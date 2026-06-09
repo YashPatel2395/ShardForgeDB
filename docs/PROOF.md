@@ -463,4 +463,210 @@ All placeholder packages (`memtable`, `sstable`, `bloom`, `engine`, `vector`, `c
 
 ---
 
+---
+
+## Phase 3 — MemTable
+
+**Date:** 2026-06-09
+**Branch:** `phase-3-memtable`
+**Go version:** go1.26.4 darwin/arm64
+
+### Implemented Behaviour
+
+| Feature | Detail |
+|---------|--------|
+| `New` | Returns empty MemTable; applies `defaultMaxBytes` (64 MiB) when `MaxBytes == 0` |
+| `Put` | Stores live entry; defensive copies of key+value; updates size accounting; replaces existing |
+| `Delete` | Stores tombstone (`EntryDelete`); defensive copy of key; updates size accounting |
+| `Get` | Returns deep copy of entry including tombstones; returns `(Entry{}, false)` for missing keys |
+| `Scan` | Returns all entries in `[start, end)` in lexicographic order; nil bounds mean open |
+| `Len` | Returns count of unique keys (live + tombstones) |
+| `ApproxBytes` | Returns `sum(len(key)+len(value)+64)` over all entries |
+| `ShouldFlush` | Returns `true` when `ApproxBytes >= MaxBytes` |
+| Concurrency | `sync.RWMutex`; readers (Get/Scan/Len/ApproxBytes/ShouldFlush) hold read lock only |
+| Defensive copies | Keys and values copied on Put/Delete, and again on Get/Scan return |
+
+### Data Structure
+
+- `map[string]Entry` — O(1) lookup
+- `[]string` sorted via `sort.SearchStrings` + slice shift — O(n) per insert, O(n²) bulk load
+- `entryOverhead = 64 B` fixed per-entry cost for size accounting
+
+### Tests — 30 tests, all PASS
+
+| # | Test | Status |
+|---|------|--------|
+| 1 | `TestNew_ReturnsEmpty` | PASS |
+| 2 | `TestPutGet_Basic` | PASS |
+| 3 | `TestGet_MissingKey` | PASS |
+| 4 | `TestPut_RejectsEmptyKey` | PASS |
+| 5 | `TestDelete_RejectsEmptyKey` | PASS |
+| 6 | `TestDelete_StoresTombstone` | PASS |
+| 7 | `TestPut_ReplacesExistingKey` | PASS |
+| 8 | `TestDelete_ReplacesExistingPut` | PASS |
+| 9 | `TestPut_AfterDelete_RestoresValue` | PASS |
+| 10 | `TestScan_SortedOrder` | PASS |
+| 11 | `TestScan_StartInclusive` | PASS |
+| 12 | `TestScan_EndExclusive` | PASS |
+| 13 | `TestScan_NilBounds_ReturnsAll` | PASS |
+| 14 | `TestScan_IncludesTombstones` | PASS |
+| 15 | `TestLen_UniqueKeyCount` | PASS |
+| 16 | `TestApproxBytes_IncreasesOnInsert` | PASS |
+| 17 | `TestApproxBytes_UpdatesOnReplaceWithLargerValue` | PASS |
+| 18 | `TestApproxBytes_UpdatesOnReplaceWithSmallerValue` | PASS |
+| 19 | `TestApproxBytes_UpdatesOnDeleteTombstone` | PASS |
+| 20 | `TestShouldFlush_FalseBelow` | PASS |
+| 21 | `TestShouldFlush_TrueAtOrAbove` | PASS |
+| 22 | `TestPut_CallerMutationSafe` | PASS |
+| 23 | `TestGet_CallerMutationSafe` | PASS |
+| 24 | `TestScan_CallerMutationSafe` | PASS |
+| 25 | `TestPut_BinaryData` | PASS |
+| 26 | `TestSequenceNumbers_Preserved` | PASS |
+| 27 | `TestConcurrent_RaceSafe` | PASS |
+| 28 | `TestScan_Deterministic` | PASS |
+| 29 | `TestDelete_MissingKey_CreatesTombstone` | PASS |
+| 30 | `TestDelete_RepeatedUpdatesSeq` | PASS |
+
+### Full Test Results (all packages)
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge       3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config      8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging     7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable   30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal        24 PASS
+```
+
+**Total: 72 tests, 72 PASS, 0 FAIL**
+
+### Benchmarks (Apple M3, darwin/arm64)
+
+```
+BenchmarkPut_1k-8         20161    179718 ns/op    459283 B/op    4776 allocs/op
+BenchmarkPut_100k-8         159  22525795 ns/op  38411142 B/op  500327 allocs/op
+BenchmarkGet_Existing-8  120821614      30.01 ns/op      32 B/op       2 allocs/op
+BenchmarkGet_Missing-8   370956397      11.51 ns/op       0 B/op       0 allocs/op
+BenchmarkScan_1k-8         82285     43881 ns/op    177984 B/op    2011 allocs/op
+BenchmarkScan_100k-8         369   9307749 ns/op  37711429 B/op  200029 allocs/op
+```
+
+Observations:
+- `Get` (existing): ~30 ns — O(1) map lookup + deep copy allocation.
+- `Get` (missing): ~11 ns — O(1) map lookup, no allocation.
+- `Put_1k`: ~180 µs for 1k sequential inserts (~180 ns/op average).
+- `Put_100k`: ~22 ms for 100k inserts — O(n²) slice-shift cost is visible; skip list deferred.
+- `Scan_1k`: ~44 µs to scan 1k entries including deep copies.
+- `Scan_100k`: ~9.3 ms to scan 100k entries — linear in result size.
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/memtable/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### git status --short (before commit)
+
+```
+ M internal/memtable/memtable.go
+?? internal/memtable/memtable_bench_test.go
+?? internal/memtable/memtable_test.go
+```
+
+Only memtable files changed. WAL and other packages untouched.
+
+### Known Limitations
+
+- O(n) insert / O(n²) bulk load — slice-shift implementation; skip list deferred to profiling phase.
+- Single `sync.RWMutex` — no per-key or per-shard locking.
+- No immutable MemTable handoff — flush coordination not yet implemented.
+- MemTable is not wired to the WAL or Engine; data is lost on process restart.
+- No WAL replay path feeding into MemTable yet (crash recovery not end-to-end).
+
+### Confirmation: No Non-MemTable Internals Implemented
+
+- `internal/sstable` — placeholder only
+- `internal/bloom` — placeholder only
+- `internal/engine` — placeholder only
+- `internal/vector` — placeholder only
+- `internal/cluster` — placeholder only
+- `internal/storage` — placeholder only
+- `internal/bench` — placeholder only
+
+---
+
+---
+
+## Phase 3 — MemTable: Review Fixes
+
+**Date:** 2026-06-09
+**Branch:** `phase-3-memtable`
+**Go version:** go1.26.4 darwin/arm64
+
+### Changes Made
+
+| # | Issue | Fix |
+|---|-------|-----|
+| 1 | README listed `MemTable` under "Features NOT Yet Implemented" even though it is implemented | Replaced with `WAL ↔ MemTable integration` and `Engine-level key-value read / write / delete`; updated top-of-file blurb from "Phase 1 only" to reflect Phase 3 status |
+| 2 | `TestPut_CallerMutationSafe` called `mustPut(t, m, string(key), string(val), 1)` — the `string(key)` conversion materialised fresh byte slices inside the helper, so mutating the original slices after the call could never reach what was passed to `Put`. The test did not actually exercise Put's defensive copy. | Rewrote to call `m.Put(key, val, 1)` directly with the live slices, then `copy(key, "XXXXX")` / `copy(val, "XXXXX")` after return, then verified stored entry still holds original bytes. |
+| 3 | No worst-case bulk-insert benchmark existed | Added `BenchmarkPut_100k_Reverse`: inserts 100k keys in descending order so every insert lands at position 0 of the sorted slice, maximising slice-shift cost. |
+
+### Benchmark Results — New Benchmark (Apple M3, darwin/arm64)
+
+```
+BenchmarkPut_100k-8              147    24016297 ns/op   38409933 B/op   500326 allocs/op
+BenchmarkPut_100k_Reverse-8        3  1275291263 ns/op   38409680 B/op   500330 allocs/op
+```
+
+Ascending insert: ~24 ms. Reverse insert: ~1.27 s. The ~53× difference confirms worst-case O(n²) slice-shift behaviour. Both are documented; skip-list evaluation deferred to the profiling phase.
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/memtable/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### Full Test Results (all packages)
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge       3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config      8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging     7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable   30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal        24 PASS
+```
+
+**Total: 72 tests, 72 PASS, 0 FAIL** (count unchanged; test was rewritten, not added)
+
+### git status --short (before commit)
+
+```
+ M README.md
+ M internal/memtable/memtable_bench_test.go
+ M internal/memtable/memtable_test.go
+```
+
+Only the three review-fix files changed. No WAL, SSTable, Engine, or other internals touched.
+
+---
+
 *Future phases will append their own sections to this document.*

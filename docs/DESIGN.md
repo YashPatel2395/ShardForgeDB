@@ -1,6 +1,6 @@
 # ShardForgeDB — High-Level Architecture Design
 
-> **Status:** WAL (`internal/wal`) is implemented as of Phase 2.
+> **Status:** WAL (`internal/wal`) and MemTable (`internal/memtable`) are implemented as of Phase 3.
 > All other components described here are intended design only — not yet implemented.
 
 ---
@@ -65,11 +65,44 @@ The distinction between a partial tail and corruption is based on which bytes ar
 
 ### MemTable
 
-The MemTable is an in-memory, sorted write buffer backed by a skip list (or red-black tree). Reads check the MemTable before going to disk.
+**Phase 3 — Implemented** in `internal/memtable`.
 
-- Bounded by a configurable size limit.
-- When full, the MemTable is frozen and flushed to disk as a new SSTable.
-- Concurrent reads and writes are supported through fine-grained locking or lock-free structures.
+The MemTable is an ordered in-memory write buffer that holds the most recent version of each key. It sits directly above the WAL in the storage stack: writes are first recorded in the WAL for durability, then applied to the MemTable for fast in-memory reads.
+
+#### Data Structure
+
+Two complementary structures are maintained under a single `sync.RWMutex`:
+
+- `map[string]Entry` — O(1) lookup by string key.
+- `[]string` — sorted key slice for ordered range scans (lexicographic order).
+
+Insertions maintain the sorted slice via binary search (`sort.SearchStrings`, O(log n)) to find the insert position, followed by a slice shift (O(n)). This gives O(n) per insert and O(n²) for a random bulk load of n keys. A skip list will be evaluated in a later phase if profiling shows this as a bottleneck.
+
+#### Ordering and Tombstones
+
+- All keys are stored in lexicographic (byte) order; `Scan(start, end)` returns entries in that order.
+- `Delete` does not remove a key — it records an `EntryDelete` tombstone. The engine (not yet implemented) uses tombstones to shadow older versions of a key in lower SSTable levels during reads and compaction.
+- `Get` returns tombstones; callers must check `entry.Kind`.
+
+#### Concurrency
+
+- `Put`, `Delete`, `Get`, `Scan`, `Len`, `ApproxBytes`, `ShouldFlush` are all safe for concurrent use.
+- `Get` and `Scan` hold only a read lock; multiple readers may proceed in parallel.
+- `Put` and `Delete` hold an exclusive write lock.
+- All returned entries are deep copies; caller mutation does not affect stored state.
+
+#### Size Accounting
+
+`ApproxBytes` tracks: `len(key) + len(value) + entryOverhead` (64 B) per entry. The overhead is a fixed estimate covering the map bucket, sorted slice element, and `Entry` struct fields. It is deterministic but not an exact runtime measurement.
+
+`ShouldFlush` returns `true` when `ApproxBytes >= MaxBytes` (default: 64 MiB).
+
+#### Known Limitations (Phase 3)
+
+- O(n) per insert; O(n²) bulk load. Skip list deferred to profiling phase.
+- Single `sync.RWMutex` — no per-key or per-shard locking.
+- No immutable (flushing) MemTable handoff — flush path not yet wired.
+- MemTable is not yet connected to the WAL or Engine; data is lost on process restart.
 
 ### SSTables (Sorted String Tables)
 

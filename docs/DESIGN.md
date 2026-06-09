@@ -579,4 +579,92 @@ Read path:
 
 ---
 
+---
+
+## Benchmarking (Phase 8)
+
+### Goal
+
+Phase 8 adds a workload evaluation layer that measures the single-node engine under realistic, deterministic workloads and produces repeatable results that can be documented alongside the code. No database features are added.
+
+### Package: `internal/bench`
+
+| File | Responsibility |
+|------|----------------|
+| `runner.go` | `Runner`, `Result`, `Recorder`, `Percentile`, `Scale` configs |
+| `workload.go` | `GenKey`, `GenValue`, per-workload run functions |
+| `report.go` | Markdown report generation (`WriteReport`, `WriteReportFile`) |
+| `bench_test.go` | 31 tests covering all framework components |
+
+### CLI: `cmd/shardforge-bench`
+
+```bash
+./bin/shardforge-bench --scale small --out docs/BENCHMARKS.md
+./bin/shardforge-bench --scale medium --workload write-heavy
+```
+
+Flags: `--scale`, `--workload`, `--out`, `--seed`.
+
+### Workload Definitions
+
+| Workload | Operations Measured | Preload? | Notes |
+|----------|---------------------|----------|-------|
+| `write-heavy` | 100% Put | No | Periodic manual Flush every N Puts |
+| `read-heavy` | 95% Get existing, 5% Get missing | Yes | Out-of-bounds missing keys hit bounds check |
+| `mixed` | 50% Put / 30% Get / 20% Delete | Yes | Deterministic via `i%10` |
+| `scan` | ScanCount range scans | Yes | Each scan covers RangeSize keys |
+| `compaction` | Gets before and after Compact() | No | Records pre/post SSTable count and compact duration |
+| `restart` | 1 engine reopen | Yes | WAL replay + manifest load |
+
+### Key/Value Generation
+
+Keys are generated as zero-padded decimal indices (`key-0000000042`) so lexicographic order matches insertion order, simplifying scan workloads without a PRNG.
+
+Values are generated via a fast LCG seeded by `(seed XOR index*magic)`. Two runs with the same seed produce identical values; changing seed or index produces different output.
+
+### Metrics
+
+The `Result` struct captures:
+
+- `Operations`, `Duration`, `OpsPerSec` — throughput
+- `P50Latency`, `P95Latency`, `P99Latency` — from a sorted per-op duration slice
+- `BytesWritten`, `BytesRead` — I/O accounting
+- `FinalSSTableCount`, `FinalMemTableEntries` — engine state at workload end
+- `FlushCount`, `CompactionCount`, `BloomChecks`, `BloomNegativeSkips` — from engine Stats
+- `PreCompactSSTableCount`, `PostCompactSSTableCount`, `CompactDuration` — compaction workload detail
+
+### Reproducibility
+
+All workloads are fully deterministic given identical `(scale, seed)`:
+
+- Fixed key generation (index-based, no PRNG)
+- Fixed value generation (LCG seeded by caller-supplied seed + index)
+- Fixed operation ratios (modular arithmetic, no PRNG)
+- Fixed flush intervals (count-based)
+- No wall-clock randomness in output
+
+### Report Format
+
+`WriteReport` produces a Markdown document with sections: Environment (placeholders for the developer to fill in), Configuration, Commands Used, Results tables, Compaction Detail, Interpretation, Known Limitations, How to Reproduce.
+
+The report output is fully deterministic for identical `(scaleName, cfg, results)` — no timestamps or machine-specific values are written automatically.
+
+### Scales
+
+| Scale | KeyCount | ValueSize | FlushInterval | RangeSize | ScanCount |
+|-------|----------|-----------|---------------|-----------|-----------|
+| `small` | 1,000 | 128 B | 100 | 50 | 100 |
+| `medium` | 50,000 | 256 B | 1,000 | 500 | 500 |
+
+`small` completes in seconds and is suitable for CI. `medium` is for stronger local measurement (not run in CI).
+
+### Limitations
+
+- Preload phases are included in total Duration (documented per-workload in the interpretation).
+- P99 latency is sensitive to OS scheduler jitter on the measurement machine.
+- Missing keys in the read-heavy workload are out-of-bounds and hit the per-SSTable bounds check before Bloom is consulted. Bloom negative-skip rate is therefore zero for that workload — this is correct behavior, not a limitation of the Bloom filter.
+- No wall-clock isolation; OS background tasks affect results.
+
+---
+
 *This document will be updated as each phase is implemented and design decisions are validated.*

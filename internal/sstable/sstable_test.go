@@ -905,21 +905,20 @@ func TestOpen_DetectsUnsupportedVersion(t *testing.T) {
 	path := tmpPath(t)
 	mustCreate(t, path, makeEntries(3))
 
-	// Overwrite bytes [8:10] (version uint16) with an unsupported value.
-	f, _ := os.OpenFile(path, os.O_RDWR, 0)
-	binary.Write(f, binary.LittleEndian, uint16(99))
-	f.Seek(8, 0)
-	binary.Write(f, binary.LittleEndian, uint16(99))
-	f.Close()
-
-	// Use WriteAt for precision.
-	f2, _ := os.OpenFile(path, os.O_RDWR, 0)
+	// Overwrite only bytes [8:10] (the version uint16) with an unsupported value.
+	// WriteAt is used for precision — no sequential writes that could corrupt offset 0.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open for version corruption: %v", err)
+	}
 	var ver [2]byte
 	binary.LittleEndian.PutUint16(ver[:], 99)
-	f2.WriteAt(ver[:], 8)
-	f2.Close()
+	if _, err := f.WriteAt(ver[:], 8); err != nil {
+		t.Fatalf("WriteAt version: %v", err)
+	}
+	f.Close()
 
-	_, err := Open(path, Options{})
+	_, err = Open(path, Options{})
 	if !errors.Is(err, ErrCorruptTable) {
 		t.Fatalf("expected ErrCorruptTable for unsupported version, got %v", err)
 	}
@@ -1142,5 +1141,51 @@ func TestOpen_DetectsIndexRecordLenTooLarge(t *testing.T) {
 	_, err := Open(path, Options{})
 	if !errors.Is(err, ErrCorruptTable) {
 		t.Fatalf("expected ErrCorruptTable for index recordLen too large, got %v", err)
+	}
+}
+
+// ── Final fix: record body extends past the data region ──────────────────────
+//
+// TestOpen_DetectsIndexRecordOverlapsIndex verifies the overflow-safe boundary
+// check: if ie.offset is valid (< indexOffset) but ie.offset + recordHeaderSize
+// + ie.recordLen > indexOffset, Open must return ErrCorruptTable.
+
+func TestOpen_DetectsIndexRecordOverlapsIndex(t *testing.T) {
+	path := tmpPath(t)
+	mustCreate(t, path, []Entry{{Key: []byte("k"), Value: []byte("v"), Kind: EntryPut, Seq: 1}})
+
+	// Determine indexOffset and the true recordLen from the index entry.
+	fi, _ := os.Stat(path)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open for corruption: %v", err)
+	}
+	var footer [footerSize]byte
+	f.ReadAt(footer[:], fi.Size()-int64(footerSize))
+	indexOffset := binary.LittleEndian.Uint64(footer[0:8])
+
+	// Index entry for key "k" (keyLen=1):
+	//   [keyLen uint32 = 1][k][offset uint64][recordLen uint32]
+	// recordLen field is at indexOffset + 4 + 1 + 8 = indexOffset + 13.
+	//
+	// We want offset + recordHeaderSize + recordLen > indexOffset but
+	// offset < indexOffset (so the offset-only check does NOT catch it).
+	//
+	// The actual record's offset is headerSize (10). The data region ends at
+	// indexOffset. Set recordLen = uint32(indexOffset - headerSize - recordHeaderSize + 1)
+	// so that: headerSize + recordHeaderSize + recordLen
+	//        = headerSize + recordHeaderSize + (indexOffset - headerSize - recordHeaderSize + 1)
+	//        = indexOffset + 1  > indexOffset.
+	//
+	// This leaves offset valid but makes the record body spill into the index.
+	overlap := uint32(indexOffset - uint64(headerSize) - uint64(recordHeaderSize) + 1)
+	var recLenBuf [4]byte
+	binary.LittleEndian.PutUint32(recLenBuf[:], overlap)
+	f.WriteAt(recLenBuf[:], int64(indexOffset)+13)
+	f.Close()
+
+	_, err = Open(path, Options{})
+	if !errors.Is(err, ErrCorruptTable) {
+		t.Fatalf("expected ErrCorruptTable for record overlapping index, got %v", err)
 	}
 }

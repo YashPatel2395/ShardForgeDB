@@ -916,4 +916,60 @@ Only SSTable files changed. WAL, MemTable, and all other packages untouched.
 
 ---
 
+---
+
+---
+
+## Phase 4 — SSTable: Final Review Fixes
+
+**Date:** 2026-06-09
+**Branch:** `phase-4-sstable`
+**Go version:** go1.26.4 darwin/arm64
+
+### Issues Fixed
+
+| # | Issue | Fix |
+|---|-------|-----|
+| 1 | `TestOpen_DetectsUnsupportedVersion` was broken: the test called `binary.Write(f, ...)` sequentially starting at offset 0, corrupting the magic sentinel bytes. It then used `WriteAt` at offset 8 (correct), but by then the magic was already wrong. The test passed because of bad magic, not version validation. | Removed the sequential-write block entirely. Replaced with a single `f.WriteAt(ver[:], 8)` call that modifies only the version field. |
+| 2 | Index offset validation in `load` checked `ie.offset < indexOffset` but not that the *complete* record `[offset, offset+recordHeaderSize+recordLen)` fits inside the data region. A record whose offset is just below `indexOffset` but whose body would extend past it was not detected. | Added an overflow-safe full-record boundary check after the per-entry offset and recordLen checks: `recordEnd := ie.offset + uint64(recordHeaderSize) + uint64(ie.recordLen); if recordEnd < ie.offset \|\| recordEnd > indexOffset { return ErrCorruptTable }`. |
+
+### Test Added (1 new)
+
+| Test | What it proves |
+|------|----------------|
+| `TestOpen_DetectsIndexRecordOverlapsIndex` | Corrupts the index entry `recordLen` to a value where `offset + recordHeaderSize + recordLen > indexOffset` (record body spills into the index block); verifies `Open` returns `ErrCorruptTable`. |
+
+### Updated Total Test Count
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge       3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config      8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging     7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable   30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/sstable    46 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal        24 PASS
+```
+
+**Total: 118 tests, 118 PASS, 0 FAIL** (was 117; +1 SSTable)
+
+### Commands Run
+
+```
+go fmt ./...
+go vet ./...
+go test -race -count=1 ./...
+```
+
+### git status --short (before commit)
+
+```
+ M docs/PROOF.md
+ M internal/sstable/sstable.go
+ M internal/sstable/sstable_test.go
+```
+
+Only SSTable files and PROOF.md changed. WAL, MemTable, and all other packages untouched.
+
+---
+
 *Future phases will append their own sections to this document.*

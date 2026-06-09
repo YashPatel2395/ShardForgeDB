@@ -646,6 +646,13 @@ func (r *Reader) load(path string) error {
 			return fmt.Errorf("%w: index entry %d recordLen %d > MaxRecordSize %d",
 				ErrCorruptTable, i, ie.recordLen, r.maxRecordSize)
 		}
+		// Overflow-safe full-record boundary check: the complete record
+		// [offset, offset+recordHeaderSize+recordLen) must fit inside the data region.
+		recordEnd := ie.offset + uint64(recordHeaderSize) + uint64(ie.recordLen)
+		if recordEnd < ie.offset || recordEnd > indexOffset {
+			return fmt.Errorf("%w: record at index entry %d extends beyond data region (end %d > indexOffset %d)",
+				ErrCorruptTable, i, recordEnd, indexOffset)
+		}
 		// Keys must be strictly sorted (no duplicates).
 		if i > 0 && string(ie.key) <= string(index[i-1].key) {
 			return fmt.Errorf("%w: index keys not strictly sorted at entry %d (%q <= %q)",

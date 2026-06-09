@@ -117,7 +117,7 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] 34 tests, 8 benchmarks
 - [x] **Manual full compaction only** — no background, no automatic thresholds, no levels
 
-**Phase 8 — Benchmarking and Workload Evaluation** (branch: `phase-8-benchmarks`, in review)
+**Phase 8 — Benchmarking and Workload Evaluation** ✓ locked
 
 - [x] `internal/bench` — deterministic workload benchmark framework
 - [x] Six workloads: write-heavy, read-heavy, mixed, scan, compaction, restart
@@ -125,9 +125,25 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] Markdown report generation (`docs/BENCHMARKS.md`)
 - [x] CLI: `bin/shardforge-bench --scale small|medium --workload NAME --out PATH`
 - [x] Makefile targets: `bench`, `bench-engine`, `bench-report`
-- [x] 31 tests in `internal/bench/bench_test.go`
+- [x] 34 tests in `internal/bench/bench_test.go`
 - [x] **No new database feature logic** — measurement and documentation only
 
+**Phase 9 — Single-node Exact Vector Search** (branch: `phase-9-vector-search`, in review)
+
+- [x] `internal/vector` — persistent exact k-nearest-neighbour vector store
+- [x] Engine-backed persistence (reuses single-node LSM engine from Phase 6)
+- [x] In-memory exact index rebuilt on `Open` by scanning the vector namespace
+- [x] `Upsert`, `Delete`, `Get`, `Search`, `Flush`, `Compact`, `Count`, `Stats` API
+- [x] Three distance metrics: **cosine** (default), **L2** (squared), **dot product**
+- [x] Exact brute-force search — **not ANN, not HNSW, not IVF**
+- [x] Deterministic binary encoding with magic, version, CRC-32, dimension check
+- [x] Namespace isolation: multiple stores can coexist in the same engine directory
+- [x] Concurrent-safe via `sync.RWMutex`
+- [x] Makefile target: `bench-vector`
+- [x] 44 tests, 10 benchmarks in `internal/vector`
+- [x] **Single-node only** — no distributed vector search, no sharding, no replication
+
+> No ANN, no HNSW, no IVF, no approximate search.
 > No background compaction, no size-tiered compaction, no leveled compaction.
 > No automatic flush. No distributed/sharded/replicated mode.
 
@@ -142,7 +158,7 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 | 6 | Engine — key-value read/write/delete |
 | 7 | Manual full compaction |
 | 8 | Benchmarking and workload evaluation |
-| 9 | Vector search — ANN index (HNSW or IVF) |
+| 9 | Vector search — exact k-NN (cosine / L2 / dot) |
 | 10 | Sharding — consistent-hash partitioning |
 | 11 | Replication — leader/follower; Raft-compatible consensus only after full implementation |
 | 12 | Dashboard, chaos / failure simulation |
@@ -154,7 +170,7 @@ The following are **not** present in the current codebase:
 - Background compaction (Compact() is manual only)
 - Automatic compaction thresholds
 - Leveled or size-tiered compaction
-- Vector search / ANN index
+- ANN / HNSW / IVF vector search (Phase 9 is exact only)
 - Sharding
 - Replication / consensus
 - Failure simulation
@@ -219,6 +235,7 @@ make vet          # static analysis
 make lint         # run golangci-lint (skipped if not installed)
 make bench        # run all Go benchmarks
 make bench-engine # run engine Go benchmarks
+make bench-vector # run vector Go benchmarks
 make bench-report # generate docs/BENCHMARKS.md (small scale)
 make clean        # remove bin/
 make help         # list all targets

@@ -6,7 +6,7 @@ BENCH_CMD    := ./cmd/shardforge-bench
 GO           := go
 GOFLAGS      :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-report help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-report help
 
 all: fmt vet build
 
@@ -43,6 +43,10 @@ bench:
 ## bench-engine: run Go benchmarks for the engine package only
 bench-engine:
 	$(GO) test -bench=. -benchmem ./internal/engine/...
+
+## bench-vector: run Go benchmarks for the vector package only
+bench-vector:
+	$(GO) test -bench=. -benchmem ./internal/vector/...
 
 ## bench-report: run the workload benchmark suite (small scale) and write docs/BENCHMARKS.md
 bench-report:

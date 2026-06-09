@@ -667,4 +667,96 @@ The report output is fully deterministic for identical `(scaleName, cfg, results
 
 ---
 
+---
+
+## Vector Search (Phase 9)
+
+### Overview
+
+Phase 9 adds a single-node **exact** k-nearest-neighbour vector store in `internal/vector`. It is backed by the existing single-node Engine (Phase 6) for persistence and provides an in-memory exact index for fast search.
+
+This is **not** approximate nearest-neighbour search. There is no HNSW, no IVF, no product quantization, and no graph index. Every search scores every stored vector against the query. This design prioritises correctness, explainability, and benchmarkability over raw search throughput at very large scales.
+
+### Package Layout
+
+```
+internal/vector/
+  store.go            — Store type, public API, lifecycle, in-memory index
+  codec.go            — binary record encoding/decoding (magic, CRC, version)
+  metric.go           — distance computations: cosine, L2, dot product
+  store_test.go       — 44 unit tests
+  store_bench_test.go — 10 benchmarks
+```
+
+### Store Architecture
+
+```
+Caller
+  │
+  ▼
+vector.Store
+  ├── sync.RWMutex — guards the in-memory index and closed flag
+  ├── map[string]Record — in-memory exact index (ID → Record)
+  └── engine.Engine — WAL + MemTable + SSTable stack for persistence
+```
+
+`Open` creates (or reopens) an engine at `opts.Dir` and scans the vector namespace prefix to rebuild the in-memory index. After that, all reads (`Get`, `Search`) operate entirely from memory. Writes (`Upsert`, `Delete`) go to the engine first, then update memory.
+
+### Engine-Backed Persistence
+
+Vectors are stored as opaque binary values in the engine under keys of the form:
+
+```
+__vector__/<namespace>/<id>
+```
+
+The prefix `__vector__/` is reserved. The namespace field allows multiple stores to share one engine directory without key collision. IDs are validated to exclude `/` and control characters. On `Open`, the store scans `__vector__/<ns>/` to `__vector__/<ns>/\xff` to load all live records.
+
+### Binary Record Encoding
+
+Each vector record is encoded as a self-describing binary blob:
+
+```
+[magic      8 bytes ] — 0x5348415244564543 ("SHARDVEC")
+[version    2 bytes ] — uint16, currently 1
+[dimension  4 bytes ] — uint32
+[metaLen    4 bytes ] — uint32
+[vector     dim×4 B ] — float32 values, little-endian IEEE 754
+[metadata   metaLen ] — raw bytes (may be empty)
+[crc32      4 bytes ] — CRC-32/IEEE over [version..metadata]
+[magic      8 bytes ] — same footer sentinel
+```
+
+On decode, bad magic, unsupported version, dimension mismatch, CRC failure, or truncation returns `ErrCorruptRecord`.
+
+### Distance Metrics
+
+| Metric | Score (higher = better) | Distance |
+|--------|------------------------|----------|
+| `cosine` | cosine similarity ∈ [−1, 1] | 1 − score |
+| `l2` | −(squared Euclidean distance) | squared L2 |
+| `dot` | dot product | −(dot product) |
+
+Tie-breaking is always by ID ascending (lexicographic) for determinism. Zero vectors are rejected for cosine. NaN and ±Inf are rejected for all metrics.
+
+### Search Algorithm
+
+```
+for each stored record:
+    score, dist = computeDistance(metric, query, record.Vector)
+sort by score descending, then by ID ascending
+return top-k
+```
+
+Time complexity: O(n·d). All stored vectors must fit in memory.
+
+### Limitations
+
+- **Exact only.** No ANN, HNSW, IVF, or approximate search.
+- **Single node.** No sharding, replication, or distributed search.
+- **Memory-bound.** All vectors reside in the process heap.
+- **Manual flush/compact.** No background maintenance.
+
+---
+
 *This document will be updated as each phase is implemented and design decisions are validated.*

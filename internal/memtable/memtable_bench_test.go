@@ -82,3 +82,19 @@ func BenchmarkScan_100k(b *testing.B) {
 		_ = m.Scan(nil, nil)
 	}
 }
+
+// BenchmarkPut_100k_Reverse inserts 100k keys in descending lexicographic
+// order. Every insert lands at position 0 of the sorted slice, maximising the
+// slice-shift cost (true worst case for the current O(n²) implementation).
+// Compare against BenchmarkPut_100k (ascending) to see the difference.
+func BenchmarkPut_100k_Reverse(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		m := New(Options{})
+		b.StartTimer()
+		for j := 100_000 - 1; j >= 0; j-- {
+			key := fmt.Sprintf("key-%08d", j)
+			_ = m.Put([]byte(key), []byte("value"), uint64(100_000-j))
+		}
+	}
+}

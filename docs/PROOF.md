@@ -604,4 +604,69 @@ Only memtable files changed. WAL and other packages untouched.
 
 ---
 
+---
+
+## Phase 3 — MemTable: Review Fixes
+
+**Date:** 2026-06-09
+**Branch:** `phase-3-memtable`
+**Go version:** go1.26.4 darwin/arm64
+
+### Changes Made
+
+| # | Issue | Fix |
+|---|-------|-----|
+| 1 | README listed `MemTable` under "Features NOT Yet Implemented" even though it is implemented | Replaced with `WAL ↔ MemTable integration` and `Engine-level key-value read / write / delete`; updated top-of-file blurb from "Phase 1 only" to reflect Phase 3 status |
+| 2 | `TestPut_CallerMutationSafe` called `mustPut(t, m, string(key), string(val), 1)` — the `string(key)` conversion materialised fresh byte slices inside the helper, so mutating the original slices after the call could never reach what was passed to `Put`. The test did not actually exercise Put's defensive copy. | Rewrote to call `m.Put(key, val, 1)` directly with the live slices, then `copy(key, "XXXXX")` / `copy(val, "XXXXX")` after return, then verified stored entry still holds original bytes. |
+| 3 | No worst-case bulk-insert benchmark existed | Added `BenchmarkPut_100k_Reverse`: inserts 100k keys in descending order so every insert lands at position 0 of the sorted slice, maximising slice-shift cost. |
+
+### Benchmark Results — New Benchmark (Apple M3, darwin/arm64)
+
+```
+BenchmarkPut_100k-8              147    24016297 ns/op   38409933 B/op   500326 allocs/op
+BenchmarkPut_100k_Reverse-8        3  1275291263 ns/op   38409680 B/op   500330 allocs/op
+```
+
+Ascending insert: ~24 ms. Reverse insert: ~1.27 s. The ~53× difference confirms worst-case O(n²) slice-shift behaviour. Both are documented; skip-list evaluation deferred to the profiling phase.
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/memtable/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### Full Test Results (all packages)
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge       3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config      8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging     7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable   30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal        24 PASS
+```
+
+**Total: 72 tests, 72 PASS, 0 FAIL** (count unchanged; test was rewritten, not added)
+
+### git status --short (before commit)
+
+```
+ M README.md
+ M internal/memtable/memtable_bench_test.go
+ M internal/memtable/memtable_test.go
+```
+
+Only the three review-fix files changed. No WAL, SSTable, Engine, or other internals touched.
+
+---
+
 *Future phases will append their own sections to this document.*

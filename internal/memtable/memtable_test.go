@@ -364,26 +364,35 @@ func TestShouldFlush_TrueAtOrAbove(t *testing.T) {
 }
 
 // ── Test 22: Caller mutation after Put does not affect stored data ─────────────
+//
+// The test passes the original []byte slices directly into m.Put (not via
+// mustPut which would create new slices from string conversion). Mutating the
+// original slices after Put must not affect what is stored.
 
 func TestPut_CallerMutationSafe(t *testing.T) {
 	m := newMT(t)
 	key := []byte("mykey")
 	val := []byte("myval")
-	mustPut(t, m, string(key), string(val), 1)
 
-	// Mutate the slices after Put.
-	copy(key, "xxxxx")
-	copy(val, "xxxxx")
+	// Pass the live slices directly — Put must copy them.
+	if err := m.Put(key, val, 1); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
 
+	// Mutate the caller's slices in-place after Put returns.
+	copy(key, "XXXXX")
+	copy(val, "XXXXX")
+
+	// The stored entry must still reflect the original bytes.
 	e, ok := m.Get([]byte("mykey"))
 	if !ok {
-		t.Fatal("Get returned false")
+		t.Fatal("Get returned false after Put")
 	}
 	if string(e.Key) != "mykey" {
-		t.Errorf("Key = %q, want mykey", e.Key)
+		t.Errorf("stored Key = %q, want mykey (caller mutation leaked into store)", e.Key)
 	}
 	if string(e.Value) != "myval" {
-		t.Errorf("Value = %q, want myval", e.Value)
+		t.Errorf("stored Value = %q, want myval (caller mutation leaked into store)", e.Value)
 	}
 }
 

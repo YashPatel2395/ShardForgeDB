@@ -2,8 +2,8 @@
 
 An **explainable** distributed database engine for key-value and vector search workloads, written in Go.
 
-> **Phase 1 — Project Foundation only.**
-> No database internals are implemented yet.
+> **Phase 3 in review.** WAL and MemTable are implemented.
+> No Engine-level integration exists yet.
 
 ---
 
@@ -84,11 +84,11 @@ WAL (`internal/wal`) and MemTable (`internal/memtable`) are implemented as of Ph
 
 The following are **not** present in the current codebase:
 
-- MemTable (partial — no WAL/Engine integration)
+- WAL ↔ MemTable integration (write path not wired end-to-end)
+- Engine-level key-value read / write / delete
 - SSTables
 - Bloom filters
 - Compaction
-- Key-value read / write / delete
 - Vector search / ANN index
 - Sharding
 - Replication / consensus

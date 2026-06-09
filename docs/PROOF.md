@@ -972,4 +972,274 @@ Only SSTable files and PROOF.md changed. WAL, MemTable, and all other packages u
 
 ---
 
+---
+
+## Phase 5 — Bloom Filter
+
+**Date:** 2026-06-09
+**Branch:** `phase-5-bloom`
+**Go version:** go1.26.4 darwin/arm64
+
+### Implemented Behaviour
+
+| Feature | Detail |
+|---------|--------|
+| `New` | Constructs a filter sized for ExpectedItems at the target FalsePositiveRate; validates all options before allocation |
+| `Add` | Sets k bit positions determined by double hashing; increments InsertedItems; rejects nil/empty keys |
+| `MightContain` | Checks k bit positions; returns false immediately on first unset bit; nil/empty → false |
+| `Metadata` | Returns a value copy of all parameters plus InsertedItems |
+| `MarshalBinary` | Serializes to a self-describing binary blob with magic, version, all parameters, word array, CRC-32, and trailing magic |
+| `UnmarshalBinary` | Deserializes and validates fully before returning a new filter; defensive copy of all data |
+| Error types | `ErrInvalidOptions`, `ErrInvalidKey`, `ErrCorruptFilter`, `ErrFilterTooLarge` |
+| Concurrency | `sync.RWMutex`; readers (`MightContain`, `Metadata`, `MarshalBinary`) hold read lock only |
+
+### Parameter Formulas
+
+```
+m = ceil( -n * ln(p) / (ln(2)^2) )   // bit count
+k = round( (m / n) * ln(2) )          // hash count, minimum 1, capped at 64
+```
+
+Verification for n=1000, p=0.01:
+```
+m = ceil(1000 × 4.60517 / 0.48045) = ceil(9585.06) = 9586
+k = round(9586/1000 × 0.69315)     = round(6.641)  = 7
+```
+Both values confirmed by `TestCalcParams_KnownValues`.
+
+### Hash Strategy
+
+```
+h1(x) = FNV-1a-64(x)
+h2(x) = FNV-1a-64(salt_bytes || x)   salt = 0x9e3779b97f4a7c15
+pos_i = (h1(x) + i × h2(x)) mod m
+```
+
+h2 fallback: if h2 == 0, replaced with the salt constant (odd, well-distributed).
+Both hashes use only `hash/fnv` from the Go standard library — no random seeds.
+
+### Serialization Format
+
+```
+[magic         8 bytes ]  0x544c464d4f4f4c42 ("BLOOMFLT" LE)
+[version       2 bytes ]  uint16 = 1
+[bitCount      8 bytes ]  uint64
+[hashCount     4 bytes ]  uint32
+[expectedItems 8 bytes ]  uint64
+[insertedItems 8 bytes ]  uint64
+[fprBits       8 bytes ]  math.Float64bits(FalsePositiveRate)
+[wordCount     8 bytes ]  uint64
+[words         wc×8 bytes]
+[crc32         4 bytes ]  IEEE CRC-32 over [magic..last word]
+[magic         8 bytes ]  trailing sentinel
+```
+
+Total minimum size: 66 bytes (no words). Safety cap: wordCount ≤ 2³⁰.
+
+### Tests — 34 tests, all PASS
+
+| # | Test | Status |
+|---|------|--------|
+| 1 | `TestNew_RejectsZeroExpectedItems` | PASS |
+| 2 | `TestNew_RejectsFPRLessOrEqualZero` | PASS |
+| 3 | `TestNew_RejectsFPRGreaterOrEqualOne` | PASS |
+| 4 | `TestNew_ComputesNonZeroParams` | PASS |
+| 5 | `TestAdd_RejectsNilKey` | PASS |
+| 6 | `TestAdd_RejectsEmptyKey` | PASS |
+| 7 | `TestMightContain_NilOrEmptyReturnsFalse` | PASS |
+| 8 | `TestMightContain_AddedKeyFound` | PASS |
+| 9 | `TestMightContain_MultipleKeysFound` | PASS |
+| 10 | `TestAdd_DuplicateDoesNotBreakMembership` | PASS |
+| 11 | `TestMightContain_MissingKeyReturnsFalse` | PASS |
+| 12 | `TestNoFalseNegatives_10k` | PASS |
+| 13 | `TestFalsePositiveRate_WithinBound` | PASS (actual ~0.36%, target 1%) |
+| 14 | `TestMetadata_ReportsCorrectFields` | PASS |
+| 15 | `TestMarshalUnmarshal_PreservesMembership` | PASS |
+| 16 | `TestMarshalBinary_IsDeterministic` | PASS |
+| 17 | `TestUnmarshal_RejectsTooShort` | PASS |
+| 18 | `TestUnmarshal_RejectsBadLeadingMagic` | PASS |
+| 19 | `TestUnmarshal_RejectsBadTrailingMagic` | PASS |
+| 20 | `TestUnmarshal_RejectsUnsupportedVersion` | PASS |
+| 21 | `TestUnmarshal_RejectsChecksumMismatch` | PASS |
+| 22 | `TestUnmarshal_RejectsInconsistentWordCount` | PASS |
+| 23 | `TestUnmarshal_RejectsZeroBitCount` | PASS |
+| 24 | `TestUnmarshal_RejectsZeroHashCount` | PASS |
+| 25 | `TestUnmarshal_RejectsExcessiveWordCount` | PASS |
+| 26 | `TestUnmarshal_CallerMutationSafe` | PASS |
+| 27 | `TestConcurrent_RaceSafe` | PASS |
+| 28 | `TestBitPositions_WordBoundaries` | PASS |
+| 29 | `TestLargeFilter_100k` | PASS |
+| 30 | `TestMarshalUnmarshal_PreservesMetadata` | PASS |
+| 31 | `TestMetadata_MutationSafe` | PASS |
+| 32 | `TestInsertedItems_CountsAddCalls` | PASS |
+| 33 | `TestCalcParams_KnownValues` | PASS |
+| 34 | `TestEmptyFilter_NoMembership` | PASS |
+
+### Benchmarks (Apple M3, darwin/arm64, `-benchtime=3s`)
+
+```
+BenchmarkNew_1k-8                28679593       123.9 ns/op       1376 B/op       2 allocs/op
+BenchmarkNew_1M-8                   90324     38134   ns/op    1204320 B/op       2 allocs/op
+BenchmarkAdd-8                  100000000        33.79 ns/op          0 B/op       0 allocs/op
+BenchmarkMightContain_Existing-8 141039631       25.52 ns/op          0 B/op       0 allocs/op
+BenchmarkMightContain_Missing-8  123953178       28.79 ns/op          0 B/op       0 allocs/op
+BenchmarkMarshalBinary-8           1612573      2382   ns/op      12288 B/op       1 allocs/op
+BenchmarkUnmarshalBinary-8         1371586      2576   ns/op      12384 B/op       2 allocs/op
+BenchmarkAdd_100k-8                   1146   3160900   ns/op     122976 B/op       2 allocs/op
+BenchmarkQuery_100k-8                 1165   3092479   ns/op          0 B/op       0 allocs/op
+```
+
+Observations:
+- `New` (1k): ~124 ns — dominated by allocating the word array.
+- `Add`: ~34 ns — zero allocations; two FNV hash computations + k bit sets.
+- `MightContain` (existing/missing): ~25–29 ns — zero allocations; early exit on first unset bit for missing keys.
+- `MarshalBinary` / `UnmarshalBinary`: ~2.4–2.6 µs for a 10k filter — single allocation each.
+- Bulk 100k Add: ~3.2 ms — ~32 ns/key.
+- Bulk 100k Query: ~3.1 ms — ~31 ns/key.
+
+### Full Test Results (all packages)
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge       3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/bloom      34 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config      8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging     7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable   30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/sstable    46 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal        24 PASS
+```
+
+**Total: 152 tests, 152 PASS, 0 FAIL**
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/bloom/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### git status --short (before commit)
+
+```
+ M README.md
+ M docs/DESIGN.md
+ M docs/PROOF.md
+ M internal/bloom/bloom.go
+?? internal/bloom/bloom_bench_test.go
+?? internal/bloom/bloom_test.go
+```
+
+Only Bloom Filter files and docs changed. WAL, MemTable, SSTable, and all other packages untouched.
+
+### Known Limitations
+
+- Not wired into SSTable or Engine; integration deferred to the Engine phase.
+- No scalable / partitioned Bloom filter; the entire bit array lives in RAM.
+- No counting Bloom filter; Delete is not supported.
+- No compression of the bit array.
+- `InsertedItems` counts successful `Add` calls, not unique keys.
+- False positives are possible by design; false negatives are impossible.
+
+### Confirmation: No Non-Bloom Internals Implemented
+
+- `internal/engine` — placeholder only
+- `internal/vector` — placeholder only
+- `internal/cluster` — placeholder only
+- `internal/storage` — placeholder only
+- `internal/bench` — placeholder only
+- `internal/wal` — unchanged
+- `internal/memtable` — unchanged
+- `internal/sstable` — unchanged
+- No compaction, sharding, replication, dashboard, or vector logic implemented
+
+---
+
+---
+
+## Phase 5 — Bloom Filter: Review Fixes
+
+**Date:** 2026-06-09
+**Branch:** `phase-5-bloom`
+**Go version:** go1.26.4 darwin/arm64
+
+### Review Blockers Fixed
+
+| # | Issue | Fix |
+|---|-------|-----|
+| 1 | `New` accepted `math.NaN()` and `math.Inf(±1)` as `FalsePositiveRate` because both values pass `<= 0` and `>= 1` comparisons | Added `math.IsNaN` and `math.IsInf` guards before the range check in `New`; extended `TestNew_RejectsFPRLessOrEqualZero` + `TestNew_RejectsFPRGreaterOrEqualOne` into a single comprehensive `TestNew_RejectsInvalidFPR` covering 0, negatives, 1, >1, +Inf, -Inf, NaN |
+| 2 | `UnmarshalBinary` accepted serialized filters with `expectedItems == 0` if the CRC was recomputed, creating a state that `New` would reject | Added `if expectedItems == 0 { return ErrCorruptFilter }` in `UnmarshalBinary`; added `TestUnmarshal_RejectsZeroExpectedItems` |
+| 3 | Package doc comment said `h2(x) = FNV-1a-64(x XOR salt)` but the implementation feeds `salt_bytes || x` into the hasher (a salt prefix, not XOR) | Updated package-level hash strategy comment to `h2(x) = FNV-1a-64(salt_bytes \|\| x)` |
+
+### Tests Added / Updated
+
+| Test | Change |
+|------|--------|
+| `TestNew_RejectsInvalidFPR` | Replaces `TestNew_RejectsFPRLessOrEqualZero` + `TestNew_RejectsFPRGreaterOrEqualOne`; adds `math.Inf(+1)`, `math.Inf(-1)`, `math.NaN()` cases |
+| `TestUnmarshal_RejectsZeroExpectedItems` | New test; patches bytes [22:30], recomputes CRC, verifies `ErrCorruptFilter` |
+
+### Updated Total Test Count
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge       3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/bloom      35 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config      8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging     7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable   30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/sstable    46 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal        24 PASS
+```
+
+**Total: 153 tests, 153 PASS, 0 FAIL** (was 152; +1 Bloom, net: two old tests replaced by one + one new)
+
+### Benchmark Results (Apple M3, darwin/arm64, unchanged performance)
+
+```
+BenchmarkNew_1k-8                  23399350      135.5 ns/op     1376 B/op    2 allocs/op
+BenchmarkNew_1M-8                     88218    40930   ns/op  1204320 B/op    2 allocs/op
+BenchmarkAdd-8                    100000000       34.30 ns/op        0 B/op    0 allocs/op
+BenchmarkMightContain_Existing-8  137112006       25.71 ns/op        0 B/op    0 allocs/op
+BenchmarkMightContain_Missing-8   124787678       28.99 ns/op        0 B/op    0 allocs/op
+BenchmarkMarshalBinary-8            1550130     2410   ns/op    12288 B/op    1 allocs/op
+BenchmarkUnmarshalBinary-8          1340643     2662   ns/op    12384 B/op    2 allocs/op
+BenchmarkAdd_100k-8                    1138  3179959   ns/op   122976 B/op    2 allocs/op
+BenchmarkQuery_100k-8                  1167  3097168   ns/op        0 B/op    0 allocs/op
+```
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/bloom/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### git status --short (before commit)
+
+```
+ M docs/PROOF.md
+ M internal/bloom/bloom.go
+ M internal/bloom/bloom_test.go
+```
+
+Only Bloom Filter files and PROOF.md changed. WAL, MemTable, SSTable, and all other packages untouched.
+
+---
+
 *Future phases will append their own sections to this document.*

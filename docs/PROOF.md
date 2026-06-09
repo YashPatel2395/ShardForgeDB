@@ -1509,4 +1509,288 @@ No compaction, vector search, sharding, replication, dashboard, distributed, net
 
 ---
 
+---
+
+## Phase 7 — Manual Full Compaction
+
+**Date:** 2026-06-09
+**Go version:** go1.26.4 darwin/arm64
+**Branch:** `phase-7-compaction`
+
+### Implemented Behavior
+
+Manual full compaction (`(*Engine).Compact()`) merges all flushed SSTables into at most one output SSTable and Bloom sidecar. It does not touch the MemTable or WAL.
+
+### API Changes
+
+| Symbol | Change |
+|--------|--------|
+| `(*Engine).Compact() error` | New method — acquires write lock, delegates to `compact()` |
+| `ErrCompactionFailed` | New sentinel error wrapping lower-level failures |
+| `Stats.CompactionCount` | New field — incremented on each successful compaction |
+| `Stats.LastCompactionInputTables` | New field — count of SSTables read in last compaction |
+| `Stats.LastCompactionOutputEntries` | New field — live entries written in last output SSTable |
+
+### Merge Rules
+
+1. All SSTables are scanned via `Reader.Scan(nil, nil)`.
+2. Per key, the entry with the highest sequence number wins.
+3. Tombstones are dropped in full compaction (safe: no older level exists after manifest swap).
+4. Surviving live entries are sorted lexicographically and written to a single new SSTable + Bloom sidecar.
+5. The new SSTable's Bloom filter is rebuilt from live entries only.
+6. Sequence numbers from the original entries are preserved in the output.
+
+### Output Cases
+
+| Condition | Output |
+|-----------|--------|
+| 0 SSTables | No-op, return nil |
+| 1 SSTable | No-op, return nil |
+| All keys deleted (all entries are tombstones) | Empty SSTable list, manifest updated to `[]` |
+| ≥1 live entry | One new SSTable + Bloom sidecar, manifest updated with one entry |
+
+### Manifest Update
+
+The manifest's `Tables` list is replaced atomically (temp-file + fsync + rename) with either an empty list or a single-entry list pointing to the compacted SSTable and Bloom sidecar. The old table entries are removed from the manifest before any file deletion.
+
+### File Cleanup
+
+Old SSTable and Bloom sidecar files are removed after the manifest commit on a best-effort basis. A removal failure returns an error but does not roll back the manifest. The compacted output is already durable at that point.
+
+### Crash/Recovery Proof
+
+| Phase | State on restart |
+|-------|-----------------|
+| Crash before manifest commit | Old manifest intact; new compacted SSTable is an orphan (unknown to manifest, ignored by `Open`). No data loss. |
+| Crash after manifest commit, before file deletion | New manifest lists the compacted SSTable. Old files are orphans (not listed in manifest, ignored). No data loss. |
+| Crash after all-deleted empty manifest commit | Empty manifest; old files are orphans. All keys correctly reported absent. No data loss. |
+
+### Tests
+
+32 tests in `internal/engine/compact_test.go`:
+
+| Test | Description |
+|------|-------------|
+| `TestCompact_EmptyEngine_IsNoOp` | Engine with no SSTables — Compact returns nil, engine state unchanged |
+| `TestCompact_ZeroSSTables_IsNoOp` | Explicit zero-table case — no-op |
+| `TestCompact_OneSsTable_IsNoOp` | Single SSTable — no-op |
+| `TestCompact_MergesTwoSSTablesIntoOne` | Two SSTables → one compacted output |
+| `TestCompact_PreservesLatestValueBySeq` | Same key across tables — highest seq wins |
+| `TestCompact_DropsOverwrittenOlderValues` | Older values for same key do not appear in output |
+| `TestCompact_PreservesLiveKeysAcrossManySSTables` | 5 SSTables, unique keys — all live keys survive |
+| `TestCompact_DropsTombstonesInFullCompaction` | Tombstones not written to compacted SSTable |
+| `TestCompact_DeletedKeyRemainsAbsent` | Get for deleted key returns not-found after compact |
+| `TestCompact_AllDeleted_RemovesAllSSTables` | All keys deleted → SSTable count = 0 |
+| `TestCompact_ScanBeforeAndAfterReturnsSameLiveResults` | Scan result identical before and after compact |
+| `TestCompact_GetBeforeAndAfterReturnsSameValues` | Get result identical before and after compact |
+| `TestCompact_MemTableValueOverridesSSTable` | Unflushed MemTable write visible after compact |
+| `TestCompact_MemTableTombstoneOverridesSSTable` | Unflushed MemTable delete hides SSTable value after compact |
+| `TestCompact_DoesNotModifyWAL` | WAL file size unchanged by compact |
+| `TestCompact_RestartLoadsCompactedSSTable` | Reopen after compact sees compacted data |
+| `TestCompact_RestartAfterAllDeletedLoadsZeroSSTables` | Reopen after all-deleted compact has zero SSTables |
+| `TestCompact_OldFilesRemovedAfterCompaction` | Old SSTable and Bloom files are removed |
+| `TestCompact_BloomSidecarExistsForCompactedSSTable` | New Bloom sidecar file exists after compact |
+| `TestCompact_BloomNegativeSkipWorksAfterCompaction` | BloomNegativeSkips stat increments on missing key after compact |
+| `TestCompact_ManifestContainsOneTableAfterMultiTableCompaction` | Manifest has exactly 1 entry after compact |
+| `TestCompact_ManifestContainsZeroTablesAfterAllDeletedCompaction` | Manifest has 0 entries after all-deleted compact |
+| `TestCompact_ManifestPathsRemainRelativeAfterCompaction` | Manifest paths are local (no absolute, no traversal) |
+| `TestCompact_AfterClose_ReturnsErrClosed` | Compact after Close returns ErrClosed |
+| `TestCompact_Concurrent_RaceSafe` | Concurrent Put + Compact + Get passes -race |
+| `TestCompact_PreservesSequenceNumbers` | Sequence numbers in compacted SSTable match original entries |
+| `TestCompact_UsesNewFileIDAndDoesNotOverwriteExistingFiles` | Compact output uses new ID, not an existing SSTable ID |
+| `TestCompact_CorruptSSTableCausesError` | Corrupt SSTable causes Compact to return an error |
+| `TestCompact_CorruptBloomSidecarDoesNotBlockCompact` | Corrupt Bloom sidecar on disk does not block compact (in-memory Bloom used) |
+| `TestCompact_LargeWorkload` | 10 SSTables × 1,000 keys — all live entries survive compact |
+| `TestCompact_StatsCompactionCountIncremented` | Stats.CompactionCount increments per successful compaction |
+| `TestCompact_StatsLastCompactionInputTables` | Stats.LastCompactionInputTables reflects input table count |
+
+### Benchmarks
+
+8 benchmarks in `internal/engine/compact_bench_test.go`:
+
+```
+BenchmarkCompact_2SSTable_1kKeys-8           186   19830618 ns/op    717376 B/op    10141 allocs/op
+BenchmarkCompact_10SSTable_10kKeys-8          43   81985188 ns/op   6700301 B/op   100386 allocs/op
+BenchmarkCompact_WithOverwrites-8            202   18518108 ns/op    682377 B/op    11159 allocs/op
+BenchmarkCompact_WithTombstones-8            702    5640262 ns/op    364229 B/op     5084 allocs/op
+BenchmarkGet_MissingKey_BeforeCompaction-8   233920914   15.47 ns/op    0 B/op    0 allocs/op
+BenchmarkGet_MissingKey_AfterCompaction-8    238009178   15.10 ns/op    0 B/op    0 allocs/op
+BenchmarkScan_BeforeCompaction-8             3608   987504 ns/op   568498 B/op    7054 allocs/op
+BenchmarkScan_AfterCompaction-8              3652   981661 ns/op   553585 B/op    7045 allocs/op
+```
+
+Observations:
+- Compaction of 1,000 keys across 2 SSTables: ~20 ms
+- Compaction of 10,000 keys across 10 SSTables: ~82 ms — roughly linear in key count
+- Tombstone-only compaction: ~5.6 ms (fast; no SSTable output to write)
+- Overwrite-heavy compaction: ~18.5 ms (similar to no-overwrite case; dominated by I/O)
+- Get (missing key): ~15.5 ns before, ~15.1 ns after — Bloom check cost identical; one SSTable vs two
+- Scan: ~988 µs before, ~982 µs after — near-identical (dominated by merge logic, not SSTable count)
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### Full Test Output (engine package)
+
+```
+--- PASS: TestCompact_EmptyEngine_IsNoOp (0.01s)
+--- PASS: TestCompact_ZeroSSTables_IsNoOp (0.01s)
+--- PASS: TestCompact_OneSsTable_IsNoOp (0.01s)
+--- PASS: TestCompact_MergesTwoSSTablesIntoOne (0.03s)
+--- PASS: TestCompact_PreservesLatestValueBySeq (0.03s)
+--- PASS: TestCompact_DropsOverwrittenOlderValues (0.04s)
+--- PASS: TestCompact_PreservesLiveKeysAcrossManySSTables (0.07s)
+--- PASS: TestCompact_DropsTombstonesInFullCompaction (0.02s)
+--- PASS: TestCompact_DeletedKeyRemainsAbsent (0.03s)
+--- PASS: TestCompact_AllDeleted_RemovesAllSSTables (0.03s)
+--- PASS: TestCompact_ScanBeforeAndAfterReturnsSameLiveResults (0.03s)
+--- PASS: TestCompact_GetBeforeAndAfterReturnsSameValues (0.03s)
+--- PASS: TestCompact_MemTableValueOverridesSSTable (0.03s)
+--- PASS: TestCompact_MemTableTombstoneOverridesSSTable (0.04s)
+--- PASS: TestCompact_DoesNotModifyWAL (0.03s)
+--- PASS: TestCompact_RestartLoadsCompactedSSTable (0.06s)
+--- PASS: TestCompact_RestartAfterAllDeletedLoadsZeroSSTables (0.03s)
+--- PASS: TestCompact_OldFilesRemovedAfterCompaction (0.04s)
+--- PASS: TestCompact_BloomSidecarExistsForCompactedSSTable (0.05s)
+--- PASS: TestCompact_BloomNegativeSkipWorksAfterCompaction (0.05s)
+--- PASS: TestCompact_ManifestContainsOneTableAfterMultiTableCompaction (0.07s)
+--- PASS: TestCompact_ManifestContainsZeroTablesAfterAllDeletedCompaction (0.03s)
+--- PASS: TestCompact_ManifestPathsRemainRelativeAfterCompaction (0.04s)
+--- PASS: TestCompact_AfterClose_ReturnsErrClosed (0.00s)
+--- PASS: TestCompact_Concurrent_RaceSafe (0.04s)
+--- PASS: TestCompact_PreservesSequenceNumbers (0.04s)
+--- PASS: TestCompact_UsesNewFileIDAndDoesNotOverwriteExistingFiles (0.04s)
+--- PASS: TestCompact_CorruptSSTableCausesError (0.03s)
+--- PASS: TestCompact_CorruptBloomSidecarDoesNotBlockCompact (0.04s)
+--- PASS: TestCompact_LargeWorkload (0.20s)
+--- PASS: TestCompact_StatsCompactionCountIncremented (0.08s)
+--- PASS: TestCompact_StatsLastCompactionInputTables (0.08s)
+ok  github.com/YashPatel2395/ShardForgeDB/internal/engine   3.989s
+```
+
+Total passing tests (all packages): 245
+New tests added in Phase 7: 32 (compact_test.go) + 8 benchmarks (compact_bench_test.go)
+
+### Limitations (Documented, Not Bugs)
+
+- Compact() is manual only — no background compaction, no automatic thresholds
+- No leveled compaction (L0 → L1 → ...) — single full-merge only
+- No size-tiered compaction — always merges all SSTables
+- MemTable is not compacted — only flushed SSTables are in scope
+- No partial compaction or range-limited compaction
+
+### Confirmation: Scope Unchanged
+
+No background compaction, no automatic thresholds, no leveled or size-tiered compaction, no vector search, no sharding, no replication, no distributed logic, no networking, no dashboard, no Raft was implemented. Phase 7 adds exactly: `Compact()`, compaction stats, and associated tests and documentation.
+
+---
+
+## Phase 7 — Review Fix: Safe Reader-Open Ordering
+
+**Date:** 2026-06-09
+**Go version:** go1.26.4 darwin/arm64
+**Branch:** `phase-7-compaction`
+
+### Correctness Blocker Fixed
+
+**Problem:** In the live-output compaction path, the code previously committed the manifest *before* opening the new compacted SSTable reader. If the reader open failed after manifest commit, the engine set `e.tables = nil` and returned an error — leaving the running engine with no access to any SSTable data until restart, even though the old readers were still valid and the old manifest was already replaced.
+
+**Fix:** The new compacted SSTable reader is now opened *before* saving the manifest. If the reader open fails:
+- The new SSTable and Bloom sidecar files are removed (best-effort)
+- `nextFileID` is decremented
+- `ErrCompactionFailed` is returned
+- `e.tables` is left unchanged — old readers continue working
+- The manifest is left unchanged — still lists the old SSTables
+
+Only after the reader opens successfully is the manifest committed. If the manifest save then fails:
+- The new reader is closed
+- New files are removed (best-effort)
+- `nextFileID` is decremented
+- `ErrCompactionFailed` is returned
+- `e.tables` and the manifest are both unchanged
+
+### Flush Path — Same Fix Applied
+
+The `flush()` function had the same ordering issue: manifest was committed before the new SSTable reader was opened. Since the fix was small, low-risk, and symmetric, the same safe ordering was applied to `flush()`:
+
+1. Write SSTable → write Bloom sidecar → **open reader** → save manifest → append to e.tables
+
+If the reader open fails in `flush()`: SSTable and Bloom sidecar are removed, `nextFileID` decremented, `ErrFlushFailed` returned. The MemTable is unchanged and still readable; the manifest is unchanged.
+
+Previously, the Flush path was less dangerous because the MemTable still held the data after a failed reader open (the MemTable reset and WAL rotation happen after the manifest commit). However, applying the same ordering eliminates the orphaned manifest entry and makes the invariant consistent: **a failed Flush or Compact never commits changes to the manifest without the reader being successfully open**.
+
+### Test Hook
+
+A package-level test hook was added to `engine.go`:
+
+```go
+// openSSTableReader is the function used to open an SSTable reader. Tests can
+// replace it to inject failures. Must be restored with defer.
+var openSSTableReader = sstable.Open
+```
+
+Production code in `flush()` and `compact()` calls `openSSTableReader(...)` instead of `sstable.Open(...)` directly.
+
+### Tests Added
+
+| Test | File | Description |
+|------|------|-------------|
+| `TestCompact_NewReaderOpenFailureLeavesOldStateUsable` | `compact_test.go` | Failed compacted-reader open: old tables and manifest unchanged, stats not incremented |
+| `TestFlush_NewReaderOpenFailureLeavesOldStateUsable` | `engine_test.go` | Failed flush-reader open: MemTable unchanged, manifest unchanged, no orphan files |
+
+### Updated Test Count
+
+| Package | Tests |
+|---------|-------|
+| `internal/engine` | **247** (was 245; +2 new) |
+| All packages combined | **247** engine + others = **247 total engine** |
+
+Total passing tests (all packages): 247
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./internal/engine/...
+go test -race -count=1 ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### All Tests Pass
+
+```
+--- PASS: TestCompact_NewReaderOpenFailureLeavesOldStateUsable (0.05s)
+--- PASS: TestFlush_NewReaderOpenFailureLeavesOldStateUsable (0.01s)
+ok  github.com/YashPatel2395/ShardForgeDB/internal/engine   3.847s
+```
+
+All 247 engine tests pass. No regressions in any other package.
+
+### Scope Confirmation
+
+No background compaction, no automatic thresholds, no leveled or size-tiered compaction, no vector search, no sharding, no replication, no distributed logic, no networking, no dashboard, no Raft was implemented. Only correctness fix: safe reader-open ordering in `compact()` and `flush()`.
+
+---
+
 *Future phases will append their own sections to this document.*

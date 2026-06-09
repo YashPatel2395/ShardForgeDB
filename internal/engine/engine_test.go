@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/YashPatel2395/ShardForgeDB/internal/sstable"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -1251,5 +1253,84 @@ func TestOpen_ManifestRejectsEmptyTablePaths(t *testing.T) {
 				t.Errorf("expected ErrCorruptManifest for empty %s, got %v", tc.field, err)
 			}
 		})
+	}
+}
+
+// ── Flush safe-ordering: reader open before manifest commit ───────────────────
+
+// TestFlush_NewReaderOpenFailureLeavesOldStateUsable verifies that if opening
+// the new SSTable reader fails during Flush (after writing the SSTable file and
+// Bloom sidecar but before committing the manifest), Flush must:
+//   - return an error wrapping ErrFlushFailed
+//   - leave the MemTable unchanged (data still readable via MemTable)
+//   - leave the manifest unchanged (no new SSTable entry)
+//   - leave SSTableCount at 0 (no committed SSTable)
+//   - not increment FlushCount
+//   - clean up any orphan SSTable and Bloom sidecar files
+
+func TestFlush_NewReaderOpenFailureLeavesOldStateUsable(t *testing.T) {
+	dir := tmpDir(t)
+	e := openEngine(t, dir)
+	defer e.Close()
+
+	// Write to MemTable; do not flush yet.
+	mustPut(t, e, "key", "value")
+
+	// Snapshot manifest state before flush.
+	mBefore, _, err := loadManifest(dir)
+	if err != nil {
+		t.Fatalf("loadManifest before: %v", err)
+	}
+
+	// Install test hook: make the new SSTable reader open fail.
+	orig := openSSTableReader
+	defer func() { openSSTableReader = orig }()
+	openSSTableReader = func(path string, opts sstable.Options) (*sstable.Reader, error) {
+		return nil, fmt.Errorf("injected open failure")
+	}
+
+	// Flush must fail with ErrFlushFailed.
+	flushErr := e.Flush()
+	if flushErr == nil {
+		t.Fatal("expected Flush to return an error, got nil")
+	}
+	if !errors.Is(flushErr, ErrFlushFailed) {
+		t.Errorf("expected ErrFlushFailed, got %v", flushErr)
+	}
+
+	// Restore hook before further reads.
+	openSSTableReader = orig
+
+	// MemTable data must still be accessible.
+	if v, ok := mustGet(t, e, "key"); !ok || v != "value" {
+		t.Errorf("key: got (%q, %v) after failed flush", v, ok)
+	}
+	// No SSTable was committed.
+	if n := e.Stats().SSTableCount; n != 0 {
+		t.Errorf("SSTableCount = %d after failed flush, want 0", n)
+	}
+	// FlushCount must not have been incremented.
+	if n := e.Stats().FlushCount; n != 0 {
+		t.Errorf("FlushCount = %d after failed flush, want 0", n)
+	}
+	// Manifest must be unchanged.
+	mAfter, _, err := loadManifest(dir)
+	if err != nil {
+		t.Fatalf("loadManifest after: %v", err)
+	}
+	if len(mAfter.Tables) != len(mBefore.Tables) {
+		t.Errorf("manifest table count changed: before=%d after=%d",
+			len(mBefore.Tables), len(mAfter.Tables))
+	}
+	// No orphan SSTable files must remain on disk.
+	sstDir := filepath.Join(dir, sstablesDir)
+	entries, err := os.ReadDir(sstDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, de := range entries {
+		if filepath.Ext(de.Name()) == ".sst" {
+			t.Errorf("orphan SSTable file found after failed flush: %s", de.Name())
+		}
 	}
 }

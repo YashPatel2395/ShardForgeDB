@@ -301,11 +301,82 @@ All integers are little-endian. The wordCount safety cap is 2³⁰ words (8 GiB 
 
 ### Compaction
 
-Compaction merges SSTables to reclaim space and bound read amplification.
+**Phase 7 — Implemented** in `internal/engine` via `(*Engine) Compact() error`.
 
-- Levelled compaction strategy (similar to LevelDB / RocksDB).
-- Compaction runs in background goroutines, rate-limited to avoid write stalls.
-- Tombstone entries are purged during compaction.
+Compaction is **manual** and **full**: it merges all currently flushed SSTables into at most one compacted SSTable. The active MemTable and WAL are not modified.
+
+#### Preconditions
+
+- `Compact()` returns `ErrClosed` if the engine is closed.
+- `Compact()` returns `nil` immediately if there are 0 or 1 SSTables (no-op).
+- `Compact()` holds the engine write lock for its entire duration to ensure correctness without complexity.
+
+#### Merge Algorithm
+
+1. Scan all SSTables oldest-first via `Reader.Scan`.
+2. For each key, track the entry with the highest sequence number.
+3. If the winning entry is PUT, include it in the output (preserving the original sequence number).
+4. If the winning entry is DELETE (tombstone), **drop it**. This is safe because full compaction covers all SSTables — no older version of the key exists below the compacted level. After the manifest swap, the key is gone.
+5. Sort surviving entries lexicographically before writing.
+
+#### Output
+
+| Live entries | Action |
+|---|---|
+| 0 | Update manifest to empty table list. No new SSTable is written. |
+| ≥ 1 | Write one new compacted SSTable (new file ID). Write one new Bloom sidecar (live keys only). Update manifest to list only the new table. |
+
+#### Manifest Swap
+
+The manifest update is atomic (temp file + `fsync` + rename):
+
+```json
+{
+  "version":      1,
+  "next_file_id": N+1,
+  "next_seq":     M,
+  "tables": [
+    { "id": N, "sstable_path": "sstables/table-NNNNNN.sst", ... }
+  ]
+}
+```
+
+Old table IDs are removed from the manifest in one atomic write. Paths are relative; MinKey/MaxKey are base64-encoded.
+
+#### File Cleanup
+
+After the manifest commit:
+1. All old SSTable readers are closed.
+2. `e.tables` is replaced with the new single handle (or empty slice).
+3. Old SSTable and Bloom sidecar files are deleted best-effort. If deletion fails, the orphaned files are harmless because they are no longer in the manifest and are ignored on restart.
+
+#### Crash Safety
+
+| Crash point | Result |
+|---|---|
+| Before new manifest commit | Old manifest intact; any partially written compacted SSTable/Bloom is an orphan and ignored. |
+| After new manifest commit, before old file deletion | New manifest lists only the compacted table; old files are orphans, ignored on restart. |
+| After manifest clears all tables | Old files may remain as orphans; ignored on restart. |
+
+#### Compaction Stats
+
+`Stats()` reports:
+
+| Field | Description |
+|---|---|
+| `CompactionCount` | Number of successful `Compact()` calls that actually ran (no-ops not counted). |
+| `LastCompactionInputTables` | Number of SSTables merged in the most recent compaction. |
+| `LastCompactionOutputEntries` | Number of live entries written to the compacted SSTable (0 if all-deleted). |
+
+#### Known Limitations (Phase 7)
+
+- Manual full compaction only — no background goroutine, no automatic threshold.
+- No levels; all SSTables live at a single (L0-equivalent) level.
+- No size-tiered or leveled compaction strategy.
+- No range tombstones.
+- No snapshots or MVCC.
+- Old file deletion is best-effort; orphans are harmless but not cleaned up proactively.
+- Parent directory not fsynced after manifest rename.
 
 ---
 

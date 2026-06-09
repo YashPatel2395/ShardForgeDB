@@ -266,12 +266,14 @@ func runScan(cfg Config, rec *Recorder) error {
 
 // ── compaction ────────────────────────────────────────────────────────────────
 
-// runCompaction creates multiple SSTables, measures Gets before and after
-// manual full compaction, and records the compaction duration separately.
+// runCompaction creates multiple SSTables, measures Gets and Scans before and
+// after manual full compaction, and records the compaction duration separately.
 //
 // Measured operations:
 //   - sampleOps Get operations before Compact
+//   - scanSamples Scan operations before Compact
 //   - sampleOps Get operations after Compact
+//   - scanSamples Scan operations after Compact
 //
 // CompactDuration and Pre/PostCompactSSTableCount are stored in the Recorder.
 func runCompaction(cfg Config, rec *Recorder) error {
@@ -301,8 +303,10 @@ func runCompaction(cfg Config, rec *Recorder) error {
 
 	rec.preCompactSSTableCount = e.Stats().SSTableCount
 
-	// Sample Gets before compaction.
 	sampleOps := min(100, keysPerTable)
+	scanSamples := min(20, cfg.Scale.ScanCount)
+
+	// Sample Gets before compaction.
 	for i := 0; i < sampleOps; i++ {
 		t0 := time.Now()
 		val, _, err := e.Get(GenKey(i))
@@ -310,8 +314,33 @@ func runCompaction(cfg Config, rec *Recorder) error {
 			return fmt.Errorf("Get before compact %d: %w", i, err)
 		}
 		rec.recordOp(time.Since(t0))
+		rec.addPreCompactGet()
 		if len(val) > 0 {
 			rec.addBytesRead(uint64(len(val)))
+		}
+	}
+
+	// Sample Scans before compaction.
+	// Distribute scanSamples start offsets evenly across the loaded key space.
+	step := total / scanSamples
+	if step < 1 {
+		step = 1
+	}
+	for i := 0; i < scanSamples; i++ {
+		startIdx := (i * step) % total
+		endIdx := startIdx + cfg.Scale.RangeSize
+		if endIdx > total {
+			endIdx = total
+		}
+		t0 := time.Now()
+		entries, err := e.Scan(GenKey(startIdx), GenKey(endIdx))
+		if err != nil {
+			return fmt.Errorf("Scan before compact %d: %w", i, err)
+		}
+		rec.recordOp(time.Since(t0))
+		rec.addPreCompactScan()
+		for _, en := range entries {
+			rec.addBytesRead(uint64(len(en.Key) + len(en.Value)))
 		}
 	}
 
@@ -331,8 +360,28 @@ func runCompaction(cfg Config, rec *Recorder) error {
 			return fmt.Errorf("Get after compact %d: %w", i, err)
 		}
 		rec.recordOp(time.Since(t0))
+		rec.addPostCompactGet()
 		if len(val) > 0 {
 			rec.addBytesRead(uint64(len(val)))
+		}
+	}
+
+	// Sample Scans after compaction.
+	for i := 0; i < scanSamples; i++ {
+		startIdx := (i * step) % total
+		endIdx := startIdx + cfg.Scale.RangeSize
+		if endIdx > total {
+			endIdx = total
+		}
+		t0 := time.Now()
+		entries, err := e.Scan(GenKey(startIdx), GenKey(endIdx))
+		if err != nil {
+			return fmt.Errorf("Scan after compact %d: %w", i, err)
+		}
+		rec.recordOp(time.Since(t0))
+		rec.addPostCompactScan()
+		for _, en := range entries {
+			rec.addBytesRead(uint64(len(en.Key) + len(en.Value)))
 		}
 	}
 

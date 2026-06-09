@@ -1914,4 +1914,84 @@ No background compaction, no automatic compaction, no leveled or size-tiered com
 
 ---
 
+---
+
+## Phase 8 — Review Fix: Compaction Workload Coverage
+
+**Date:** 2026-06-09
+**Go version:** go1.26.4 darwin/arm64
+**Branch:** phase-8-benchmarks
+
+### Coverage Gap Fixed
+
+The original `runCompaction` workload measured only Get operations before and after compaction. The Phase 8 spec required both Get and Scan measurements to exercise both point-lookup and range-scan paths across the compaction boundary.
+
+### Changes Made
+
+| File | Change |
+|------|--------|
+| `internal/bench/workload.go` | `runCompaction` now measures Get + Scan before compact and Get + Scan after compact (deterministic, index-based start keys) |
+| `internal/bench/runner.go` | `Result` gains `PreCompactGetOps`, `PostCompactGetOps`, `PreCompactScanOps`, `PostCompactScanOps`; `Recorder` gains four corresponding counter fields and methods |
+| `internal/bench/report.go` | `compactionDetail` section now lists Gets/Scans before+after, total ops, and a note that both point lookups and range scans are measured; interpretation updated |
+| `internal/bench/bench_test.go` | Added `TestWorkload_Compaction_IncludesGetAndScanMeasurements`; added `sampleCompactionResult()` helper; added `TestReport_CompactionDetail_IncludesGetAndScanCounts` |
+| `docs/BENCHMARKS.md` | Regenerated via `make bench-report` |
+
+### Compaction Workload — Measured Operations
+
+With `small` scale:
+- **100 Gets before compact** — point lookups across 5 SSTables
+- **20 Scans before compact** — range scans (50 keys each) across 5 SSTables
+- **Compact** — merges 5 SSTables → 1
+- **100 Gets after compact** — point lookups against merged SSTable
+- **20 Scans after compact** — range scans against merged SSTable
+- **Total: 240 measured ops**
+
+### Tests Added / Updated
+
+| Test | Status |
+|------|--------|
+| `TestWorkload_Compaction_IncludesGetAndScanMeasurements` | New — verifies PreCompactGetOps/PostCompactGetOps/PreCompactScanOps/PostCompactScanOps all > 0; total ops = sum of all four; BytesRead exceeds Get-only minimum |
+| `TestReport_CompactionDetail_IncludesGetAndScanCounts` | New — verifies report contains Gets/Scans before+after and "Total measured ops" |
+| `TestWorkload_Compaction_SmallScale` | Unchanged — still verifies SSTable counts, CompactDuration, CompactionCount |
+
+### Updated Total Test Count
+
+| Package | Tests |
+|---------|-------|
+| `internal/bench` | 34 (was 31; +3 new tests) |
+| All other packages | unchanged |
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/bench/...
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...
+make test
+make vet
+make build
+make bench-report
+./bin/shardforge --help
+./bin/shardforge version
+go run ./cmd/shardforge-bench --scale small --out /tmp/shardforge-bench.md
+git status --short
+```
+
+### Benchmark Results (bench package, small scale, after fix)
+
+```
+BenchmarkGenKey-8                      48210788    70.15 ns/op      24 B/op    2 allocs/op
+BenchmarkGenValue_128-8                94784443    38.13 ns/op   128 B/op    0 allocs/op
+BenchmarkPercentile_1k-8               1436299     2513 ns/op    8248 B/op    3 allocs/op
+BenchmarkWorkload_WriteHeavy_Small-8   28         157670902 ns/op 1901156 B/op  15274 allocs/op
+BenchmarkWorkload_ReadHeavy_Small-8    24         156691549 ns/op 2334784 B/op  20834 allocs/op
+```
+
+### Confirmation: No New DB Feature Logic
+
+No background compaction, no automatic compaction, no leveled or size-tiered compaction, no vector search, no sharding, no replication, no distributed logic, no networking, no dashboard, no Raft, and no core engine behavior changes were made in this fix.
+
 *Future phases will append their own sections to this document.*

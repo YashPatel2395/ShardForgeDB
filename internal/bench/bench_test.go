@@ -283,6 +283,55 @@ func TestWorkload_Compaction_SmallScale(t *testing.T) {
 	}
 }
 
+func TestWorkload_Compaction_IncludesGetAndScanMeasurements(t *testing.T) {
+	res := runWorkload(t, "compaction")
+
+	// SSTable state around compaction.
+	if res.PreCompactSSTableCount < 2 {
+		t.Errorf("PreCompactSSTableCount = %d, want >= 2", res.PreCompactSSTableCount)
+	}
+	if res.PostCompactSSTableCount != 1 {
+		t.Errorf("PostCompactSSTableCount = %d, want 1", res.PostCompactSSTableCount)
+	}
+	if res.CompactDuration <= 0 {
+		t.Error("CompactDuration = 0, want > 0")
+	}
+
+	// Per-phase Get op counts.
+	if res.PreCompactGetOps <= 0 {
+		t.Errorf("PreCompactGetOps = %d, want > 0", res.PreCompactGetOps)
+	}
+	if res.PostCompactGetOps <= 0 {
+		t.Errorf("PostCompactGetOps = %d, want > 0", res.PostCompactGetOps)
+	}
+
+	// Per-phase Scan op counts.
+	if res.PreCompactScanOps <= 0 {
+		t.Errorf("PreCompactScanOps = %d, want > 0", res.PreCompactScanOps)
+	}
+	if res.PostCompactScanOps <= 0 {
+		t.Errorf("PostCompactScanOps = %d, want > 0", res.PostCompactScanOps)
+	}
+
+	// Total ops = Gets before + Scans before + Gets after + Scans after.
+	expectedOps := res.PreCompactGetOps + res.PreCompactScanOps +
+		res.PostCompactGetOps + res.PostCompactScanOps
+	if res.Operations != expectedOps {
+		t.Errorf("Operations = %d, want %d (PreGet+PreScan+PostGet+PostScan)",
+			res.Operations, expectedOps)
+	}
+
+	// BytesRead must exceed what Get-only sampling would produce.
+	// Get-only minimum: sampleOps*2 * ValueSize. Scans read key+value per entry,
+	// covering RangeSize keys per scan, so BytesRead must be strictly larger.
+	sc := Scales["small"]
+	getOnlyMinBytes := uint64(res.PreCompactGetOps+res.PostCompactGetOps) * uint64(sc.ValueSize)
+	if res.BytesRead <= getOnlyMinBytes {
+		t.Errorf("BytesRead = %d, want > %d (Get-only minimum — Scans should contribute additional bytes)",
+			res.BytesRead, getOnlyMinBytes)
+	}
+}
+
 func TestWorkload_Restart_SmallScale(t *testing.T) {
 	res := runWorkload(t, "restart")
 	// Restart measures exactly 1 operation (the reopen).
@@ -339,6 +388,28 @@ func sampleResults() []Result {
 			BloomChecks:        500,
 			BloomNegativeSkips: 25,
 		},
+	}
+}
+
+func sampleCompactionResult() Result {
+	return Result{
+		Name:                    "compaction",
+		Operations:              240,
+		Duration:                200 * time.Millisecond,
+		OpsPerSec:               1200,
+		P50Latency:              2 * time.Microsecond,
+		P95Latency:              4 * time.Microsecond,
+		P99Latency:              8 * time.Microsecond,
+		BytesRead:               512000,
+		FinalSSTableCount:       1,
+		CompactionCount:         1,
+		PreCompactSSTableCount:  5,
+		PostCompactSSTableCount: 1,
+		CompactDuration:         30 * time.Millisecond,
+		PreCompactGetOps:        100,
+		PostCompactGetOps:       100,
+		PreCompactScanOps:       20,
+		PostCompactScanOps:      20,
 	}
 }
 
@@ -402,6 +473,30 @@ func TestReport_ContainsScaleName(t *testing.T) {
 	}
 	if !strings.Contains(sb.String(), "small") {
 		t.Error("report does not contain scale name 'small'")
+	}
+}
+
+func TestReport_CompactionDetail_IncludesGetAndScanCounts(t *testing.T) {
+	cfg := Config{Scale: Scales["small"], Seed: 42}
+	results := []Result{sampleCompactionResult()}
+	var sb strings.Builder
+	if err := WriteReport(&sb, "small", cfg, results); err != nil {
+		t.Fatalf("WriteReport: %v", err)
+	}
+	out := sb.String()
+
+	required := []string{
+		"## Compaction Detail",
+		"Gets before compact",
+		"Gets after compact",
+		"Scans before compact",
+		"Scans after compact",
+		"Total measured ops",
+	}
+	for _, s := range required {
+		if !strings.Contains(out, s) {
+			t.Errorf("compaction detail section missing: %q", s)
+		}
 	}
 }
 

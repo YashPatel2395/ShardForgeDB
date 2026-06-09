@@ -136,12 +136,18 @@ func compactionDetail(results []Result) string {
 		if r.Name == "compaction" && (r.PreCompactSSTableCount > 0 || r.PostCompactSSTableCount > 0) {
 			var sb strings.Builder
 			sb.WriteString("## Compaction Detail\n\n")
+			sb.WriteString("> The compaction workload measures both point lookups (Get) and range scans (Scan)\n")
+			sb.WriteString("> before and after manual full compaction.\n\n")
 			sb.WriteString("| Metric | Value |\n")
 			sb.WriteString("|--------|-------|\n")
 			sb.WriteString(fmt.Sprintf("| SSTables before compact | %d |\n", r.PreCompactSSTableCount))
 			sb.WriteString(fmt.Sprintf("| SSTables after compact | %d |\n", r.PostCompactSSTableCount))
 			sb.WriteString(fmt.Sprintf("| Compact duration | %s |\n", fmtDuration(r.CompactDuration)))
-			sb.WriteString(fmt.Sprintf("| Gets measured (before + after) | %d |\n", r.Operations))
+			sb.WriteString(fmt.Sprintf("| Gets before compact | %d |\n", r.PreCompactGetOps))
+			sb.WriteString(fmt.Sprintf("| Gets after compact | %d |\n", r.PostCompactGetOps))
+			sb.WriteString(fmt.Sprintf("| Scans before compact | %d |\n", r.PreCompactScanOps))
+			sb.WriteString(fmt.Sprintf("| Scans after compact | %d |\n", r.PostCompactScanOps))
+			sb.WriteString(fmt.Sprintf("| Total measured ops (Get + Scan, before + after) | %d |\n", r.Operations))
 			sb.WriteString("\n---\n\n")
 			return sb.String()
 		}
@@ -177,10 +183,11 @@ func interpretation(results []Result) string {
 		"Ops/sec reflects full scan completions per second, not individual key reads.\n\n")
 
 	sb.WriteString("### compaction\n\n")
-	sb.WriteString("Compares Get latency before and after manual full compaction. " +
-		"After compaction the engine holds a single merged SSTable, reducing the " +
-		"number of files and Bloom filter checks per lookup. " +
-		"The compact duration is listed separately in the Compaction Detail table.\n\n")
+	sb.WriteString("Measures both Get (point lookup) and Scan (range) latency before and after " +
+		"manual full compaction. After compaction the engine holds a single merged SSTable, " +
+		"reducing the number of files and Bloom filter checks per lookup. " +
+		"The compact duration and per-phase op counts are listed in the Compaction Detail table. " +
+		"Total measured ops = Gets before + Scans before + Gets after + Scans after.\n\n")
 
 	sb.WriteString("### restart\n\n")
 	sb.WriteString("Measures engine reopen latency including WAL replay and SSTable manifest load. " +

@@ -151,6 +151,12 @@ type Result struct {
 	PreCompactSSTableCount  int
 	PostCompactSSTableCount int
 	CompactDuration         time.Duration
+
+	// Compaction-workload per-phase op counts (zero for other workloads).
+	PreCompactGetOps   int
+	PostCompactGetOps  int
+	PreCompactScanOps  int
+	PostCompactScanOps int
 }
 
 // ── Recorder ──────────────────────────────────────────────────────────────────
@@ -176,6 +182,12 @@ type Recorder struct {
 	postCompactSSTableCount int
 	compactDuration         time.Duration
 	finalStats              engineSnapshot
+
+	// Per-phase op counts for the compaction workload.
+	preCompactGetOps   int
+	postCompactGetOps  int
+	preCompactScanOps  int
+	postCompactScanOps int
 }
 
 func (r *Recorder) recordOp(d time.Duration) {
@@ -184,6 +196,11 @@ func (r *Recorder) recordOp(d time.Duration) {
 
 func (r *Recorder) addBytesWritten(n uint64) { r.bytesWritten += n }
 func (r *Recorder) addBytesRead(n uint64)    { r.bytesRead += n }
+
+func (r *Recorder) addPreCompactGet()   { r.preCompactGetOps++ }
+func (r *Recorder) addPostCompactGet()  { r.postCompactGetOps++ }
+func (r *Recorder) addPreCompactScan()  { r.preCompactScanOps++ }
+func (r *Recorder) addPostCompactScan() { r.postCompactScanOps++ }
 
 // result builds a Result from the recorder data and total workload wall time.
 func (r *Recorder) result(name string, total time.Duration) Result {
@@ -211,6 +228,10 @@ func (r *Recorder) result(name string, total time.Duration) Result {
 		PreCompactSSTableCount:  r.preCompactSSTableCount,
 		PostCompactSSTableCount: r.postCompactSSTableCount,
 		CompactDuration:         r.compactDuration,
+		PreCompactGetOps:        r.preCompactGetOps,
+		PostCompactGetOps:       r.postCompactGetOps,
+		PreCompactScanOps:       r.preCompactScanOps,
+		PostCompactScanOps:      r.postCompactScanOps,
 	}
 }
 

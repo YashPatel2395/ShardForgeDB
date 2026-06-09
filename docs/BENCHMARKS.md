@@ -52,12 +52,12 @@ Durations include preload time where applicable (see Interpretation).
 
 | Workload | Ops | Duration | Ops/sec | P50 | P95 | P99 | SSTables | Bloom Skips |
 |----------|----:|---------:|--------:|----:|----:|----:|:--------:|------------:|
-| write-heavy | 1000 | 154.8ms | 6458 | 5.0µs | 14.0µs | 62.6µs | 10 | 0 |
-| read-heavy | 1000 | 161.0ms | 6213 | 2.5µs | 4.1µs | 27.7µs | 10 | 0 |
-| mixed | 1000 | 232.2ms | 4307 | 5.2µs | 15.7µs | 89.6µs | 15 | 0 |
-| scan | 100 | 153.3ms | 652 | 114.9µs | 173.5µs | 244.9µs | 10 | 0 |
-| compaction | 200 | 118.3ms | 1691 | 2.7µs | 3.6µs | 5.4µs | 1 | 0 |
-| restart | 1 | 67.5ms | 15 | 1.0ms | 1.0ms | 1.0ms | 5 | 0 |
+| write-heavy | 1000 | 143.5ms | 6967 | 2.4µs | 5.1µs | 12.1µs | 10 | 0 |
+| read-heavy | 1000 | 166.8ms | 5996 | 1.1µs | 2.6µs | 3.2µs | 10 | 0 |
+| mixed | 1000 | 288.4ms | 3468 | 5.5µs | 18.0µs | 84.3µs | 15 | 0 |
+| scan | 100 | 172.4ms | 580 | 112.2µs | 138.0µs | 275.8µs | 10 | 0 |
+| compaction | 240 | 128.0ms | 1875 | 2.7µs | 119.0µs | 150.8µs | 1 | 0 |
+| restart | 1 | 90.4ms | 11 | 1.8ms | 1.8ms | 1.8ms | 5 | 0 |
 
 | Workload | Bytes Written | Bytes Read | Flush Count | Compaction Count |
 |----------|:-------------:|:----------:|:-----------:|:----------------:|
@@ -65,19 +65,26 @@ Durations include preload time where applicable (see Interpretation).
 | read-heavy | 0 B | 118.8 KiB | 10 | 0 |
 | mixed | 69.3 KiB | 18.8 KiB | 15 | 0 |
 | scan | 0 B | 679.5 KiB | 10 | 0 |
-| compaction | 0 B | 25.0 KiB | 5 | 1 |
+| compaction | 0 B | 302.3 KiB | 5 | 1 |
 | restart | 0 B | 0 B | 0 | 0 |
 
 ---
 
 ## Compaction Detail
 
+> The compaction workload measures both point lookups (Get) and range scans (Scan)
+> before and after manual full compaction.
+
 | Metric | Value |
 |--------|-------|
 | SSTables before compact | 5 |
 | SSTables after compact | 1 |
-| Compact duration | 27.5ms |
-| Gets measured (before + after) | 200 |
+| Compact duration | 33.4ms |
+| Gets before compact | 100 |
+| Gets after compact | 100 |
+| Scans before compact | 20 |
+| Scans after compact | 20 |
+| Total measured ops (Get + Scan, before + after) | 240 |
 
 ---
 
@@ -101,7 +108,7 @@ Measures range Scan throughput over an ordered SSTable layout. Each scan reads R
 
 ### compaction
 
-Compares Get latency before and after manual full compaction. After compaction the engine holds a single merged SSTable, reducing the number of files and Bloom filter checks per lookup. The compact duration is listed separately in the Compaction Detail table.
+Measures both Get (point lookup) and Scan (range) latency before and after manual full compaction. After compaction the engine holds a single merged SSTable, reducing the number of files and Bloom filter checks per lookup. The compact duration and per-phase op counts are listed in the Compaction Detail table. Total measured ops = Gets before + Scans before + Gets after + Scans after.
 
 ### restart
 

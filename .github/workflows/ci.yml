@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    name: Build, Vet, Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21.x'
+          cache: true
+
+      # ── Module hygiene ────────────────────────────────────────────────────
+      - name: go mod tidy
+        run: go mod tidy
+
+      - name: Verify no uncommitted changes after tidy
+        run: |
+          if ! git diff --exit-code; then
+            echo "go mod tidy produced changes — commit the updated go.mod/go.sum"
+            exit 1
+          fi
+
+      # ── Formatting ────────────────────────────────────────────────────────
+      - name: go fmt
+        run: go fmt ./...
+
+      - name: Verify no formatting changes
+        run: |
+          if ! git diff --exit-code; then
+            echo "go fmt produced changes — commit the formatted files"
+            exit 1
+          fi
+
+      # ── Static analysis ───────────────────────────────────────────────────
+      - name: go vet
+        run: go vet ./...
+
+      # ── Tests ─────────────────────────────────────────────────────────────
+      - name: go test
+        run: go test -race -count=1 ./...
+
+      # ── Build ─────────────────────────────────────────────────────────────
+      - name: Build binary
+        run: go build -o bin/shardforge ./cmd/shardforge
+
+      # ── Smoke tests ───────────────────────────────────────────────────────
+      - name: shardforge --help
+        run: ./bin/shardforge --help
+
+      - name: shardforge version
+        run: ./bin/shardforge version

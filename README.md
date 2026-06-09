@@ -29,7 +29,7 @@ Cluster
   └── Replication  — leader/follower replication
 ```
 
-None of the above components are implemented in Phase 1. The architecture diagram reflects the intended final design.
+WAL (`internal/wal`) and MemTable (`internal/memtable`) are implemented as of Phase 3. All other components are intended design only — not yet implemented.
 
 ## Current Phase
 
@@ -44,17 +44,27 @@ None of the above components are implemented in Phase 1. The architecture diagra
 - [x] Design and proof documentation
 - [x] GitHub Actions CI
 
-**Phase 2 — WAL** (branch: `phase-2-wal`, in review)
+**Phase 2 — WAL** ✓ locked
 
 - [x] `internal/wal` — append-only, CRC-checksummed write-ahead log
 - [x] `Open`, `Append`, `Replay`, `Close` API
 - [x] Little-endian binary record format with sequence numbers
 - [x] Corruption detection and partial-tail tolerance
 - [x] Concurrent-safe appends
-- [x] 18 tests, 4 benchmarks
+- [x] 24 tests, 4 benchmarks
 
-> The WAL is not yet connected to a MemTable or Engine. No key-value reads or
-> writes are possible yet. No crash recovery pipeline exists end-to-end.
+**Phase 3 — MemTable** (branch: `phase-3-memtable`, in review)
+
+- [x] `internal/memtable` — ordered, concurrent in-memory write buffer
+- [x] `Put`, `Delete`, `Get`, `Scan`, `Len`, `ApproxBytes`, `ShouldFlush` API
+- [x] Lexicographically sorted key slice for ordered range scans
+- [x] Deletion tombstones (consistent with WAL `RecordDelete`)
+- [x] Defensive copies on all reads and writes; `sync.RWMutex` concurrency
+- [x] Size accounting (`len(key) + len(value) + 64 B overhead` per entry)
+- [x] 30 tests, 6 benchmarks
+
+> The MemTable is not yet connected to the WAL or Engine. Data is lost on
+> process restart — it is not durable by itself.
 
 ## Planned Phases
 
@@ -74,8 +84,7 @@ None of the above components are implemented in Phase 1. The architecture diagra
 
 The following are **not** present in the current codebase:
 
-- WAL (Write-Ahead Log)
-- MemTable
+- MemTable (partial — no WAL/Engine integration)
 - SSTables
 - Bloom filters
 - Compaction

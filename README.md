@@ -2,7 +2,7 @@
 
 An **explainable** distributed database engine for key-value and vector search workloads, written in Go.
 
-> **Phase 3 in review.** WAL and MemTable are implemented.
+> **Phase 4 in review.** WAL, MemTable, and SSTable are implemented.
 > No Engine-level integration exists yet.
 
 ---
@@ -29,7 +29,7 @@ Cluster
   └── Replication  — leader/follower replication
 ```
 
-WAL (`internal/wal`) and MemTable (`internal/memtable`) are implemented as of Phase 3. All other components are intended design only — not yet implemented.
+WAL (`internal/wal`), MemTable (`internal/memtable`), and SSTable (`internal/sstable`) are implemented as of Phase 4. All other components are intended design only — not yet implemented.
 
 ## Current Phase
 
@@ -53,7 +53,7 @@ WAL (`internal/wal`) and MemTable (`internal/memtable`) are implemented as of Ph
 - [x] Concurrent-safe appends
 - [x] 24 tests, 4 benchmarks
 
-**Phase 3 — MemTable** (branch: `phase-3-memtable`, in review)
+**Phase 3 — MemTable** ✓ locked
 
 - [x] `internal/memtable` — ordered, concurrent in-memory write buffer
 - [x] `Put`, `Delete`, `Get`, `Scan`, `Len`, `ApproxBytes`, `ShouldFlush` API
@@ -61,10 +61,22 @@ WAL (`internal/wal`) and MemTable (`internal/memtable`) are implemented as of Ph
 - [x] Deletion tombstones (consistent with WAL `RecordDelete`)
 - [x] Defensive copies on all reads and writes; `sync.RWMutex` concurrency
 - [x] Size accounting (`len(key) + len(value) + 64 B overhead` per entry)
-- [x] 30 tests, 6 benchmarks
+- [x] 30 tests, 7 benchmarks
 
-> The MemTable is not yet connected to the WAL or Engine. Data is lost on
-> process restart — it is not durable by itself.
+**Phase 4 — SSTable** (branch: `phase-4-sstable`, in review)
+
+- [x] `internal/sstable` — immutable, sorted, on-disk SSTable file format
+- [x] `Create`, `Open`, `Get`, `Scan`, `Len`, `Metadata`, `Close` API
+- [x] Binary file format: header, data records, index block, footer
+- [x] CRC-32 checksums on every data record and on the footer
+- [x] Dense in-memory index for O(log n) Get (binary search + single disk seek)
+- [x] Atomic creation via temp-file + rename; partial-write safe
+- [x] Deletion tombstones, sequence numbers, binary key/value support
+- [x] Concurrent-safe reads; `sync.RWMutex` around file access
+- [x] 35 tests, 7 benchmarks
+
+> SSTable is not yet connected to the MemTable or Engine. No Bloom filter,
+> compaction, or multi-SSTable lookup exists yet.
 
 ## Planned Phases
 
@@ -84,9 +96,8 @@ WAL (`internal/wal`) and MemTable (`internal/memtable`) are implemented as of Ph
 
 The following are **not** present in the current codebase:
 
-- WAL ↔ MemTable integration (write path not wired end-to-end)
+- WAL ↔ MemTable ↔ SSTable integration (write path not wired end-to-end)
 - Engine-level key-value read / write / delete
-- SSTables
 - Bloom filters
 - Compaction
 - Vector search / ANN index

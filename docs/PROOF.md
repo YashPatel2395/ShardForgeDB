@@ -669,4 +669,307 @@ Only the three review-fix files changed. No WAL, SSTable, Engine, or other inter
 
 ---
 
+---
+
+## Phase 4 — SSTable
+
+**Date:** 2026-06-09
+**Branch:** `phase-4-sstable`
+**Go version:** go1.26.4 darwin/arm64
+
+### Implemented Behaviour
+
+| Feature | Detail |
+|---------|--------|
+| `Create` | Writes immutable SSTable to disk atomically (temp + rename); validates all entries before I/O |
+| `Open` | Reads footer, verifies header magic + footer magic + footer CRC, loads index into memory |
+| `Get` | Binary-searches in-memory index, seeks to record, verifies CRC, returns deep copy |
+| `Scan` | Iterates index range, reads each record from disk with CRC verification, returns deep copies |
+| `Len` | Returns entry count from metadata |
+| `Metadata` | Returns defensive copy of path, count, MinKey, MaxKey, SizeBytes |
+| `Close` | Closes file; subsequent Get/Scan return ErrClosed; double Close returns ErrClosed |
+| Input validation | Rejects empty table, empty keys, unknown kind, unsorted entries, duplicate keys, oversized records |
+| Defensive copies | Create copies all input slices; Get/Scan/Metadata return deep copies |
+| Concurrency | `sync.RWMutex` around file; concurrent Get/Scan safe; race-detector clean |
+| Atomic create | Write to temp file, sync, rename; failed create leaves no partial final file |
+
+### File Format
+
+```
+[header: magic(8) + version(2)]
+[data record 0..N-1: recordLen(4) + crc32(4) + seq(8) + kind(1) + keyLen(4) + valueLen(4) + key + value]
+[index block: per-entry keyLen(4) + key + offset(8) + recordLen(4)]
+[footer: indexOffset(8) + indexLen(8) + entryCount(8) + footerCRC(4) + magic(8)]
+```
+
+All integers little-endian. CRC-32 (IEEE) on every record body and on footer fields.
+
+### Tests — 35 tests, all PASS
+
+| # | Test | Status |
+|---|------|--------|
+| 1 | `TestCreate_WritesFile` | PASS |
+| 2 | `TestOpen_ReadsMetadata` | PASS |
+| 3 | `TestCreate_RejectsEmptyTable` | PASS |
+| 4 | `TestCreate_RejectsEmptyKey` | PASS |
+| 5 | `TestCreate_RejectsUnknownKind` | PASS |
+| 6 | `TestCreate_RejectsUnsortedEntries` | PASS |
+| 7 | `TestCreate_RejectsDuplicateKeys` | PASS |
+| 8 | `TestCreate_RejectsOversizedRecord` | PASS |
+| 9 | `TestGet_ExistingPut` | PASS |
+| 10 | `TestGet_MissingKey` | PASS |
+| 11 | `TestGet_Tombstone` | PASS |
+| 12 | `TestScan_SortedOrder` | PASS |
+| 13 | `TestScan_StartInclusive` | PASS |
+| 14 | `TestScan_EndExclusive` | PASS |
+| 15 | `TestScan_NilBoundsReturnsAll` | PASS |
+| 16 | `TestScan_IncludesTombstones` | PASS |
+| 17 | `TestBinaryKeysAndValues` | PASS |
+| 18 | `TestSequenceNumbers_Preserved` | PASS |
+| 19 | `TestGet_CallerMutationSafe` | PASS |
+| 20 | `TestScan_CallerMutationSafe` | PASS |
+| 21 | `TestMetadata_KeysMutationSafe` | PASS |
+| 22 | `TestOpen_DetectsBadMagic` | PASS |
+| 23 | `TestOpen_DetectsCorruptFooterChecksum` | PASS |
+| 24 | `TestGet_DetectsCorruptRecord` | PASS |
+| 25 | `TestScan_DetectsCorruptRecord` | PASS |
+| 26 | `TestOpen_TruncatedFile` | PASS |
+| 27 | `TestClose_ThenGet_ReturnsErrClosed` | PASS |
+| 28 | `TestClose_ThenScan_ReturnsErrClosed` | PASS |
+| 29 | `TestClose_CalledTwice_ReturnsErrClosed` | PASS |
+| 30 | `TestConcurrent_RaceSafe` | PASS |
+| 31 | `TestCreate_FailureNoPartialFile` | PASS |
+| 32 | `TestLargeTable` | PASS |
+| 33 | `TestMetadata_CreateMatchesOpen` | PASS |
+| 34 | `TestScan_StartAfterEnd_ReturnsEmpty` | PASS |
+| 35 | `TestScan_DeterministicAfterSortedCreate` | PASS |
+
+### Full Test Results (all packages)
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge       3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config      8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging     7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable   30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/sstable    35 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal        24 PASS
+```
+
+**Total: 107 tests, 107 PASS, 0 FAIL**
+
+### Benchmarks (Apple M3, darwin/arm64, `-benchtime=3s`)
+
+```
+BenchmarkCreate_1k-8         448    8183444 ns/op     106660 B/op    2023 allocs/op
+BenchmarkCreate_100k-8         7  492694869 ns/op   10408769 B/op  200026 allocs/op
+BenchmarkOpen_100k-8        2611    1611486 ns/op    8408208 B/op  100011 allocs/op
+BenchmarkGet_Existing-8  4518351        799 ns/op          80 B/op       3 allocs/op
+BenchmarkGet_Missing-8  100000000       33.4 ns/op          0 B/op       0 allocs/op
+BenchmarkScan_1k-8          4621     779236 ns/op     225984 B/op    3011 allocs/op
+BenchmarkScan_100k-8          40   82841256 ns/op   42511430 B/op  300029 allocs/op
+```
+
+Observations:
+- `Get` (missing): ~33 ns — in-memory binary search, no disk I/O.
+- `Get` (existing): ~800 ns — binary search + single pread syscall + CRC verify.
+- `Open` (100k): ~1.6 ms — footer read + index decode (~8 MiB into RAM).
+- `Create` (1k): ~8.2 ms dominated by temp-file write + sync + rename.
+- `Scan` (100k): ~83 ms — 100k pread calls; no block caching yet.
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/sstable/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### git status --short (before commit)
+
+```
+ M internal/sstable/sstable.go
+?? internal/sstable/sstable_bench_test.go
+?? internal/sstable/sstable_test.go
+```
+
+Only SSTable files changed. WAL, MemTable, and all other packages untouched.
+
+### Known Limitations
+
+- No Bloom filter — every `Get` for an existing key requires a disk seek; missing-key detection is in-memory only (index binary search).
+- No block cache — data reads rely on the OS page cache.
+- Dense index (one entry per key) — index grows linearly with entry count; loads entirely into RAM.
+- No compression or encryption.
+- No block-level data layout — data region is a flat record stream.
+- No compaction — multi-SSTable lookup logic belongs to the Engine (future phase).
+- SSTable is not wired to MemTable or Engine.
+- Parent directory is not fsynced after atomic rename.
+
+### Confirmation: No Non-SSTable Internals Implemented
+
+- `internal/bloom` — placeholder only
+- `internal/engine` — placeholder only
+- `internal/vector` — placeholder only
+- `internal/cluster` — placeholder only
+- `internal/storage` — placeholder only
+- `internal/bench` — placeholder only
+- `internal/wal` — unchanged
+- `internal/memtable` — unchanged
+
+---
+
+---
+
+## Phase 4 — SSTable: Review Fixes
+
+**Date:** 2026-06-09
+**Branch:** `phase-4-sstable`
+**Go version:** go1.26.4 darwin/arm64
+
+### Review Blockers Fixed
+
+| # | Blocker | Fix |
+|---|---------|-----|
+| 1 | Index writer used `[keyLen][offset][recordLen][key]` but docs specified `[keyLen][key][offset][recordLen]` | Rewrote index writer to emit key bytes immediately after keyLen; rewrote reader to parse in the same order; added `TestIndexLayout_MatchesDocumented` to prove on-disk bytes match the documented layout |
+| 2 | `Open` never validated the header version field | Added version check in `load`; non-`tableVersion` (1) → `ErrCorruptTable`; added `TestOpen_DetectsUnsupportedVersion` |
+| 3 | `readRecord` allocated `make([]byte, recLen)` before validating recLen | Added pre-allocation checks: `recLen >= bodyFixedSize`, `recLen <= r.maxRecordSize`, `recLen == ie.recordLen`; Reader now stores `maxRecordSize`; added 3 tests |
+| 4 | `readRecord` never validated decoded `kind` | After CRC verification, check kind is `EntryPut` or `EntryDelete`; added `TestGet_DetectsInvalidRecordKind` (kind corrupted but CRC recomputed) |
+| 5 | `readRecord` never cross-checked decoded key against index key | After decoding key, check `string(key) == string(ie.key)`; added `TestGet_DetectsIndexRecordKeyMismatch` (key corrupted, CRC recomputed) |
+| 6 | `load` did not validate the decoded index beyond bounds | Added: count == entryCount, strict key sort, per-entry offset in data region, per-entry recordLen in [bodyFixedSize, MaxRecordSize]; used uint64 arithmetic throughout; added 4 tests |
+
+### Tests Added (12 new)
+
+| Test | Blocker |
+|------|---------|
+| `TestIndexLayout_MatchesDocumented` | 1 |
+| `TestOpen_DetectsUnsupportedVersion` | 2 |
+| `TestGet_OversizedRecordLen_ReturnsErrCorruptTable` | 3a |
+| `TestGet_UndersizedRecordLen_ReturnsErrCorruptTable` | 3b |
+| `TestGet_RecordLenMismatchesIndex_ReturnsErrCorruptTable` | 3c |
+| `TestGet_DetectsInvalidRecordKind` | 4 |
+| `TestGet_DetectsIndexRecordKeyMismatch` | 5 |
+| `TestOpen_DetectsEntryCountMismatch` | 6a |
+| `TestOpen_DetectsUnsortedIndex` | 6b |
+| `TestOpen_DetectsIndexOffsetOutOfRange` | 6c |
+| `TestOpen_DetectsIndexRecordLenTooLarge` | 6d |
+| *(layout proof test counted above)* | |
+
+Also added `rewriteRecordBody` and `rewriteFooter` test helpers for CRC-consistent corruption.
+
+### Updated Total Test Count
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge       3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config      8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging     7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable   30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/sstable    45 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal        24 PASS
+```
+
+**Total: 117 tests, 117 PASS, 0 FAIL** (was 107; +10 SSTable)
+
+### Benchmark Results (Apple M3, darwin/arm64)
+
+```
+BenchmarkCreate_1k-8         379    9,700,168 ns/op     106,687 B/op    2,023 allocs/op
+BenchmarkCreate_100k-8         5  647,838,658 ns/op  10,408,827 B/op  200,027 allocs/op
+BenchmarkOpen_100k-8        2113    1,811,942 ns/op   8,408,226 B/op  100,011 allocs/op
+BenchmarkGet_Existing-8  4,400,742        819 ns/op          80 B/op        3 allocs/op
+BenchmarkGet_Missing-8  100,000,000      33.1 ns/op           0 B/op        0 allocs/op
+BenchmarkScan_1k-8          4,556      780,376 ns/op     225,984 B/op    3,011 allocs/op
+BenchmarkScan_100k-8           43   86,350,372 ns/op  42,511,434 B/op  300,029 allocs/op
+```
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/sstable/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### git status --short (before commit)
+
+```
+ M internal/sstable/sstable.go
+ M internal/sstable/sstable_test.go
+```
+
+Only SSTable files changed. WAL, MemTable, and all other packages untouched.
+
+---
+
+---
+
+---
+
+## Phase 4 — SSTable: Final Review Fixes
+
+**Date:** 2026-06-09
+**Branch:** `phase-4-sstable`
+**Go version:** go1.26.4 darwin/arm64
+
+### Issues Fixed
+
+| # | Issue | Fix |
+|---|-------|-----|
+| 1 | `TestOpen_DetectsUnsupportedVersion` was broken: the test called `binary.Write(f, ...)` sequentially starting at offset 0, corrupting the magic sentinel bytes. It then used `WriteAt` at offset 8 (correct), but by then the magic was already wrong. The test passed because of bad magic, not version validation. | Removed the sequential-write block entirely. Replaced with a single `f.WriteAt(ver[:], 8)` call that modifies only the version field. |
+| 2 | Index offset validation in `load` checked `ie.offset < indexOffset` but not that the *complete* record `[offset, offset+recordHeaderSize+recordLen)` fits inside the data region. A record whose offset is just below `indexOffset` but whose body would extend past it was not detected. | Added an overflow-safe full-record boundary check after the per-entry offset and recordLen checks: `recordEnd := ie.offset + uint64(recordHeaderSize) + uint64(ie.recordLen); if recordEnd < ie.offset \|\| recordEnd > indexOffset { return ErrCorruptTable }`. |
+
+### Test Added (1 new)
+
+| Test | What it proves |
+|------|----------------|
+| `TestOpen_DetectsIndexRecordOverlapsIndex` | Corrupts the index entry `recordLen` to a value where `offset + recordHeaderSize + recordLen > indexOffset` (record body spills into the index block); verifies `Open` returns `ErrCorruptTable`. |
+
+### Updated Total Test Count
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge       3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config      8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging     7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable   30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/sstable    46 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal        24 PASS
+```
+
+**Total: 118 tests, 118 PASS, 0 FAIL** (was 117; +1 SSTable)
+
+### Commands Run
+
+```
+go fmt ./...
+go vet ./...
+go test -race -count=1 ./...
+```
+
+### git status --short (before commit)
+
+```
+ M docs/PROOF.md
+ M internal/sstable/sstable.go
+ M internal/sstable/sstable_test.go
+```
+
+Only SSTable files and PROOF.md changed. WAL, MemTable, and all other packages untouched.
+
+---
+
 *Future phases will append their own sections to this document.*

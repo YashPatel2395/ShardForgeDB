@@ -1,6 +1,6 @@
 # ShardForgeDB — High-Level Architecture Design
 
-> **Status:** WAL (`internal/wal`) and MemTable (`internal/memtable`) are implemented as of Phase 3.
+> **Status:** WAL (`internal/wal`), MemTable (`internal/memtable`), and SSTable (`internal/sstable`) are implemented as of Phase 4.
 > All other components described here are intended design only — not yet implemented.
 
 ---
@@ -106,11 +106,125 @@ Insertions maintain the sorted slice via binary search (`sort.SearchStrings`, O(
 
 ### SSTables (Sorted String Tables)
 
-SSTables are immutable, sorted, on-disk files produced by MemTable flushes.
+**Phase 4 — Implemented** in `internal/sstable`.
 
-- Each SSTable has a data block, index block, and metadata block.
-- SSTables are organised into levels (L0–LN) following an LSM-tree design.
-- L0 allows overlapping key ranges; deeper levels are non-overlapping.
+An SSTable is an immutable, sorted, on-disk file produced when a MemTable is flushed. It stores key-value entries (`EntryPut`) and deletion tombstones (`EntryDelete`) in lexicographic key order. Once written, the file is never modified.
+
+#### File Layout
+
+```
+[header]
+[data record 0]
+[data record 1]
+…
+[data record N-1]
+[index block]
+[footer]
+```
+
+#### Header (10 bytes)
+
+```
+[magic uint64][version uint16]
+```
+
+- `magic` = `0x53534853_46445442` (`SHSFDBTB` in ASCII) — identifies the file type.
+- `version` = `1`.
+
+#### Data Record
+
+```
+[recordLen uint32][crc32 uint32][seq uint64][kind uint8][keyLen uint32][valueLen uint32][key…][value…]
+```
+
+- `recordLen` — byte count of the body (everything after `crc32`).
+- `crc32` — IEEE CRC-32 computed over the body (`seq` through `value` bytes inclusive).
+- `kind` — `1 = EntryPut`, `2 = EntryDelete`.
+- All integers are little-endian.
+
+#### Index Block
+
+One entry per data record, written immediately after the last data record:
+
+```
+[keyLen uint32][key bytes][offset uint64][recordLen uint32]
+```
+
+- `offset` — file position of the data record's `recordLen` field.
+- `recordLen` — body length (redundant with the record header; kept for direct reads without seeking back).
+
+The index block is a dense index (one entry per key). On `Open`, the entire index is loaded into memory. The data region is never loaded.
+
+#### Footer (36 bytes)
+
+```
+[indexOffset uint64][indexLen uint64][entryCount uint64][footerCRC uint32][magic uint64]
+```
+
+- `footerCRC` — IEEE CRC-32 over `[indexOffset][indexLen][entryCount]` (24 bytes).
+- Trailing `magic` — same sentinel as header, confirms file is not truncated at the tail.
+
+#### Checksum Strategy
+
+- **Per-record CRC**: every data record body is checksummed. `Get` and `Scan` verify this on every read. A mismatch returns `ErrCorruptTable`.
+- **Footer CRC**: `[indexOffset][indexLen][entryCount]` are checksummed. `Open` verifies before loading the index.
+- **Header and footer magic**: validated by `Open` to catch non-SSTable files or truncation.
+- **Header version**: `Open` rejects any version other than `1` with `ErrCorruptTable`.
+
+#### Index Validation on Open
+
+After decoding the index, `Open` validates:
+- Decoded entry count equals the footer `entryCount`; mismatch → `ErrCorruptTable`.
+- Keys are strictly ascending; unsorted or duplicate keys → `ErrCorruptTable`.
+- Each record offset falls in `[headerSize, indexOffset)` (the data region); out-of-range → `ErrCorruptTable`.
+- Each index `recordLen` is in `[bodyFixedSize, MaxRecordSize]`; violation → `ErrCorruptTable`.
+
+#### readRecord Safety
+
+Before allocating the record body buffer, `readRecord` validates:
+- `recLen >= bodyFixedSize` — rejects truncated body lengths.
+- `recLen <= MaxRecordSize` — prevents OOM from a corrupt length field.
+- `recLen == index entry recordLen` — cross-checks the on-disk record header against the in-memory index.
+After CRC verification it additionally checks:
+- `kind` is `EntryPut` or `EntryDelete` — rejects semantically invalid kind bytes even if CRC passes.
+- Decoded key matches the index key — detects data corruption where CRC is recomputed but keys diverge.
+
+#### Read Path
+
+**Open:**
+1. Verify file size is at least `headerSize + footerSize`.
+2. Read header; verify magic and version.
+3. Seek to `fileSize - footerSize`, read footer, verify trailing magic and footer CRC.
+4. Seek to `indexOffset`, read `indexLen` bytes, decode index into memory.
+5. Validate decoded index (count, sort order, offsets, record lengths).
+
+**Get(key):**
+1. Binary-search in-memory index for `key`.
+2. If not found, return `(Entry{}, false, nil)`.
+3. Seek to `index[i].offset`, read `recordHeaderSize + recordLen` bytes.
+4. Verify CRC; decode and return a deep copy.
+
+**Scan(start, end):**
+1. Binary-search index for `start` to find `startIdx`.
+2. Iterate index from `startIdx` while `key < end`.
+3. For each matching index entry, read record from disk, verify CRC, append deep copy to result.
+
+#### Atomic Creation
+
+`Create` writes to a temporary file (same directory as the target), syncs, then calls `os.Rename`. If any step fails, the temp file is removed and the target path is never created or modified.
+
+Limitation: the parent directory is not fsynced after rename (a future improvement).
+
+#### Known Limitations (Phase 4)
+
+- No Bloom filter; every `Get` for a missing key does a binary index search (no disk I/O) but confirms absence only after scanning the in-memory index.
+- No block cache; data reads go to the OS page cache only.
+- Dense index (one entry per key) — no sparse index, so large tables consume proportional RAM.
+- No compression or encryption.
+- No block-level layout; the data region is a flat record stream.
+- No compaction; multi-SSTable lookup logic is the Engine's responsibility.
+- SSTable is not yet wired to the MemTable or Engine.
+- Parent directory is not fsynced after rename.
 
 ### Bloom Filters
 

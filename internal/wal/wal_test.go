@@ -432,6 +432,174 @@ func TestAppend_CallerMutationSafe(t *testing.T) {
 	}
 }
 
+// ── Test 19: Single corrupt record returns ErrCorruptRecord ──────────────────
+// A WAL with only one record whose CRC is wrong must return ErrCorruptRecord.
+// Prior implementation silently stopped at EOF instead.
+
+func TestReplay_SingleCorruptRecord_ReturnsError(t *testing.T) {
+	w, path := openTemp(t, Options{})
+	mustAppend(t, w, Record{Type: RecordPut, Key: []byte("k"), Value: []byte("v")})
+	w.Close()
+
+	// Corrupt the CRC field (bytes 4–7) of the only record.
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{0xDE, 0xAD, 0xBE, 0xEF}, 4); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+
+	w2, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+
+	err = w2.Replay(func(Record) error { return nil })
+	if !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("expected ErrCorruptRecord for single corrupt record, got %v", err)
+	}
+}
+
+// ── Test 20: Last record corrupt returns ErrCorruptRecord ─────────────────────
+// Corrupting the final record of a multi-record WAL must return ErrCorruptRecord.
+
+func TestReplay_LastRecordCorrupt_ReturnsError(t *testing.T) {
+	w, path := openTemp(t, Options{})
+	mustAppend(t, w, Record{Type: RecordPut, Key: []byte("k1"), Value: []byte("v1")})
+	mustAppend(t, w, Record{Type: RecordPut, Key: []byte("k2"), Value: []byte("v2")})
+	w.Close()
+
+	// Locate the CRC field of the second (last) record.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstBodyLen := binary.LittleEndian.Uint32(data[0:4])
+	secondCRCOffset := int64(frameHeaderSize+int(firstBodyLen)) + 4
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{0xDE, 0xAD, 0xBE, 0xEF}, secondCRCOffset); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+
+	w2, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+
+	err = w2.Replay(func(Record) error { return nil })
+	if !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("expected ErrCorruptRecord for last corrupt record, got %v", err)
+	}
+}
+
+// ── Test 21: Replay rejects oversized body claim before allocation ─────────────
+// A frame header claiming bodyLen > MaxRecordSize must return ErrCorruptRecord
+// without allocating the body buffer.
+
+func TestReplay_RejectsOversizedBodyBeforeAlloc(t *testing.T) {
+	const limit = 64
+	w, path := openTemp(t, Options{MaxRecordSize: limit})
+	mustAppend(t, w, Record{Type: RecordPut, Key: []byte("k"), Value: []byte("v")})
+	w.Close()
+
+	// Append a header whose declared bodyLen is far above the limit.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hdr [frameHeaderSize]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], 1<<20) // 1 MiB >> 64 B limit
+	binary.LittleEndian.PutUint32(hdr[4:8], 0)
+	f.Write(hdr[:])
+	f.Close()
+
+	w2, err := Open(path, Options{MaxRecordSize: limit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+
+	err = w2.Replay(func(Record) error { return nil })
+	if !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("expected ErrCorruptRecord for oversized body claim, got %v", err)
+	}
+}
+
+// ── Test 22: Append rejects huge records before encoding ──────────────────────
+// A record whose body would exceed MaxRecordSize must be rejected before any
+// encoding or allocation.
+
+func TestAppend_RejectsHugeRecordBeforeEncoding(t *testing.T) {
+	const limit = 32 // bodyFixedSize(17) + key(20) = 37 > 32
+	w, _ := openTemp(t, Options{MaxRecordSize: limit})
+
+	bigKey := make([]byte, 20)
+	_, err := w.Append(Record{Type: RecordPut, Key: bigKey})
+	if !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("expected ErrRecordTooLarge before encoding, got %v", err)
+	}
+}
+
+// ── Test 23: Replay rejects body smaller than fixed body size ─────────────────
+// A complete 8-byte frame header claiming a bodyLen smaller than bodyFixedSize
+// cannot come from a valid Append — it is always corruption.
+
+func TestReplay_RejectsBodySmallerThanFixedSize(t *testing.T) {
+	w, path := openTemp(t, Options{})
+	mustAppend(t, w, Record{Type: RecordPut, Key: []byte("k"), Value: []byte("v")})
+	w.Close()
+
+	// Append a header claiming bodyLen=1 and then write that 1 byte so the body
+	// read succeeds — the size check must fire before the read.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hdr [frameHeaderSize]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], 1) // bodyLen=1 < bodyFixedSize=17
+	binary.LittleEndian.PutUint32(hdr[4:8], 0)
+	f.Write(hdr[:])
+	f.Write([]byte{0x42}) // the 1-byte body
+	f.Close()
+
+	w2, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+
+	err = w2.Replay(func(Record) error { return nil })
+	if !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("expected ErrCorruptRecord for body smaller than fixed size, got %v", err)
+	}
+}
+
+// ── Test 24: Close called twice returns ErrClosed ─────────────────────────────
+// The documented behavior is: subsequent calls to Close return ErrClosed.
+
+func TestClose_CalledTwiceReturnsErrClosed(t *testing.T) {
+	w, _ := openTemp(t, Options{})
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("first Close returned unexpected error: %v", err)
+	}
+	err := w.Close()
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("second Close: expected ErrClosed, got %v", err)
+	}
+}
+
 // ── Test 18: Reopen existing WAL appends without losing old records ───────────
 
 func TestReopen_PreservesOldRecords(t *testing.T) {

@@ -7,8 +7,8 @@
 //
 // # Binary record format
 //
-// Each record is written as a fixed-header frame followed by a variable-length
-// body:
+// Each record is written as a fixed-size frame header followed by a
+// variable-length body. All integers are little-endian.
 //
 //	┌─────────┬─────────┬─────────┬──────┬────────┬──────────┬────────────────┐
 //	│ length  │  crc32  │   seq   │ type │ keyLen │ valueLen │  key … value … │
@@ -16,18 +16,20 @@
 //	│  4 B    │  4 B    │  8 B    │ 1 B  │  4 B   │   4 B    │   variable     │
 //	└─────────┴─────────┴─────────┴──────┴────────┴──────────┴────────────────┘
 //
-// All integers are little-endian.
-//
 // "length" is the byte count of everything after the crc32 field
 // (i.e. seq + type + keyLen + valueLen + key bytes + value bytes).
 //
 // "crc32" is IEEE CRC-32 computed over those same bytes.
 //
-// A record whose checksum does not match is rejected as corrupt. A record
-// that is truncated at the very end of the file (incomplete header or body)
-// is treated as a partial tail write caused by a crash and is silently
-// skipped. Truncation anywhere except the last record is treated as
-// corruption.
+// # Partial-tail vs. corruption
+//
+// A partial tail (crash mid-write) produces an incomplete header or body:
+// io.ReadFull returns io.EOF or io.ErrUnexpectedEOF. That is a clean stop.
+//
+// A complete body whose checksum does not match the stored CRC is always
+// ErrCorruptRecord, regardless of whether the record is the last one in the
+// file. The distinction is intentional: a crashed write leaves bytes missing,
+// not bytes present-but-wrong.
 package wal
 
 import (
@@ -49,8 +51,8 @@ var ErrClosed = errors.New("wal: closed")
 // unknown type, …).
 var ErrInvalidRecord = errors.New("wal: invalid record")
 
-// ErrCorruptRecord is returned by Replay when a checksum mismatch is detected
-// at a record that is not at the tail of the file.
+// ErrCorruptRecord is returned by Replay when a complete record's checksum
+// does not match, or when a frame header contains an impossible body length.
 var ErrCorruptRecord = errors.New("wal: corrupt record")
 
 // ErrRecordTooLarge is returned when the encoded size of a record exceeds
@@ -87,8 +89,9 @@ type Options struct {
 	// Default: false (suitable for tests; set true in production).
 	SyncOnWrite bool
 
-	// MaxRecordSize is the maximum allowed encoded record size in bytes.
+	// MaxRecordSize is the maximum allowed body size in bytes.
 	// Append returns ErrRecordTooLarge when the limit is exceeded.
+	// Replay returns ErrCorruptRecord when a frame claims a larger body.
 	// Default (0): 64 MiB.
 	MaxRecordSize uint32
 }
@@ -160,7 +163,16 @@ func (w *WAL) Append(r Record) (uint64, error) {
 		return 0, err
 	}
 
-	// Defensive copies — protect against caller mutation.
+	// Pre-check body size before any allocation to prevent OOM from huge
+	// records. Use uint64 arithmetic to avoid uint32 overflow when summing
+	// bodyFixedSize + len(key) + len(value).
+	rawBodyLen := uint64(bodyFixedSize) + uint64(len(r.Key)) + uint64(len(r.Value))
+	if rawBodyLen > uint64(w.opts.MaxRecordSize) {
+		return 0, fmt.Errorf("%w: body would be %d bytes, limit is %d",
+			ErrRecordTooLarge, rawBodyLen, w.opts.MaxRecordSize)
+	}
+
+	// Defensive copies — protect against caller mutation after Append returns.
 	key := make([]byte, len(r.Key))
 	copy(key, r.Key)
 	value := make([]byte, len(r.Value))
@@ -176,17 +188,7 @@ func (w *WAL) Append(r Record) (uint64, error) {
 	w.seq++
 	seq := w.seq
 
-	buf, err := encodeRecord(seq, r.Type, key, value)
-	if err != nil {
-		return 0, err
-	}
-
-	// Enforce MaxRecordSize on the body portion (excludes the 8-byte header).
-	bodyLen := uint32(len(buf) - frameHeaderSize)
-	if bodyLen > w.opts.MaxRecordSize {
-		return 0, fmt.Errorf("%w: encoded body %d bytes exceeds limit %d",
-			ErrRecordTooLarge, bodyLen, w.opts.MaxRecordSize)
-	}
+	buf := encodeRecord(seq, r.Type, key, value)
 
 	if _, err := w.file.Write(buf); err != nil {
 		return 0, fmt.Errorf("wal: write: %w", err)
@@ -207,9 +209,14 @@ func (w *WAL) Append(r Record) (uint64, error) {
 // fn for each valid record. It stops and returns the first error returned by
 // fn, or any read/corruption error.
 //
-// A truncated final record (partial tail) is treated as a clean stop — this
-// can happen if the process crashed after a partial write. Corruption
-// (checksum mismatch) at any non-tail position is returned as ErrCorruptRecord.
+// Partial-tail handling: if the file ends in the middle of a frame header or
+// frame body (io.EOF / io.ErrUnexpectedEOF from io.ReadFull), Replay treats
+// it as a clean stop. This is the expected outcome when a process crashes
+// mid-write.
+//
+// Corruption: a complete body whose checksum does not match its stored CRC is
+// always ErrCorruptRecord — even when it is the last record in the file. A
+// crashed write leaves bytes absent, not bytes present-but-wrong.
 //
 // Replay must not be called concurrently with Append.
 func (w *WAL) Replay(fn func(Record) error) error {
@@ -233,7 +240,7 @@ func (w *WAL) Replay(fn func(Record) error) error {
 		_, err := io.ReadFull(w.file, header[:])
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				// Partial or missing header at the tail — treat as clean stop.
+				// Partial or missing header at the tail — clean stop.
 				break
 			}
 			return fmt.Errorf("wal: replay read header: %w", err)
@@ -242,44 +249,52 @@ func (w *WAL) Replay(fn func(Record) error) error {
 		bodyLen := binary.LittleEndian.Uint32(header[0:4])
 		storedCRC := binary.LittleEndian.Uint32(header[4:8])
 
+		// ── Validate body length before allocation ────────────────────────
+		// A valid record always has at least bodyFixedSize bytes.
+		// Anything larger than MaxRecordSize is impossible from a valid Append.
+		// Both conditions indicate a corrupt frame header, not a partial tail
+		// (we have a complete 8-byte header so the tail scenario does not apply).
+		if bodyLen > w.opts.MaxRecordSize {
+			return fmt.Errorf("%w: frame claims body of %d bytes, MaxRecordSize is %d",
+				ErrCorruptRecord, bodyLen, w.opts.MaxRecordSize)
+		}
+		if bodyLen < bodyFixedSize {
+			return fmt.Errorf("%w: frame claims body of %d bytes, minimum is %d",
+				ErrCorruptRecord, bodyLen, bodyFixedSize)
+		}
+
 		// ── Read body ────────────────────────────────────────────────────
 		body := make([]byte, bodyLen)
 		_, err = io.ReadFull(w.file, body)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				// Partial body at the tail — treat as clean stop.
+				// Partial body at the tail — clean stop.
 				break
 			}
 			return fmt.Errorf("wal: replay read body: %w", err)
 		}
 
 		// ── Verify checksum ───────────────────────────────────────────────
+		// The body is complete. A checksum mismatch is always ErrCorruptRecord.
+		// We do NOT treat tail-position CRC failures as a clean stop: a crashed
+		// write leaves a truncated record (caught above), not a full record with
+		// wrong bytes.
 		computed := crc32.Checksum(body, crcTable)
 		if computed != storedCRC {
-			// Peek ahead: if this is not the last record, it is mid-file corruption.
-			// We detect this by trying to read one more byte.
-			var probe [1]byte
-			n, _ := w.file.Read(probe[:])
-			if n > 0 {
-				// Not at EOF — corruption is in the middle of the file.
-				return fmt.Errorf("%w: checksum mismatch at non-tail record", ErrCorruptRecord)
-			}
-			// At EOF — this was the last record and it is corrupt; treat as partial tail.
-			break
+			return fmt.Errorf("%w: checksum mismatch (stored %08x, computed %08x)",
+				ErrCorruptRecord, storedCRC, computed)
 		}
 
 		// ── Decode body ───────────────────────────────────────────────────
-		if uint32(len(body)) < uint32(bodyFixedSize) {
-			return fmt.Errorf("%w: body too short (%d bytes)", ErrCorruptRecord, len(body))
-		}
-
 		seq := binary.LittleEndian.Uint64(body[0:8])
 		rtype := RecordType(body[8])
 		keyLen := binary.LittleEndian.Uint32(body[9:13])
 		valueLen := binary.LittleEndian.Uint32(body[13:17])
 
-		if uint32(len(body)) < uint32(bodyFixedSize)+keyLen+valueLen {
-			return fmt.Errorf("%w: body length mismatch", ErrCorruptRecord)
+		// Guard against keyLen+valueLen overflow and against a corrupt body
+		// where the declared lengths exceed the actual body bytes.
+		if uint64(keyLen)+uint64(valueLen) > uint64(bodyLen)-uint64(bodyFixedSize) {
+			return fmt.Errorf("%w: key+value lengths exceed body size", ErrCorruptRecord)
 		}
 
 		key := make([]byte, keyLen)
@@ -337,8 +352,9 @@ func (w *WAL) Close() error {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // encodeRecord serialises one record into the wire format and returns the
-// complete frame (header + body).
-func encodeRecord(seq uint64, rtype RecordType, key, value []byte) ([]byte, error) {
+// complete frame (header + body). The caller must validate body size before
+// calling encodeRecord.
+func encodeRecord(seq uint64, rtype RecordType, key, value []byte) []byte {
 	bodyLen := bodyFixedSize + len(key) + len(value)
 	buf := make([]byte, frameHeaderSize+bodyLen)
 
@@ -356,7 +372,7 @@ func encodeRecord(seq uint64, rtype RecordType, key, value []byte) ([]byte, erro
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(bodyLen))
 	binary.LittleEndian.PutUint32(buf[4:8], checksum)
 
-	return buf, nil
+	return buf
 }
 
 // validateRecord checks the caller-supplied record before encoding.

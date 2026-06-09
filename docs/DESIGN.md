@@ -47,9 +47,13 @@ Each record is encoded as a fixed-size frame header followed by a variable-lengt
 
 #### Corruption Handling
 
-- **Checksum mismatch at a non-tail record** → `ErrCorruptRecord` (replay aborted).
-- **Truncated final record** (partial header or body at EOF) → treated as a clean stop. This is normal after a crash-during-write scenario.
-- **Checksum mismatch at the tail** → treated as a partial tail write (clean stop), because there is no following record to confirm mid-file corruption.
+The distinction between a partial tail and corruption is based on which bytes are present, not on position:
+
+- **Partial header** — `io.ReadFull` returns `io.EOF` or `io.ErrUnexpectedEOF` while reading the 8-byte frame header → clean stop. The process crashed before it could write a complete frame header.
+- **Partial body** — `io.ReadFull` returns `io.EOF` or `io.ErrUnexpectedEOF` while reading the declared body → clean stop. The process crashed after writing the header but before finishing the body.
+- **Complete body, checksum mismatch** → `ErrCorruptRecord`, always, regardless of whether the record is the last one in the file. A crashed write leaves bytes *absent*, not bytes *present-but-wrong*. A complete record with the wrong CRC is data corruption, not a partial tail.
+- **Frame header claims `bodyLen > MaxRecordSize`** → `ErrCorruptRecord` immediately, before any allocation. Prevents OOM from a corrupt length field.
+- **Frame header claims `bodyLen < bodyFixedSize`** → `ErrCorruptRecord` immediately. No valid `Append` can produce a body smaller than the fixed overhead.
 
 #### Known Limitations (Phase 2)
 

@@ -1,6 +1,6 @@
 # ShardForgeDB — High-Level Architecture Design
 
-> **Status:** WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable`), and Bloom Filter (`internal/bloom`) are implemented as of Phase 5.
+> **Status:** WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable`), Bloom Filter (`internal/bloom`), and the single-node Engine (`internal/engine`) are implemented as of Phase 6.
 > All other components described here are intended design only — not yet implemented.
 
 ---
@@ -311,19 +311,118 @@ Compaction merges SSTables to reclaim space and bound read amplification.
 
 ## Engine Layer
 
-The `engine` package composes WAL + MemTable + SSTables into a unified key-value interface:
+**Phase 6 — Implemented** in `internal/engine`.
+
+The `engine` package composes WAL + MemTable + SSTable + Bloom Filter into a unified single-node key-value interface. This is a **single-node engine only** — no compaction, distribution, replication, or vector search.
+
+### API
+
+```go
+Open(opts Options) (*Engine, error)
+(*Engine) Put(key, value []byte) error
+(*Engine) Delete(key []byte) error
+(*Engine) Get(key []byte) ([]byte, bool, error)
+(*Engine) Scan(start, end []byte) ([]Entry, error)
+(*Engine) Flush() error
+(*Engine) Stats() Stats
+(*Engine) Close() error
+```
+
+### File Layout
 
 ```
-Put(key, value) error
-Get(key) (value, error)
-Delete(key) error
-Scan(start, end) (Iterator, error)
+<Dir>/
+  wal.log               — append-only write-ahead log
+  MANIFEST.json         — atomic JSON manifest (temp: MANIFEST.json.tmp)
+  sstables/
+    table-000001.sst    — immutable sorted SSTable
+    table-000001.bloom  — serialized Bloom filter sidecar
+    table-000002.sst
+    table-000002.bloom
 ```
 
-Reads follow this path:
-1. Check active MemTable.
-2. Check immutable (flushing) MemTable, if any.
-3. Consult each SSTable level, newest first, using Bloom filters to skip.
+### Write Path
+
+1. Validate key (non-empty).
+2. Acquire write lock.
+3. Assign next sequence number (engine-owned monotonic counter).
+4. Append WAL record (PUT or DELETE) — durable before MemTable is updated.
+5. Apply to MemTable.
+
+On WAL failure the sequence counter is rolled back; the MemTable is not updated.
+
+### Read Path (Get)
+
+1. Acquire read lock.
+2. Check MemTable — PUT → return copy; DELETE tombstone → return not-found.
+3. For each SSTable, newest to oldest:
+   a. Min/max key bounds check — skip if key is outside the SSTable's range.
+   b. Bloom filter check — skip (and increment `BloomNegativeSkips`) if absent.
+   c. `Reader.Get` — return on PUT or DELETE.
+4. Key not in any source → return (nil, false, nil).
+
+### Scan Path
+
+All sources (MemTable + all SSTables) are scanned. Results are merged into a `map[string]*candidate` keyed by string(key), keeping the highest-Seq entry per key. Only PUT entries survive; DELETE tombstones suppress all lower-Seq versions. The final result is sorted lexicographically and returned as `[]Entry`.
+
+### Flush
+
+Manual-only in this phase. Sequence:
+
+1. Snapshot MemTable via `Scan(nil, nil)` — all entries in sorted order.
+2. Convert to SSTable entries; write SSTable (atomic temp+rename inside `sstable.Create`).
+3. Build Bloom filter over all keys (including tombstones); serialize to `.bloom` sidecar file.
+4. Reload manifest from disk, append new `tableEntry`, save manifest atomically (temp+rename).
+5. Open `sstable.Reader` for the new SSTable; append `tableHandle` to `e.tables`.
+6. Reset MemTable.
+7. Rotate WAL: close, remove, reopen empty file.
+
+### Manifest Format
+
+`MANIFEST.json` is a JSON object tracking all flushed SSTables. Paths are relative to `Dir` so the directory is portable. `MinKey` and `MaxKey` are base64-encoded to support arbitrary binary keys.
+
+```json
+{
+  "version":      1,
+  "next_file_id": 3,
+  "next_seq":     42,
+  "tables": [
+    {
+      "id":           1,
+      "sstable_path": "sstables/table-000001.sst",
+      "bloom_path":   "sstables/table-000001.bloom",
+      "count":        100,
+      "min_key":      "<base64>",
+      "max_key":      "<base64>"
+    }
+  ]
+}
+```
+
+The manifest is written atomically via temp file + `fsync` + rename. The parent directory is not fsynced after rename (known limitation).
+
+### Recovery Invariants
+
+- **Crash before manifest update:** orphan SSTable and Bloom files may exist on disk but are absent from the manifest, so they are ignored on restart. No data loss.
+- **Crash after manifest update, before WAL rotation:** replaying the WAL re-applies entries already in the SSTable. The MemTable holds duplicate (higher-Seq) entries that shadow the SSTable during reads. Correct; a subsequent Flush consolidates.
+- **Sequence monotonicity:** `nextSeq` is initialized from `manifest.NextSeq` and bumped by WAL replay (`max(manifestSeq, maxWALSeq+1)`). This ensures sequence numbers never repeat across restarts.
+
+### Bloom Sidecar Strategy
+
+A fresh Bloom filter is built at flush time from all SSTable entries (including tombstones). The filter is serialized and written as a `.bloom` sidecar file alongside the `.sst` file. At `Open` time, both files are loaded together. The Bloom filter lives entirely in RAM; it is not embedded in the SSTable binary.
+
+### Known Limitations (Phase 6)
+
+- No compaction; read amplification grows linearly with flush count.
+- No background flush; callers must call Flush explicitly.
+- No WAL segment rotation; WAL is replaced in full after each flush.
+- No background cleanup of orphan SSTable/Bloom files.
+- No transactions, snapshots, or MVCC.
+- No compression or block cache.
+- No distributed/sharded/replicated mode.
+- No vector search.
+- Parent directory not fsynced after manifest rename.
+- Bloom sidecars are not embedded in SSTables.
 
 ---
 

@@ -18,8 +18,8 @@
 //
 // Double hashing with two deterministic FNV-1a 64-bit variants:
 //
-//	h1(x) = FNV-1a-64(x)          // standard FNV-1a seed
-//	h2(x) = FNV-1a-64(x XOR salt) // secondary seed (salt = 0x9e3779b97f4a7c15)
+//	h1(x) = FNV-1a-64(x)                     // standard FNV-1a seed
+//	h2(x) = FNV-1a-64(salt_bytes || x)       // secondary seed (salt = 0x9e3779b97f4a7c15)
 //
 // The i-th bit position for key x is:
 //
@@ -183,8 +183,9 @@ func New(opts Options) (*Filter, error) {
 	if opts.ExpectedItems == 0 {
 		return nil, fmt.Errorf("%w: ExpectedItems must be > 0", ErrInvalidOptions)
 	}
-	if opts.FalsePositiveRate <= 0 || opts.FalsePositiveRate >= 1 {
-		return nil, fmt.Errorf("%w: FalsePositiveRate must be in (0, 1), got %g",
+	if math.IsNaN(opts.FalsePositiveRate) || math.IsInf(opts.FalsePositiveRate, 0) ||
+		opts.FalsePositiveRate <= 0 || opts.FalsePositiveRate >= 1 {
+		return nil, fmt.Errorf("%w: FalsePositiveRate must be a finite value in (0, 1), got %g",
 			ErrInvalidOptions, opts.FalsePositiveRate)
 	}
 
@@ -384,6 +385,9 @@ func UnmarshalBinary(data []byte) (*Filter, error) {
 	}
 	if fpr <= 0 || fpr >= 1 || math.IsNaN(fpr) || math.IsInf(fpr, 0) {
 		return nil, fmt.Errorf("%w: impossible fpr %g", ErrCorruptFilter, fpr)
+	}
+	if expectedItems == 0 {
+		return nil, fmt.Errorf("%w: expectedItems is zero", ErrCorruptFilter)
 	}
 
 	// Validate wordCount against bitCount to detect internal inconsistency.

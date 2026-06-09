@@ -40,24 +40,24 @@ func TestNew_RejectsZeroExpectedItems(t *testing.T) {
 	}
 }
 
-// ── Test 2: New rejects FalsePositiveRate <= 0 ───────────────────────────────
+// ── Test 2+3: New rejects all invalid FalsePositiveRate values ───────────────
 
-func TestNew_RejectsFPRLessOrEqualZero(t *testing.T) {
-	for _, p := range []float64{0, -0.1, -1, math.Inf(-1)} {
-		_, err := New(Options{ExpectedItems: 100, FalsePositiveRate: p})
-		if !errors.Is(err, ErrInvalidOptions) {
-			t.Fatalf("expected ErrInvalidOptions for FPR=%g, got %v", p, err)
-		}
+func TestNew_RejectsInvalidFPR(t *testing.T) {
+	cases := []float64{
+		0,
+		-0.1,
+		-1,
+		1.0,
+		1.1,
+		2.0,
+		math.Inf(1),
+		math.Inf(-1),
+		math.NaN(),
 	}
-}
-
-// ── Test 3: New rejects FalsePositiveRate >= 1 ───────────────────────────────
-
-func TestNew_RejectsFPRGreaterOrEqualOne(t *testing.T) {
-	for _, p := range []float64{1.0, 1.1, 2.0, math.Inf(1)} {
+	for _, p := range cases {
 		_, err := New(Options{ExpectedItems: 100, FalsePositiveRate: p})
 		if !errors.Is(err, ErrInvalidOptions) {
-			t.Fatalf("expected ErrInvalidOptions for FPR=%g, got %v", p, err)
+			t.Errorf("expected ErrInvalidOptions for FPR=%g, got %v", p, err)
 		}
 	}
 }
@@ -407,6 +407,24 @@ func TestUnmarshal_RejectsZeroHashCount(t *testing.T) {
 	_, err := UnmarshalBinary(data)
 	if !errors.Is(err, ErrCorruptFilter) {
 		t.Fatalf("expected ErrCorruptFilter for zero hashCount, got %v", err)
+	}
+}
+
+// ── Test 24b: Unmarshal rejects zero expectedItems ────────────────────────────
+
+func TestUnmarshal_RejectsZeroExpectedItems(t *testing.T) {
+	f := mustNew(t, 100, 0.01)
+	data := mustMarshal(t, f)
+	// Overwrite expectedItems bytes [22:30] with zero.
+	binary.LittleEndian.PutUint64(data[22:30], 0)
+	// Recompute CRC so the checksum check passes — the expectedItems check must
+	// then catch the zero value independently.
+	crcEnd := len(data) - serialTrailerSize
+	newCRC := crc32.Checksum(data[:crcEnd], crcTable)
+	binary.LittleEndian.PutUint32(data[crcEnd:crcEnd+4], newCRC)
+	_, err := UnmarshalBinary(data)
+	if !errors.Is(err, ErrCorruptFilter) {
+		t.Fatalf("expected ErrCorruptFilter for zero expectedItems, got %v", err)
 	}
 }
 

@@ -1163,4 +1163,83 @@ Only Bloom Filter files and docs changed. WAL, MemTable, SSTable, and all other 
 
 ---
 
+---
+
+## Phase 5 — Bloom Filter: Review Fixes
+
+**Date:** 2026-06-09
+**Branch:** `phase-5-bloom`
+**Go version:** go1.26.4 darwin/arm64
+
+### Review Blockers Fixed
+
+| # | Issue | Fix |
+|---|-------|-----|
+| 1 | `New` accepted `math.NaN()` and `math.Inf(±1)` as `FalsePositiveRate` because both values pass `<= 0` and `>= 1` comparisons | Added `math.IsNaN` and `math.IsInf` guards before the range check in `New`; extended `TestNew_RejectsFPRLessOrEqualZero` + `TestNew_RejectsFPRGreaterOrEqualOne` into a single comprehensive `TestNew_RejectsInvalidFPR` covering 0, negatives, 1, >1, +Inf, -Inf, NaN |
+| 2 | `UnmarshalBinary` accepted serialized filters with `expectedItems == 0` if the CRC was recomputed, creating a state that `New` would reject | Added `if expectedItems == 0 { return ErrCorruptFilter }` in `UnmarshalBinary`; added `TestUnmarshal_RejectsZeroExpectedItems` |
+| 3 | Package doc comment said `h2(x) = FNV-1a-64(x XOR salt)` but the implementation feeds `salt_bytes || x` into the hasher (a salt prefix, not XOR) | Updated package-level hash strategy comment to `h2(x) = FNV-1a-64(salt_bytes \|\| x)` |
+
+### Tests Added / Updated
+
+| Test | Change |
+|------|--------|
+| `TestNew_RejectsInvalidFPR` | Replaces `TestNew_RejectsFPRLessOrEqualZero` + `TestNew_RejectsFPRGreaterOrEqualOne`; adds `math.Inf(+1)`, `math.Inf(-1)`, `math.NaN()` cases |
+| `TestUnmarshal_RejectsZeroExpectedItems` | New test; patches bytes [22:30], recomputes CRC, verifies `ErrCorruptFilter` |
+
+### Updated Total Test Count
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge       3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/bloom      35 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config      8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging     7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable   30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/sstable    46 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal        24 PASS
+```
+
+**Total: 153 tests, 153 PASS, 0 FAIL** (was 152; +1 Bloom, net: two old tests replaced by one + one new)
+
+### Benchmark Results (Apple M3, darwin/arm64, unchanged performance)
+
+```
+BenchmarkNew_1k-8                  23399350      135.5 ns/op     1376 B/op    2 allocs/op
+BenchmarkNew_1M-8                     88218    40930   ns/op  1204320 B/op    2 allocs/op
+BenchmarkAdd-8                    100000000       34.30 ns/op        0 B/op    0 allocs/op
+BenchmarkMightContain_Existing-8  137112006       25.71 ns/op        0 B/op    0 allocs/op
+BenchmarkMightContain_Missing-8   124787678       28.99 ns/op        0 B/op    0 allocs/op
+BenchmarkMarshalBinary-8            1550130     2410   ns/op    12288 B/op    1 allocs/op
+BenchmarkUnmarshalBinary-8          1340643     2662   ns/op    12384 B/op    2 allocs/op
+BenchmarkAdd_100k-8                    1138  3179959   ns/op   122976 B/op    2 allocs/op
+BenchmarkQuery_100k-8                  1167  3097168   ns/op        0 B/op    0 allocs/op
+```
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/bloom/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### git status --short (before commit)
+
+```
+ M docs/PROOF.md
+ M internal/bloom/bloom.go
+ M internal/bloom/bloom_test.go
+```
+
+Only Bloom Filter files and PROOF.md changed. WAL, MemTable, SSTable, and all other packages untouched.
+
+---
+
 *Future phases will append their own sections to this document.*

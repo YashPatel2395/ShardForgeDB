@@ -1,0 +1,21 @@
+# Build output
+bin/
+
+# Go test cache and coverage
+*.test
+*.out
+coverage.html
+
+# Editor and OS artifacts
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.*
+
+# Claude Code local settings
+.claude/

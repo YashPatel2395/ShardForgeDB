@@ -169,14 +169,34 @@ The index block is a dense index (one entry per key). On `Open`, the entire inde
 - **Per-record CRC**: every data record body is checksummed. `Get` and `Scan` verify this on every read. A mismatch returns `ErrCorruptTable`.
 - **Footer CRC**: `[indexOffset][indexLen][entryCount]` are checksummed. `Open` verifies before loading the index.
 - **Header and footer magic**: validated by `Open` to catch non-SSTable files or truncation.
+- **Header version**: `Open` rejects any version other than `1` with `ErrCorruptTable`.
+
+#### Index Validation on Open
+
+After decoding the index, `Open` validates:
+- Decoded entry count equals the footer `entryCount`; mismatch → `ErrCorruptTable`.
+- Keys are strictly ascending; unsorted or duplicate keys → `ErrCorruptTable`.
+- Each record offset falls in `[headerSize, indexOffset)` (the data region); out-of-range → `ErrCorruptTable`.
+- Each index `recordLen` is in `[bodyFixedSize, MaxRecordSize]`; violation → `ErrCorruptTable`.
+
+#### readRecord Safety
+
+Before allocating the record body buffer, `readRecord` validates:
+- `recLen >= bodyFixedSize` — rejects truncated body lengths.
+- `recLen <= MaxRecordSize` — prevents OOM from a corrupt length field.
+- `recLen == index entry recordLen` — cross-checks the on-disk record header against the in-memory index.
+After CRC verification it additionally checks:
+- `kind` is `EntryPut` or `EntryDelete` — rejects semantically invalid kind bytes even if CRC passes.
+- Decoded key matches the index key — detects data corruption where CRC is recomputed but keys diverge.
 
 #### Read Path
 
 **Open:**
 1. Verify file size is at least `headerSize + footerSize`.
-2. Read and verify header magic.
+2. Read header; verify magic and version.
 3. Seek to `fileSize - footerSize`, read footer, verify trailing magic and footer CRC.
 4. Seek to `indexOffset`, read `indexLen` bytes, decode index into memory.
+5. Validate decoded index (count, sort order, offsets, record lengths).
 
 **Get(key):**
 1. Binary-search in-memory index for `key`.

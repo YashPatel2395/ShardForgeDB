@@ -826,4 +826,94 @@ Only SSTable files changed. WAL, MemTable, and all other packages untouched.
 
 ---
 
+---
+
+## Phase 4 — SSTable: Review Fixes
+
+**Date:** 2026-06-09
+**Branch:** `phase-4-sstable`
+**Go version:** go1.26.4 darwin/arm64
+
+### Review Blockers Fixed
+
+| # | Blocker | Fix |
+|---|---------|-----|
+| 1 | Index writer used `[keyLen][offset][recordLen][key]` but docs specified `[keyLen][key][offset][recordLen]` | Rewrote index writer to emit key bytes immediately after keyLen; rewrote reader to parse in the same order; added `TestIndexLayout_MatchesDocumented` to prove on-disk bytes match the documented layout |
+| 2 | `Open` never validated the header version field | Added version check in `load`; non-`tableVersion` (1) → `ErrCorruptTable`; added `TestOpen_DetectsUnsupportedVersion` |
+| 3 | `readRecord` allocated `make([]byte, recLen)` before validating recLen | Added pre-allocation checks: `recLen >= bodyFixedSize`, `recLen <= r.maxRecordSize`, `recLen == ie.recordLen`; Reader now stores `maxRecordSize`; added 3 tests |
+| 4 | `readRecord` never validated decoded `kind` | After CRC verification, check kind is `EntryPut` or `EntryDelete`; added `TestGet_DetectsInvalidRecordKind` (kind corrupted but CRC recomputed) |
+| 5 | `readRecord` never cross-checked decoded key against index key | After decoding key, check `string(key) == string(ie.key)`; added `TestGet_DetectsIndexRecordKeyMismatch` (key corrupted, CRC recomputed) |
+| 6 | `load` did not validate the decoded index beyond bounds | Added: count == entryCount, strict key sort, per-entry offset in data region, per-entry recordLen in [bodyFixedSize, MaxRecordSize]; used uint64 arithmetic throughout; added 4 tests |
+
+### Tests Added (12 new)
+
+| Test | Blocker |
+|------|---------|
+| `TestIndexLayout_MatchesDocumented` | 1 |
+| `TestOpen_DetectsUnsupportedVersion` | 2 |
+| `TestGet_OversizedRecordLen_ReturnsErrCorruptTable` | 3a |
+| `TestGet_UndersizedRecordLen_ReturnsErrCorruptTable` | 3b |
+| `TestGet_RecordLenMismatchesIndex_ReturnsErrCorruptTable` | 3c |
+| `TestGet_DetectsInvalidRecordKind` | 4 |
+| `TestGet_DetectsIndexRecordKeyMismatch` | 5 |
+| `TestOpen_DetectsEntryCountMismatch` | 6a |
+| `TestOpen_DetectsUnsortedIndex` | 6b |
+| `TestOpen_DetectsIndexOffsetOutOfRange` | 6c |
+| `TestOpen_DetectsIndexRecordLenTooLarge` | 6d |
+| *(layout proof test counted above)* | |
+
+Also added `rewriteRecordBody` and `rewriteFooter` test helpers for CRC-consistent corruption.
+
+### Updated Total Test Count
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge       3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config      8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging     7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable   30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/sstable    45 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal        24 PASS
+```
+
+**Total: 117 tests, 117 PASS, 0 FAIL** (was 107; +10 SSTable)
+
+### Benchmark Results (Apple M3, darwin/arm64)
+
+```
+BenchmarkCreate_1k-8         379    9,700,168 ns/op     106,687 B/op    2,023 allocs/op
+BenchmarkCreate_100k-8         5  647,838,658 ns/op  10,408,827 B/op  200,027 allocs/op
+BenchmarkOpen_100k-8        2113    1,811,942 ns/op   8,408,226 B/op  100,011 allocs/op
+BenchmarkGet_Existing-8  4,400,742        819 ns/op          80 B/op        3 allocs/op
+BenchmarkGet_Missing-8  100,000,000      33.1 ns/op           0 B/op        0 allocs/op
+BenchmarkScan_1k-8          4,556      780,376 ns/op     225,984 B/op    3,011 allocs/op
+BenchmarkScan_100k-8           43   86,350,372 ns/op  42,511,434 B/op  300,029 allocs/op
+```
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/sstable/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### git status --short (before commit)
+
+```
+ M internal/sstable/sstable.go
+ M internal/sstable/sstable_test.go
+```
+
+Only SSTable files changed. WAL, MemTable, and all other packages untouched.
+
+---
+
 *Future phases will append their own sections to this document.*

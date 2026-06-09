@@ -19,7 +19,7 @@
 //
 //	[magic uint64][version uint16]   — all little-endian
 //
-// magic  = 0x53534853_46445442 ("SHSFDBTB" in ASCII)
+// magic   = 0x425442_44465348_53 (little-endian bytes: S H S F D B T B)
 // version = 1
 //
 // # Data record
@@ -31,7 +31,7 @@
 //
 // # Index entry (per record)
 //
-//	[keyLen uint32][key…][offset uint64][recordLen uint32]
+//	[keyLen uint32][key bytes][offset uint64][recordLen uint32]
 //
 // offset is the file offset of the corresponding data record header (recordLen
 // field). An index entry occupies 4+len(key)+8+4 bytes.
@@ -47,21 +47,20 @@
 // # Read path
 //
 // Open reads the last 36 bytes (footer), verifies the trailing magic and footer
-// checksum, then reads the index block into memory. Get binary-searches the
-// in-memory index, seeks to the matching record, reads and verifies the record
-// CRC, and decodes the entry. Scan iterates the relevant index range, reading
-// records from disk in order.
+// checksum, verifies header magic and version, then reads the index block into
+// memory. Get binary-searches the in-memory index, seeks to the matching
+// record, reads and verifies the record CRC, and decodes the entry. Scan
+// iterates the relevant index range, reading records from disk in order.
 //
 // # Atomic creation
 //
 // Create writes to a temporary file in the same directory, syncs it, then
 // renames it to the final path. If Create fails the final path is never
-// written. Directory fsync after rename is a known limitation (see package
-// limitations).
+// written. Directory fsync after rename is a known limitation (see below).
 //
 // # Known limitations
 //
-//   - No Bloom filter; every Get is a disk seek.
+//   - No Bloom filter; every Get for an existing key requires a disk seek.
 //   - No block cache; every read goes to the OS page cache.
 //   - One index entry per key (dense index); no sparse index.
 //   - No compression or encryption.
@@ -92,8 +91,9 @@ var ErrClosed = errors.New("sstable: reader closed")
 // unknown kind).
 var ErrInvalidEntry = errors.New("sstable: invalid entry")
 
-// ErrCorruptTable is returned when a file fails a magic or checksum check, or
-// when the file is truncated.
+// ErrCorruptTable is returned when a file fails a magic, version, or checksum
+// check; when the file is truncated; when the index is internally inconsistent;
+// or when a data record's decoded fields are semantically invalid.
 var ErrCorruptTable = errors.New("sstable: corrupt table")
 
 // ErrRecordTooLarge is returned when an entry's encoded body exceeds
@@ -166,21 +166,17 @@ const (
 	// bodyFixedSize = seq(8) + kind(1) + keyLen(4) + valueLen(4)
 	bodyFixedSize = 8 + 1 + 4 + 4
 
-	// indexEntryFixedSize = keyLen(4) + offset(8) + recordLen(4)
-	indexEntryFixedSize = 4 + 8 + 4
+	// indexEntryFixedWidth is the sum of the fixed-width fields in an index
+	// entry: keyLen(4) + offset(8) + recordLen(4) = 16.
+	// The actual on-disk size per entry is indexEntryFixedWidth + len(key).
+	// Layout: [keyLen uint32][key bytes][offset uint64][recordLen uint32]
+	indexEntryFixedWidth = 4 + 8 + 4
 
 	// footerSize = indexOffset(8) + indexLen(8) + entryCount(8) + footerCRC(4) + magic(8)
 	footerSize = 8 + 8 + 8 + 4 + 8
 
 	defaultMaxRecordSize uint32 = 64 << 20 // 64 MiB
 )
-
-// magic as [8]byte for easy comparison.
-var magicBytes = func() [8]byte {
-	var b [8]byte
-	binary.LittleEndian.PutUint64(b[:], magic)
-	return b
-}()
 
 var crcTable = crc32.MakeTable(crc32.IEEE)
 
@@ -190,7 +186,7 @@ var crcTable = crc32.MakeTable(crc32.IEEE)
 type indexEntry struct {
 	key       []byte
 	offset    uint64 // file offset of the data record header (recordLen field)
-	recordLen uint32 // body length stored in the record header
+	recordLen uint32 // body length from the index (cross-checked against record header)
 }
 
 // ── Reader ────────────────────────────────────────────────────────────────────
@@ -199,11 +195,12 @@ type indexEntry struct {
 //
 // Concurrent calls to Get, Scan, Len, Metadata, and Close are safe.
 type Reader struct {
-	mu     sync.RWMutex
-	file   *os.File
-	index  []indexEntry
-	meta   Metadata
-	closed bool
+	mu            sync.RWMutex
+	file          *os.File
+	index         []indexEntry
+	meta          Metadata
+	maxRecordSize uint32
+	closed        bool
 }
 
 // ── Create ────────────────────────────────────────────────────────────────────
@@ -269,9 +266,9 @@ func Create(path string, entries []Entry, opts Options) (Metadata, error) {
 
 // Open opens an existing SSTable for reading.
 //
-// Open verifies the header magic, footer magic, and footer checksum. It loads
-// the index block into memory but does not read data records. The caller must
-// call Close when done.
+// Open verifies the header magic and version, footer magic and checksum, then
+// loads the index block into memory. Data records are not read at open time.
+// The caller must call Close when done.
 func Open(path string, opts Options) (*Reader, error) {
 	if opts.MaxRecordSize == 0 {
 		opts.MaxRecordSize = defaultMaxRecordSize
@@ -282,8 +279,8 @@ func Open(path string, opts Options) (*Reader, error) {
 		return nil, fmt.Errorf("sstable: open %q: %w", path, err)
 	}
 
-	r := &Reader{file: f}
-	if err := r.load(path, opts); err != nil {
+	r := &Reader{file: f, maxRecordSize: opts.MaxRecordSize}
+	if err := r.load(path); err != nil {
 		f.Close()
 		return nil, err
 	}
@@ -438,24 +435,33 @@ func writeTable(w *os.File, path string, entries []Entry) (Metadata, error) {
 	}
 
 	// ── Index block ───────────────────────────────────────────────────────────
+	// On-disk index entry layout: [keyLen uint32][key bytes][offset uint64][recordLen uint32]
 	indexOffset := offset
 	for _, ir := range idxRecords {
 		kl := uint32(len(ir.key))
-		var buf [indexEntryFixedSize]byte
-		binary.LittleEndian.PutUint32(buf[0:4], kl)
-		binary.LittleEndian.PutUint64(buf[4:12], ir.offset)
-		binary.LittleEndian.PutUint32(buf[12:16], ir.recLen)
-		if _, err := w.Write(buf[:]); err != nil {
-			return Metadata{}, fmt.Errorf("sstable: write index fixed: %w", err)
+
+		// keyLen
+		var klBuf [4]byte
+		binary.LittleEndian.PutUint32(klBuf[:], kl)
+		if _, err := w.Write(klBuf[:]); err != nil {
+			return Metadata{}, fmt.Errorf("sstable: write index keyLen: %w", err)
 		}
+		// key
 		if _, err := w.Write(ir.key); err != nil {
 			return Metadata{}, fmt.Errorf("sstable: write index key: %w", err)
+		}
+		// offset + recordLen
+		var trailBuf [12]byte
+		binary.LittleEndian.PutUint64(trailBuf[0:8], ir.offset)
+		binary.LittleEndian.PutUint32(trailBuf[8:12], ir.recLen)
+		if _, err := w.Write(trailBuf[:]); err != nil {
+			return Metadata{}, fmt.Errorf("sstable: write index offset+recLen: %w", err)
 		}
 	}
 
 	afterIndex := indexOffset
 	for _, ir := range idxRecords {
-		afterIndex += uint64(indexEntryFixedSize) + uint64(len(ir.key))
+		afterIndex += uint64(indexEntryFixedWidth) + uint64(len(ir.key))
 	}
 	indexLen := afterIndex - indexOffset
 
@@ -506,8 +512,10 @@ func encodeBody(e Entry) []byte {
 
 // ── Internal: read ────────────────────────────────────────────────────────────
 
-// load reads the footer and index block from an already-open file.
-func (r *Reader) load(path string, opts Options) error {
+// load reads the header, footer, and index block from an already-open file.
+// It validates magic bytes, header version, footer checksum, and index
+// consistency. r.maxRecordSize must be set before calling load.
+func (r *Reader) load(path string) error {
 	fi, err := r.file.Stat()
 	if err != nil {
 		return fmt.Errorf("sstable: stat: %w", err)
@@ -519,7 +527,7 @@ func (r *Reader) load(path string, opts Options) error {
 		return fmt.Errorf("%w: file too small (%d bytes)", ErrCorruptTable, fileSize)
 	}
 
-	// ── Verify header magic ───────────────────────────────────────────────────
+	// ── Verify header magic and version ──────────────────────────────────────
 	var hdr [headerSize]byte
 	if _, err := io.ReadFull(r.file, hdr[:]); err != nil {
 		return fmt.Errorf("%w: cannot read header: %v", ErrCorruptTable, err)
@@ -528,8 +536,12 @@ func (r *Reader) load(path string, opts Options) error {
 	if gotMagic != magic {
 		return fmt.Errorf("%w: bad header magic (got %016x)", ErrCorruptTable, gotMagic)
 	}
+	gotVersion := binary.LittleEndian.Uint16(hdr[8:10])
+	if gotVersion != tableVersion {
+		return fmt.Errorf("%w: unsupported version %d (want %d)", ErrCorruptTable, gotVersion, tableVersion)
+	}
 
-	// ── Read footer ───────────────────────────────────────────────────────────
+	// ── Read and verify footer ────────────────────────────────────────────────
 	if _, err := r.file.Seek(-int64(footerSize), io.SeekEnd); err != nil {
 		return fmt.Errorf("sstable: seek to footer: %w", err)
 	}
@@ -556,9 +568,22 @@ func (r *Reader) load(path string, opts Options) error {
 	indexLen := binary.LittleEndian.Uint64(footer[8:16])
 	entryCount := binary.LittleEndian.Uint64(footer[16:24])
 
-	// Sanity-check index bounds.
-	if int64(indexOffset)+int64(indexLen) > fileSize-int64(footerSize) {
-		return fmt.Errorf("%w: index region out of bounds", ErrCorruptTable)
+	// ── Validate index region bounds (using uint64 arithmetic) ───────────────
+	// fileSize is positive; convert to uint64 once after the size check above.
+	uFileSize := uint64(fileSize)
+	uFooterSize := uint64(footerSize)
+	uHeaderSize := uint64(headerSize)
+
+	// The data+index region spans [headerSize, fileSize-footerSize).
+	dataRegionEnd := uFileSize - uFooterSize // safe: fileSize >= headerSize+footerSize
+
+	if indexOffset < uHeaderSize || indexOffset > dataRegionEnd {
+		return fmt.Errorf("%w: indexOffset %d outside valid range [%d, %d)",
+			ErrCorruptTable, indexOffset, uHeaderSize, dataRegionEnd)
+	}
+	if indexLen > dataRegionEnd-indexOffset {
+		return fmt.Errorf("%w: index region [%d, %d+%d) extends into footer",
+			ErrCorruptTable, indexOffset, indexOffset, indexLen)
 	}
 
 	// ── Read index block ──────────────────────────────────────────────────────
@@ -570,27 +595,65 @@ func (r *Reader) load(path string, opts Options) error {
 		return fmt.Errorf("%w: cannot read index: %v", ErrCorruptTable, err)
 	}
 
+	// ── Decode index entries ──────────────────────────────────────────────────
+	// On-disk layout per entry: [keyLen uint32][key bytes][offset uint64][recordLen uint32]
 	index := make([]indexEntry, 0, entryCount)
 	pos := 0
 	for pos < len(indexData) {
-		if pos+indexEntryFixedSize > len(indexData) {
-			return fmt.Errorf("%w: index entry truncated", ErrCorruptTable)
+		// Need at least 4 bytes for keyLen.
+		if pos+4 > len(indexData) {
+			return fmt.Errorf("%w: index entry truncated (keyLen)", ErrCorruptTable)
 		}
 		kl := binary.LittleEndian.Uint32(indexData[pos : pos+4])
-		recOffset := binary.LittleEndian.Uint64(indexData[pos+4 : pos+12])
-		recLen := binary.LittleEndian.Uint32(indexData[pos+12 : pos+16])
-		pos += indexEntryFixedSize
+		pos += 4
 
-		if pos+int(kl) > len(indexData) {
-			return fmt.Errorf("%w: index key truncated", ErrCorruptTable)
+		// Need kl bytes for key + 12 bytes for offset+recordLen.
+		// Guard against kl overflow: kl is uint32, pos+int(kl)+12 could overflow int.
+		if uint64(pos)+uint64(kl)+12 > uint64(len(indexData)) {
+			return fmt.Errorf("%w: index entry truncated (key+trailer)", ErrCorruptTable)
 		}
 		key := make([]byte, kl)
 		copy(key, indexData[pos:pos+int(kl)])
 		pos += int(kl)
 
+		recOffset := binary.LittleEndian.Uint64(indexData[pos : pos+8])
+		recLen := binary.LittleEndian.Uint32(indexData[pos+8 : pos+12])
+		pos += 12
+
 		index = append(index, indexEntry{key: key, offset: recOffset, recordLen: recLen})
 	}
 
+	// ── Validate decoded index ────────────────────────────────────────────────
+
+	// Entry count must match footer.
+	if uint64(len(index)) != entryCount {
+		return fmt.Errorf("%w: index has %d entries but footer claims %d",
+			ErrCorruptTable, len(index), entryCount)
+	}
+
+	for i, ie := range index {
+		// Each record offset must point into the data region [headerSize, indexOffset).
+		if ie.offset < uHeaderSize || ie.offset >= indexOffset {
+			return fmt.Errorf("%w: index entry %d offset %d outside data region [%d, %d)",
+				ErrCorruptTable, i, ie.offset, uHeaderSize, indexOffset)
+		}
+		// recordLen must be within [bodyFixedSize, maxRecordSize].
+		if ie.recordLen < uint32(bodyFixedSize) {
+			return fmt.Errorf("%w: index entry %d recordLen %d < bodyFixedSize %d",
+				ErrCorruptTable, i, ie.recordLen, bodyFixedSize)
+		}
+		if ie.recordLen > r.maxRecordSize {
+			return fmt.Errorf("%w: index entry %d recordLen %d > MaxRecordSize %d",
+				ErrCorruptTable, i, ie.recordLen, r.maxRecordSize)
+		}
+		// Keys must be strictly sorted (no duplicates).
+		if i > 0 && string(ie.key) <= string(index[i-1].key) {
+			return fmt.Errorf("%w: index keys not strictly sorted at entry %d (%q <= %q)",
+				ErrCorruptTable, i, ie.key, index[i-1].key)
+		}
+	}
+
+	// ── Build metadata ────────────────────────────────────────────────────────
 	var minKey, maxKey []byte
 	if len(index) > 0 {
 		minKey = make([]byte, len(index[0].key))
@@ -605,12 +668,15 @@ func (r *Reader) load(path string, opts Options) error {
 		Count:     entryCount,
 		MinKey:    minKey,
 		MaxKey:    maxKey,
-		SizeBytes: uint64(fileSize),
+		SizeBytes: uFileSize,
 	}
 	return nil
 }
 
 // readRecord reads and decodes one record from the file at ie's offset.
+// Validates recLen bounds and consistency with the index before allocating.
+// Validates the record CRC, entry kind, and that the decoded key matches the
+// index key.
 // Must be called with at least the read lock held.
 func (r *Reader) readRecord(ie indexEntry) (Entry, error) {
 	var recHdr [recordHeaderSize]byte
@@ -620,26 +686,47 @@ func (r *Reader) readRecord(ie indexEntry) (Entry, error) {
 	recLen := binary.LittleEndian.Uint32(recHdr[0:4])
 	storedCRC := binary.LittleEndian.Uint32(recHdr[4:8])
 
+	// Validate recLen before any allocation.
+	if recLen < uint32(bodyFixedSize) {
+		return Entry{}, fmt.Errorf("%w: record at offset %d has recLen %d < bodyFixedSize %d",
+			ErrCorruptTable, ie.offset, recLen, bodyFixedSize)
+	}
+	if recLen > r.maxRecordSize {
+		return Entry{}, fmt.Errorf("%w: record at offset %d has recLen %d > MaxRecordSize %d",
+			ErrCorruptTable, ie.offset, recLen, r.maxRecordSize)
+	}
+	// Cross-check with index: the record header must agree with the index entry.
+	if recLen != ie.recordLen {
+		return Entry{}, fmt.Errorf("%w: record at offset %d has recLen %d but index says %d",
+			ErrCorruptTable, ie.offset, recLen, ie.recordLen)
+	}
+
 	body := make([]byte, recLen)
 	if _, err := r.file.ReadAt(body, int64(ie.offset)+recordHeaderSize); err != nil {
 		return Entry{}, fmt.Errorf("%w: cannot read record body: %v", ErrCorruptTable, err)
 	}
 
+	// Verify CRC over the body.
 	computed := crc32.Checksum(body, crcTable)
 	if computed != storedCRC {
 		return Entry{}, fmt.Errorf("%w: record checksum mismatch (stored %08x computed %08x)",
 			ErrCorruptTable, storedCRC, computed)
 	}
 
-	if len(body) < bodyFixedSize {
-		return Entry{}, fmt.Errorf("%w: record body too short", ErrCorruptTable)
-	}
+	// Decode body fields.
 	seq := binary.LittleEndian.Uint64(body[0:8])
 	kind := EntryKind(body[8])
 	keyLen := binary.LittleEndian.Uint32(body[9:13])
 	valueLen := binary.LittleEndian.Uint32(body[13:17])
 
-	if uint64(keyLen)+uint64(valueLen) > uint64(len(body))-uint64(bodyFixedSize) {
+	// Validate kind before decoding key/value.
+	if kind != EntryPut && kind != EntryDelete {
+		return Entry{}, fmt.Errorf("%w: record at offset %d has invalid kind %d",
+			ErrCorruptTable, ie.offset, kind)
+	}
+
+	// Guard against keyLen+valueLen overflow and exceeding actual body.
+	if uint64(keyLen)+uint64(valueLen) > uint64(recLen)-uint64(bodyFixedSize) {
 		return Entry{}, fmt.Errorf("%w: key+value lengths exceed body", ErrCorruptTable)
 	}
 
@@ -647,6 +734,12 @@ func (r *Reader) readRecord(ie indexEntry) (Entry, error) {
 	copy(key, body[bodyFixedSize:bodyFixedSize+keyLen])
 	value := make([]byte, valueLen)
 	copy(value, body[bodyFixedSize+keyLen:bodyFixedSize+keyLen+valueLen])
+
+	// Cross-check decoded key against the index key.
+	if string(key) != string(ie.key) {
+		return Entry{}, fmt.Errorf("%w: record key %q does not match index key %q",
+			ErrCorruptTable, key, ie.key)
+	}
 
 	return Entry{Key: key, Value: value, Kind: kind, Seq: seq}, nil
 }
@@ -662,13 +755,13 @@ func validateEntries(entries []Entry, maxRecordSize uint32) error {
 		if e.Kind != EntryPut && e.Kind != EntryDelete {
 			return fmt.Errorf("%w: entry %d has unknown kind %d", ErrInvalidEntry, i, e.Kind)
 		}
-		// Size check
+		// Size check using uint64 to avoid uint32 overflow.
 		bodyLen := uint64(bodyFixedSize) + uint64(len(e.Key)) + uint64(len(e.Value))
 		if bodyLen > uint64(maxRecordSize) {
 			return fmt.Errorf("%w: entry %d body %d bytes exceeds MaxRecordSize %d",
 				ErrRecordTooLarge, i, bodyLen, maxRecordSize)
 		}
-		// Order check
+		// Order check.
 		if i > 0 {
 			cmp := compareBytes(e.Key, entries[i-1].Key)
 			if cmp == 0 {

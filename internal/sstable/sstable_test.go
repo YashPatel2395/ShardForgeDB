@@ -1,8 +1,10 @@
 package sstable
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -47,6 +49,74 @@ func makeEntries(n int) []Entry {
 		}
 	}
 	return entries
+}
+
+// rewriteRecordBody reads the body of the first (and only) data record in path
+// (which must be a single-entry SSTable), applies fn to a mutable copy,
+// recomputes the CRC, and writes both the new body and updated CRC back.
+// Used by tests that need CRC-consistent but semantically corrupt records.
+func rewriteRecordBody(t *testing.T, path string, fn func(body []byte)) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open for rewrite: %v", err)
+	}
+	defer f.Close()
+
+	// Record starts at headerSize. Read the record header to get recLen.
+	var recHdr [recordHeaderSize]byte
+	if _, err := f.ReadAt(recHdr[:], int64(headerSize)); err != nil {
+		t.Fatalf("read record header: %v", err)
+	}
+	recLen := binary.LittleEndian.Uint32(recHdr[0:4])
+
+	body := make([]byte, recLen)
+	if _, err := f.ReadAt(body, int64(headerSize+recordHeaderSize)); err != nil {
+		t.Fatalf("read record body: %v", err)
+	}
+
+	fn(body)
+
+	newCRC := crc32.Checksum(body, crcTable)
+	binary.LittleEndian.PutUint32(recHdr[4:8], newCRC)
+
+	if _, err := f.WriteAt(recHdr[:], int64(headerSize)); err != nil {
+		t.Fatalf("write record header: %v", err)
+	}
+	if _, err := f.WriteAt(body, int64(headerSize+recordHeaderSize)); err != nil {
+		t.Fatalf("write record body: %v", err)
+	}
+}
+
+// rewriteFooter reads the 36-byte footer, applies fn to a mutable copy,
+// recomputes the footerCRC field, and writes it back.
+func rewriteFooter(t *testing.T, path string, fn func(footer []byte)) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open for footer rewrite: %v", err)
+	}
+	defer f.Close()
+
+	footerOff := fi.Size() - int64(footerSize)
+	var footer [footerSize]byte
+	if _, err := f.ReadAt(footer[:], footerOff); err != nil {
+		t.Fatalf("read footer: %v", err)
+	}
+
+	fn(footer[:])
+
+	// Recompute footerCRC over the first 24 bytes.
+	newCRC := crc32.Checksum(footer[0:24], crcTable)
+	binary.LittleEndian.PutUint32(footer[24:28], newCRC)
+
+	if _, err := f.WriteAt(footer[:], footerOff); err != nil {
+		t.Fatalf("write footer: %v", err)
+	}
 }
 
 // ── Test 1: Create writes a file ──────────────────────────────────────────────
@@ -765,5 +835,312 @@ func TestScan_DeterministicAfterSortedCreate(t *testing.T) {
 		if string(all[i].Key) <= string(all[i-1].Key) {
 			t.Errorf("not sorted at %d", i)
 		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Review-fix tests (blockers 1-6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Blocker 1: On-disk index layout matches [keyLen][key][offset][recordLen] ──
+
+func TestIndexLayout_MatchesDocumented(t *testing.T) {
+	path := tmpPath(t)
+	key := []byte("hello")
+	mustCreate(t, path, []Entry{{Key: key, Value: []byte("world"), Kind: EntryPut, Seq: 1}})
+
+	// Read the footer to find indexOffset.
+	fi, _ := os.Stat(path)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer f.Close()
+
+	var footer [footerSize]byte
+	f.ReadAt(footer[:], fi.Size()-int64(footerSize))
+	indexOffset := binary.LittleEndian.Uint64(footer[0:8])
+	indexLen := binary.LittleEndian.Uint64(footer[8:16])
+
+	indexData := make([]byte, indexLen)
+	f.ReadAt(indexData, int64(indexOffset))
+
+	// Documented layout: [keyLen uint32][key bytes][offset uint64][recordLen uint32]
+	if len(indexData) < 4 {
+		t.Fatal("index too short for keyLen")
+	}
+	kl := binary.LittleEndian.Uint32(indexData[0:4])
+	if int(kl) != len(key) {
+		t.Fatalf("keyLen = %d, want %d", kl, len(key))
+	}
+	// key bytes come next.
+	if int(4)+int(kl) > len(indexData) {
+		t.Fatal("index too short for key")
+	}
+	gotKey := indexData[4 : 4+kl]
+	if string(gotKey) != string(key) {
+		t.Errorf("index key = %q, want %q", gotKey, key)
+	}
+	// offset (8 bytes) follows the key.
+	off := 4 + int(kl)
+	if off+12 > len(indexData) {
+		t.Fatal("index too short for offset+recordLen")
+	}
+	recOffset := binary.LittleEndian.Uint64(indexData[off : off+8])
+	// offset must point into the data region (past the header).
+	if recOffset < uint64(headerSize) {
+		t.Errorf("index offset %d < headerSize %d", recOffset, headerSize)
+	}
+	// recordLen (4 bytes) follows offset.
+	recLen := binary.LittleEndian.Uint32(indexData[off+8 : off+12])
+	if recLen < uint32(bodyFixedSize) {
+		t.Errorf("index recordLen %d < bodyFixedSize %d", recLen, bodyFixedSize)
+	}
+	t.Logf("index entry: keyLen=%d key=%q offset=%d recordLen=%d", kl, gotKey, recOffset, recLen)
+}
+
+// ── Blocker 2: version validation ────────────────────────────────────────────
+
+func TestOpen_DetectsUnsupportedVersion(t *testing.T) {
+	path := tmpPath(t)
+	mustCreate(t, path, makeEntries(3))
+
+	// Overwrite bytes [8:10] (version uint16) with an unsupported value.
+	f, _ := os.OpenFile(path, os.O_RDWR, 0)
+	binary.Write(f, binary.LittleEndian, uint16(99))
+	f.Seek(8, 0)
+	binary.Write(f, binary.LittleEndian, uint16(99))
+	f.Close()
+
+	// Use WriteAt for precision.
+	f2, _ := os.OpenFile(path, os.O_RDWR, 0)
+	var ver [2]byte
+	binary.LittleEndian.PutUint16(ver[:], 99)
+	f2.WriteAt(ver[:], 8)
+	f2.Close()
+
+	_, err := Open(path, Options{})
+	if !errors.Is(err, ErrCorruptTable) {
+		t.Fatalf("expected ErrCorruptTable for unsupported version, got %v", err)
+	}
+}
+
+// ── Blocker 3a: readRecord rejects oversized recLen before allocation ─────────
+
+func TestGet_OversizedRecordLen_ReturnsErrCorruptTable(t *testing.T) {
+	path := tmpPath(t)
+	mustCreate(t, path, []Entry{{Key: []byte("k"), Value: []byte("v"), Kind: EntryPut, Seq: 1}})
+
+	// Corrupt the recLen field in the record header to 0xFFFFFFFF.
+	f, _ := os.OpenFile(path, os.O_RDWR, 0)
+	var huge [4]byte
+	binary.LittleEndian.PutUint32(huge[:], 0xFFFFFFFF)
+	f.WriteAt(huge[:], int64(headerSize))
+	f.Close()
+
+	r := mustOpen(t, path) // Open reads index, not data records — should succeed.
+	defer r.Close()
+
+	_, _, err := r.Get([]byte("k"))
+	if !errors.Is(err, ErrCorruptTable) {
+		t.Fatalf("expected ErrCorruptTable for oversized recLen, got %v", err)
+	}
+}
+
+// ── Blocker 3b: readRecord rejects recLen < bodyFixedSize ─────────────────────
+
+func TestGet_UndersizedRecordLen_ReturnsErrCorruptTable(t *testing.T) {
+	path := tmpPath(t)
+	mustCreate(t, path, []Entry{{Key: []byte("k"), Value: []byte("v"), Kind: EntryPut, Seq: 1}})
+
+	// Corrupt recLen to 0 (< bodyFixedSize).
+	f, _ := os.OpenFile(path, os.O_RDWR, 0)
+	var zero [4]byte
+	f.WriteAt(zero[:], int64(headerSize))
+	f.Close()
+
+	r := mustOpen(t, path)
+	defer r.Close()
+
+	_, _, err := r.Get([]byte("k"))
+	if !errors.Is(err, ErrCorruptTable) {
+		t.Fatalf("expected ErrCorruptTable for recLen=0, got %v", err)
+	}
+}
+
+// ── Blocker 3c: readRecord rejects recLen != index recordLen ──────────────────
+
+func TestGet_RecordLenMismatchesIndex_ReturnsErrCorruptTable(t *testing.T) {
+	path := tmpPath(t)
+	mustCreate(t, path, []Entry{{Key: []byte("k"), Value: []byte("v"), Kind: EntryPut, Seq: 1}})
+
+	// Read the true recLen from the index (via Open), then corrupt the on-disk
+	// record header to a different but valid-looking value.
+	r0 := mustOpen(t, path)
+	indexRecLen := r0.index[0].recordLen
+	r0.Close()
+
+	// Change recLen in record header to indexRecLen+1 (different, but still within
+	// bodyFixedSize..maxRecordSize so only the mismatch check catches it).
+	f, _ := os.OpenFile(path, os.O_RDWR, 0)
+	var newLen [4]byte
+	binary.LittleEndian.PutUint32(newLen[:], indexRecLen+1)
+	f.WriteAt(newLen[:], int64(headerSize))
+	f.Close()
+
+	r := mustOpen(t, path)
+	defer r.Close()
+
+	_, _, err := r.Get([]byte("k"))
+	if !errors.Is(err, ErrCorruptTable) {
+		t.Fatalf("expected ErrCorruptTable for recLen mismatch, got %v", err)
+	}
+}
+
+// ── Blocker 4: invalid record kind (CRC-consistent corruption) ────────────────
+
+func TestGet_DetectsInvalidRecordKind(t *testing.T) {
+	path := tmpPath(t)
+	mustCreate(t, path, []Entry{{Key: []byte("k"), Value: []byte("v"), Kind: EntryPut, Seq: 1}})
+
+	// Corrupt body[8] (kind) to an invalid value and recompute CRC so the
+	// checksum check passes but the kind validation fails.
+	rewriteRecordBody(t, path, func(body []byte) {
+		body[8] = 0x99 // not EntryPut(1) or EntryDelete(2)
+	})
+
+	r := mustOpen(t, path)
+	defer r.Close()
+
+	_, _, err := r.Get([]byte("k"))
+	if !errors.Is(err, ErrCorruptTable) {
+		t.Fatalf("expected ErrCorruptTable for invalid kind, got %v", err)
+	}
+}
+
+// ── Blocker 5: key cross-check between index and record ───────────────────────
+
+func TestGet_DetectsIndexRecordKeyMismatch(t *testing.T) {
+	path := tmpPath(t)
+	mustCreate(t, path, []Entry{{Key: []byte("abc"), Value: []byte("v"), Kind: EntryPut, Seq: 1}})
+
+	// Corrupt the key bytes inside the record body (body[bodyFixedSize:bodyFixedSize+3])
+	// and recompute CRC so checksum passes, but the decoded key no longer matches
+	// the index key "abc".
+	rewriteRecordBody(t, path, func(body []byte) {
+		copy(body[bodyFixedSize:bodyFixedSize+3], "xyz")
+	})
+
+	r := mustOpen(t, path)
+	defer r.Close()
+
+	_, _, err := r.Get([]byte("abc"))
+	if !errors.Is(err, ErrCorruptTable) {
+		t.Fatalf("expected ErrCorruptTable for key mismatch, got %v", err)
+	}
+}
+
+// ── Blocker 6a: index entry count mismatch with footer ────────────────────────
+
+func TestOpen_DetectsEntryCountMismatch(t *testing.T) {
+	path := tmpPath(t)
+	mustCreate(t, path, makeEntries(3))
+
+	// Change footer entryCount from 3 to 99 and recompute footerCRC.
+	rewriteFooter(t, path, func(footer []byte) {
+		binary.LittleEndian.PutUint64(footer[16:24], 99)
+	})
+
+	_, err := Open(path, Options{})
+	if !errors.Is(err, ErrCorruptTable) {
+		t.Fatalf("expected ErrCorruptTable for entryCount mismatch, got %v", err)
+	}
+}
+
+// ── Blocker 6b: index keys not strictly sorted ────────────────────────────────
+
+func TestOpen_DetectsUnsortedIndex(t *testing.T) {
+	path := tmpPath(t)
+	// Two entries with same-length keys so we can swap key bytes in the index.
+	mustCreate(t, path, []Entry{
+		{Key: []byte("aaa"), Kind: EntryPut, Seq: 1},
+		{Key: []byte("zzz"), Kind: EntryPut, Seq: 2},
+	})
+
+	// Find indexOffset from the footer and swap the two index keys.
+	fi, _ := os.Stat(path)
+	f, _ := os.OpenFile(path, os.O_RDWR, 0)
+	var footer [footerSize]byte
+	f.ReadAt(footer[:], fi.Size()-int64(footerSize))
+	indexOffset := binary.LittleEndian.Uint64(footer[0:8])
+
+	// New index format: [keyLen(4)][key(3)][offset(8)][recordLen(4)] per entry.
+	// Entry 0 key is at indexOffset+4 (after keyLen).
+	// Entry 1 key is at indexOffset+4+3+12 = indexOffset+19 (after entry 0's keyLen+key+offset+recordLen).
+	var key0 [3]byte
+	var key1 [3]byte
+	f.ReadAt(key0[:], int64(indexOffset)+4)
+	f.ReadAt(key1[:], int64(indexOffset)+4+3+12)
+
+	// Swap: make index unsorted (entry 0 gets "zzz", entry 1 gets "aaa").
+	f.WriteAt(key1[:], int64(indexOffset)+4)
+	f.WriteAt(key0[:], int64(indexOffset)+4+3+12)
+	f.Close()
+
+	_, err := Open(path, Options{})
+	if !errors.Is(err, ErrCorruptTable) {
+		t.Fatalf("expected ErrCorruptTable for unsorted index, got %v", err)
+	}
+}
+
+// ── Blocker 6c: index offset outside data region ──────────────────────────────
+
+func TestOpen_DetectsIndexOffsetOutOfRange(t *testing.T) {
+	path := tmpPath(t)
+	mustCreate(t, path, []Entry{{Key: []byte("k"), Kind: EntryPut, Seq: 1}})
+
+	// Find indexOffset from footer, then corrupt the first entry's offset in the
+	// index to point to the index region itself (not the data region).
+	fi, _ := os.Stat(path)
+	f, _ := os.OpenFile(path, os.O_RDWR, 0)
+	var footer [footerSize]byte
+	f.ReadAt(footer[:], fi.Size()-int64(footerSize))
+	indexOffset := binary.LittleEndian.Uint64(footer[0:8])
+
+	// Index entry for "k": [keyLen=1(4)][k(1)][offset(8)][recordLen(4)]
+	// offset field is at indexOffset+4+1 = indexOffset+5.
+	var badOff [8]byte
+	binary.LittleEndian.PutUint64(badOff[:], indexOffset) // points into index, not data
+	f.WriteAt(badOff[:], int64(indexOffset)+5)
+	f.Close()
+
+	_, err := Open(path, Options{})
+	if !errors.Is(err, ErrCorruptTable) {
+		t.Fatalf("expected ErrCorruptTable for index offset out of range, got %v", err)
+	}
+}
+
+// ── Blocker 6d: index recordLen exceeds MaxRecordSize ────────────────────────
+
+func TestOpen_DetectsIndexRecordLenTooLarge(t *testing.T) {
+	path := tmpPath(t)
+	mustCreate(t, path, []Entry{{Key: []byte("k"), Kind: EntryPut, Seq: 1}})
+
+	// Corrupt the recordLen field in the index entry to exceed MaxRecordSize.
+	fi, _ := os.Stat(path)
+	f, _ := os.OpenFile(path, os.O_RDWR, 0)
+	var footer [footerSize]byte
+	f.ReadAt(footer[:], fi.Size()-int64(footerSize))
+	indexOffset := binary.LittleEndian.Uint64(footer[0:8])
+
+	// recordLen is at indexOffset+4+1+8 = indexOffset+13 (keyLen + key + offset).
+	var huge [4]byte
+	binary.LittleEndian.PutUint32(huge[:], 0xFFFFFFFF)
+	f.WriteAt(huge[:], int64(indexOffset)+13)
+	f.Close()
+
+	_, err := Open(path, Options{})
+	if !errors.Is(err, ErrCorruptTable) {
+		t.Fatalf("expected ErrCorruptTable for index recordLen too large, got %v", err)
 	}
 }

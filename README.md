@@ -2,8 +2,8 @@
 
 An **explainable** distributed database engine for key-value and vector search workloads, written in Go.
 
-> **Phase 6 in review.** WAL, MemTable, SSTable, Bloom Filter, and single-node Engine are implemented.
-> No compaction, distributed mode, or vector search exists yet.
+> **Phase 7 in review.** WAL, MemTable, SSTable, Bloom Filter, single-node Engine, and manual full compaction are implemented.
+> No background compaction, no distributed mode, no vector search.
 
 ---
 
@@ -29,7 +29,7 @@ Cluster
   └── Replication  — leader/follower replication
 ```
 
-WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable`), Bloom Filter (`internal/bloom`), and the single-node Engine (`internal/engine`) are implemented as of Phase 6. All other components are intended design only — not yet implemented.
+WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable`), Bloom Filter (`internal/bloom`), the single-node Engine (`internal/engine`), and manual full compaction are implemented as of Phase 7. All other components are intended design only — not yet implemented.
 
 ## Current Phase
 
@@ -86,7 +86,7 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] Concurrent-safe Add and MightContain via `sync.RWMutex`
 - [x] 35 tests, 9 benchmarks
 
-**Phase 6 — Single-node Engine** (branch: `phase-6-engine`, in review)
+**Phase 6 — Single-node Engine** ✓ locked
 
 - [x] `internal/engine` — single-node LSM-tree key-value engine
 - [x] `Open`, `Put`, `Delete`, `Get`, `Scan`, `Flush`, `Stats`, `Close` API
@@ -102,9 +102,22 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] 45 tests, 10 benchmarks
 - [x] This is a **single-node** engine only — no compaction, no distribution, no vector search
 
-> No compaction; read amplification grows with flush count.
-> No automatic flush; callers must call Flush explicitly.
-> No distributed/sharded/replicated mode planned for this phase.
+**Phase 7 — Manual Full Compaction** (branch: `phase-7-compaction`, in review)
+
+- [x] `(*Engine) Compact() error` — manual full compaction of all flushed SSTables
+- [x] Merges all SSTables into at most one compacted SSTable + Bloom sidecar
+- [x] Tombstones dropped in full compaction (safe: no older level exists below)
+- [x] Overwrites resolved by highest sequence number; original seqs preserved
+- [x] Atomic manifest swap: old table list → one new entry (or empty if all-deleted)
+- [x] Old SSTable and Bloom sidecar files removed after manifest commit (best-effort)
+- [x] Crash-safe: orphan files pre-commit ignored; orphan old files post-commit ignored
+- [x] MemTable and WAL untouched by compaction
+- [x] Compaction stats: `CompactionCount`, `LastCompactionInputTables`, `LastCompactionOutputEntries`
+- [x] 32 tests, 8 benchmarks
+- [x] **Manual full compaction only** — no background, no automatic thresholds, no levels
+
+> No background compaction, no size-tiered compaction, no leveled compaction.
+> No automatic flush. No distributed/sharded/replicated mode.
 
 ## Planned Phases
 
@@ -124,7 +137,9 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 
 The following are **not** present in the current codebase:
 
-- Compaction (read amplification grows with flush count)
+- Background compaction (Compact() is manual only)
+- Automatic compaction thresholds
+- Leveled or size-tiered compaction
 - Vector search / ANN index
 - Sharding
 - Replication / consensus

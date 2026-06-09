@@ -1,17 +1,20 @@
-BINARY     := shardforge
-BUILD_DIR  := bin
-CMD        := ./cmd/shardforge
-GO         := go
-GOFLAGS    :=
+BINARY       := shardforge
+BENCH_BINARY := shardforge-bench
+BUILD_DIR    := bin
+CMD          := ./cmd/shardforge
+BENCH_CMD    := ./cmd/shardforge-bench
+GO           := go
+GOFLAGS      :=
 
-.PHONY: all build test fmt vet lint clean help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-report help
 
 all: fmt vet build
 
-## build: compile the shardforge binary into bin/
+## build: compile the shardforge and shardforge-bench binaries into bin/
 build:
 	@mkdir -p $(BUILD_DIR)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY) $(CMD)
+	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BENCH_BINARY) $(BENCH_CMD)
 
 ## test: run all tests with race detection
 test:
@@ -32,6 +35,18 @@ lint:
 	else \
 		echo "golangci-lint not found — skipping (install from https://golangci-lint.run)"; \
 	fi
+
+## bench: run all Go benchmarks across all packages
+bench:
+	$(GO) test -bench=. -benchmem ./...
+
+## bench-engine: run Go benchmarks for the engine package only
+bench-engine:
+	$(GO) test -bench=. -benchmem ./internal/engine/...
+
+## bench-report: run the workload benchmark suite (small scale) and write docs/BENCHMARKS.md
+bench-report:
+	$(GO) run $(BENCH_CMD) --scale small --out docs/BENCHMARKS.md
 
 ## clean: remove build artifacts
 clean:

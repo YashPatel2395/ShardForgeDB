@@ -102,19 +102,31 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] 45 tests, 10 benchmarks
 - [x] This is a **single-node** engine only — no compaction, no distribution, no vector search
 
-**Phase 7 — Manual Full Compaction** (branch: `phase-7-compaction`, in review)
+**Phase 7 — Manual Full Compaction** ✓ locked
 
 - [x] `(*Engine) Compact() error` — manual full compaction of all flushed SSTables
 - [x] Merges all SSTables into at most one compacted SSTable + Bloom sidecar
 - [x] Tombstones dropped in full compaction (safe: no older level exists below)
 - [x] Overwrites resolved by highest sequence number; original seqs preserved
 - [x] Atomic manifest swap: old table list → one new entry (or empty if all-deleted)
+- [x] SSTable reader opened before manifest commit; failure leaves old state usable
 - [x] Old SSTable and Bloom sidecar files removed after manifest commit (best-effort)
 - [x] Crash-safe: orphan files pre-commit ignored; orphan old files post-commit ignored
 - [x] MemTable and WAL untouched by compaction
 - [x] Compaction stats: `CompactionCount`, `LastCompactionInputTables`, `LastCompactionOutputEntries`
-- [x] 32 tests, 8 benchmarks
+- [x] 34 tests, 8 benchmarks
 - [x] **Manual full compaction only** — no background, no automatic thresholds, no levels
+
+**Phase 8 — Benchmarking and Workload Evaluation** (branch: `phase-8-benchmarks`, in review)
+
+- [x] `internal/bench` — deterministic workload benchmark framework
+- [x] Six workloads: write-heavy, read-heavy, mixed, scan, compaction, restart
+- [x] Per-operation latency collection with P50/P95/P99 percentiles
+- [x] Markdown report generation (`docs/BENCHMARKS.md`)
+- [x] CLI: `bin/shardforge-bench --scale small|medium --workload NAME --out PATH`
+- [x] Makefile targets: `bench`, `bench-engine`, `bench-report`
+- [x] 31 tests in `internal/bench/bench_test.go`
+- [x] **No new database feature logic** — measurement and documentation only
 
 > No background compaction, no size-tiered compaction, no leveled compaction.
 > No automatic flush. No distributed/sharded/replicated mode.
@@ -127,11 +139,13 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 | 3 | MemTable — concurrent in-memory write buffer |
 | 4 | SSTable — sorted, immutable on-disk segments |
 | 5 | Bloom filters — fast negative-key lookups |
-| 6 | Engine — key-value read/write/delete, compaction |
-| 7 | Vector search — ANN index (HNSW or IVF) |
-| 8 | Sharding — consistent-hash partitioning |
-| 9 | Replication — leader/follower; Raft-compatible consensus only after full implementation |
-| 10 | Benchmarks, dashboard, chaos / failure simulation |
+| 6 | Engine — key-value read/write/delete |
+| 7 | Manual full compaction |
+| 8 | Benchmarking and workload evaluation |
+| 9 | Vector search — ANN index (HNSW or IVF) |
+| 10 | Sharding — consistent-hash partitioning |
+| 11 | Replication — leader/follower; Raft-compatible consensus only after full implementation |
+| 12 | Dashboard, chaos / failure simulation |
 
 ## Features NOT Yet Implemented
 
@@ -149,13 +163,14 @@ The following are **not** present in the current codebase:
 ## How to Build
 
 ```bash
-make build          # produces bin/shardforge
+make build          # produces bin/shardforge and bin/shardforge-bench
 ```
 
 Or directly:
 
 ```bash
 go build -o bin/shardforge ./cmd/shardforge
+go build -o bin/shardforge-bench ./cmd/shardforge-bench
 ```
 
 ## How to Run
@@ -163,6 +178,25 @@ go build -o bin/shardforge ./cmd/shardforge
 ```bash
 ./bin/shardforge --help
 ./bin/shardforge version
+```
+
+## How to Run Benchmarks
+
+```bash
+# Generate Markdown report (small scale, fast)
+make bench-report
+
+# Or directly:
+go run ./cmd/shardforge-bench --scale small --out docs/BENCHMARKS.md
+
+# Run a single workload
+go run ./cmd/shardforge-bench --workload write-heavy
+
+# Medium scale (stronger local run)
+go run ./cmd/shardforge-bench --scale medium --out /tmp/bench-medium.md
+
+# Run existing Go package benchmarks
+make bench-engine
 ```
 
 ## How to Run Tests
@@ -180,11 +214,14 @@ go test -race -count=1 ./...
 ## Other Makefile Targets
 
 ```bash
-make fmt    # format source files
-make vet    # static analysis
-make lint   # run golangci-lint (skipped if not installed)
-make clean  # remove bin/
-make help   # list all targets
+make fmt          # format source files
+make vet          # static analysis
+make lint         # run golangci-lint (skipped if not installed)
+make bench        # run all Go benchmarks
+make bench-engine # run engine Go benchmarks
+make bench-report # generate docs/BENCHMARKS.md (small scale)
+make clean        # remove bin/
+make help         # list all targets
 ```
 
 ## Requirements

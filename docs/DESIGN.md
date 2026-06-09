@@ -409,7 +409,31 @@ The manifest is written atomically via temp file + `fsync` + rename. The parent 
 
 ### Bloom Sidecar Strategy
 
-A fresh Bloom filter is built at flush time from all SSTable entries (including tombstones). The filter is serialized and written as a `.bloom` sidecar file alongside the `.sst` file. At `Open` time, both files are loaded together. The Bloom filter lives entirely in RAM; it is not embedded in the SSTable binary.
+A fresh Bloom filter is built at flush time from all SSTable entries (including tombstones). The filter is serialized and written as a `.bloom` sidecar file alongside the `.sst` file via `writeFileAtomic` (temp file + `fsync` + rename) so a crash mid-write cannot leave a truncated sidecar. At `Open` time, both files are loaded together. The Bloom filter lives entirely in RAM; it is not embedded in the SSTable binary.
+
+### Bloom Stats Concurrency
+
+`BloomChecks` and `BloomNegativeSkips` are incremented inside `Get`, which holds only `e.mu.RLock()`. Multiple concurrent readers can therefore reach these increments simultaneously. Both counters are `sync/atomic.Uint64` values — no write lock is needed and no data race can occur. `Stats()` reads them with `Load()`.
+
+### Manifest Initialization
+
+On the first `Open` (no `MANIFEST.json` on disk), the engine writes an empty manifest to disk before proceeding. This makes the on-disk layout explicit from the very first call and ensures restart logic always finds a valid manifest.
+
+### Manifest Table Entry Validation
+
+Every table entry loaded from the manifest is validated by `validateTableEntries`:
+
+| Rule | Error |
+|------|-------|
+| ID must be non-zero | `ErrCorruptManifest` |
+| IDs must be unique | `ErrCorruptManifest` |
+| SSTablePath and BloomPath must be non-empty | `ErrCorruptManifest` |
+| Both paths must pass `filepath.IsLocal` (not absolute, no `..`) | `ErrCorruptManifest` |
+| MinKey and MaxKey must be valid base64 | `ErrCorruptManifest` |
+| If both decoded keys are non-empty, MinKey must be ≤ MaxKey | `ErrCorruptManifest` |
+| Count must be non-zero | `ErrCorruptManifest` |
+
+`filepath.IsLocal` (available since Go 1.20) checks that a path is not absolute, does not escape the current directory via `..`, and is not empty.
 
 ### Known Limitations (Phase 6)
 

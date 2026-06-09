@@ -15,7 +15,7 @@ const manifestVersion = 1
 // manifestFilename is the canonical MANIFEST path relative to the engine Dir.
 const manifestFilename = "MANIFEST.json"
 
-// manifestTmpSuffix is the suffix used for the temp file during atomic writes.
+// manifestTmpSuffix is the suffix used for temp files during atomic writes.
 const manifestTmpSuffix = ".tmp"
 
 // tableEntry is one row in the manifest, representing a single flushed SSTable
@@ -58,8 +58,8 @@ func newManifest() *manifest {
 }
 
 // loadManifest reads and parses the manifest from dir. Returns a new manifest
-// if no file exists yet, and ErrCorruptManifest for any decode or validation
-// error.
+// if no file exists yet (second return value false), and ErrCorruptManifest for
+// any decode or validation error.
 func loadManifest(dir string) (*manifest, bool, error) {
 	path := filepath.Join(dir, manifestFilename)
 	data, err := os.ReadFile(path)
@@ -84,45 +84,115 @@ func loadManifest(dir string) (*manifest, bool, error) {
 	if m.NextSeq == 0 {
 		return nil, false, fmt.Errorf("%w: NextSeq is zero", ErrCorruptManifest)
 	}
+	if err := validateTableEntries(m.Tables); err != nil {
+		return nil, false, err
+	}
 	return &m, true, nil
 }
 
-// saveManifest atomically writes m to dir/MANIFEST.json by writing a temp
-// file and renaming it. The temp file is synced before rename.
+// validateTableEntries checks every tableEntry for correctness. It is called
+// by loadManifest after the top-level fields have been validated.
 //
-// Limitation: the parent directory is not fsynced after rename, which means
-// on a crash the rename may be lost. This is a known limitation of this phase.
+// Validation rules per entry:
+//   - ID must be non-zero
+//   - IDs must be unique
+//   - SSTablePath and BloomPath must be non-empty
+//   - both paths must be local (not absolute, no ".." traversal, not empty)
+//   - MinKey and MaxKey must be valid base64 strings
+//   - if both decoded keys are non-empty, MinKey must be <= MaxKey
+//   - Count must be non-zero
+func validateTableEntries(tables []tableEntry) error {
+	seenIDs := make(map[uint64]bool, len(tables))
+	for i, te := range tables {
+		if te.ID == 0 {
+			return fmt.Errorf("%w: table[%d] has zero ID", ErrCorruptManifest, i)
+		}
+		if seenIDs[te.ID] {
+			return fmt.Errorf("%w: duplicate table ID %d at index %d", ErrCorruptManifest, te.ID, i)
+		}
+		seenIDs[te.ID] = true
+
+		if te.SSTablePath == "" {
+			return fmt.Errorf("%w: table[%d] has empty SSTablePath", ErrCorruptManifest, i)
+		}
+		if te.BloomPath == "" {
+			return fmt.Errorf("%w: table[%d] has empty BloomPath", ErrCorruptManifest, i)
+		}
+
+		// filepath.IsLocal returns true for paths that are not absolute, do not
+		// contain ".." components, and are not empty. Available since Go 1.20.
+		if !filepath.IsLocal(te.SSTablePath) {
+			return fmt.Errorf("%w: table[%d] SSTablePath is not a safe relative path: %q",
+				ErrCorruptManifest, i, te.SSTablePath)
+		}
+		if !filepath.IsLocal(te.BloomPath) {
+			return fmt.Errorf("%w: table[%d] BloomPath is not a safe relative path: %q",
+				ErrCorruptManifest, i, te.BloomPath)
+		}
+
+		minKeyBytes, err := base64.StdEncoding.DecodeString(te.MinKey)
+		if err != nil {
+			return fmt.Errorf("%w: table[%d] MinKey is not valid base64: %v",
+				ErrCorruptManifest, i, err)
+		}
+		maxKeyBytes, err := base64.StdEncoding.DecodeString(te.MaxKey)
+		if err != nil {
+			return fmt.Errorf("%w: table[%d] MaxKey is not valid base64: %v",
+				ErrCorruptManifest, i, err)
+		}
+		if len(minKeyBytes) > 0 && len(maxKeyBytes) > 0 && string(minKeyBytes) > string(maxKeyBytes) {
+			return fmt.Errorf("%w: table[%d] MinKey > MaxKey", ErrCorruptManifest, i)
+		}
+
+		if te.Count == 0 {
+			return fmt.Errorf("%w: table[%d] has zero Count", ErrCorruptManifest, i)
+		}
+	}
+	return nil
+}
+
+// saveManifest atomically writes m to dir/MANIFEST.json.
 func saveManifest(dir string, m *manifest) error {
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return fmt.Errorf("engine: manifest encode: %w", err)
 	}
+	path := filepath.Join(dir, manifestFilename)
+	return writeFileAtomic(path, data, 0o600)
+}
 
-	tmpPath := filepath.Join(dir, manifestFilename+manifestTmpSuffix)
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+// writeFileAtomic atomically writes data to path by writing to a temp file in
+// the same directory, syncing, closing, and renaming. The temp file is removed
+// on any error.
+//
+// Limitation: the parent directory is not fsynced after the rename, which
+// means on a crash the rename may be lost. This is a known limitation of this
+// phase.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmpPath := path + manifestTmpSuffix
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
-		return fmt.Errorf("engine: manifest tmp create: %w", err)
+		return fmt.Errorf("engine: atomic write tmp create %s: %w", path, err)
 	}
 
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		os.Remove(tmpPath)
-		return fmt.Errorf("engine: manifest tmp write: %w", err)
+		return fmt.Errorf("engine: atomic write tmp write %s: %w", path, err)
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmpPath)
-		return fmt.Errorf("engine: manifest tmp sync: %w", err)
+		return fmt.Errorf("engine: atomic write tmp sync %s: %w", path, err)
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmpPath)
-		return fmt.Errorf("engine: manifest tmp close: %w", err)
+		return fmt.Errorf("engine: atomic write tmp close %s: %w", path, err)
 	}
 
-	finalPath := filepath.Join(dir, manifestFilename)
-	if err := os.Rename(tmpPath, finalPath); err != nil {
+	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath)
-		return fmt.Errorf("engine: manifest rename: %w", err)
+		return fmt.Errorf("engine: atomic write rename %s: %w", path, err)
 	}
 	return nil
 }

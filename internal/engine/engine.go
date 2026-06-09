@@ -76,9 +76,18 @@
 //  2. Snapshots MemTable entries, converts them to SSTable entries.
 //  3. Writes SSTable to a temp path, syncs, renames atomically (handled by
 //     sstable.Create).
-//  4. Builds and serializes a Bloom filter to a sidecar file.
+//  4. Builds and serializes a Bloom filter; writes sidecar atomically via
+//     writeFileAtomic (temp file + fsync + rename in the same directory).
 //  5. Updates MANIFEST.json atomically (temp + rename).
 //  6. Resets MemTable and rotates WAL.
+//
+// # Bloom stats concurrency
+//
+// BloomChecks and BloomNegativeSkips are updated inside Get, which holds only
+// a read lock (e.mu.RLock). Multiple concurrent readers therefore update these
+// counters simultaneously. They are stored as [sync/atomic.Uint64] values so
+// that concurrent increments are safe without a write lock. Stats.BloomChecks
+// and Stats.BloomNegativeSkips are read with Load().
 //
 // # Recovery invariants
 //
@@ -113,6 +122,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/YashPatel2395/ShardForgeDB/internal/bloom"
 	"github.com/YashPatel2395/ShardForgeDB/internal/memtable"
@@ -227,9 +237,13 @@ type Engine struct {
 	nextSeq    uint64 // next sequence number to assign
 	nextFileID uint64 // next SSTable file ID to assign
 
-	flushCount    uint64
-	bloomChecks   uint64
-	bloomNegSkips uint64
+	flushCount uint64 // guarded by mu (write lock on every write path)
+
+	// bloomChecks and bloomNegSkips are incremented inside Get which holds only
+	// e.mu.RLock(), so multiple goroutines can update them concurrently.
+	// They are stored as atomic values to avoid a data race.
+	bloomChecks   atomic.Uint64
+	bloomNegSkips atomic.Uint64
 
 	closed bool
 }
@@ -263,10 +277,16 @@ func Open(opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("engine: mkdir: %w", err)
 	}
 
-	// Load or create manifest.
-	m, _, err := loadManifest(opts.Dir)
+	// Load or create manifest. On first Open (no file on disk) persist an empty
+	// manifest so that the on-disk layout is explicit and matches documentation.
+	m, existed, err := loadManifest(opts.Dir)
 	if err != nil {
 		return nil, err
+	}
+	if !existed {
+		if err := saveManifest(opts.Dir, m); err != nil {
+			return nil, fmt.Errorf("engine: init manifest: %w", err)
+		}
 	}
 
 	e := &Engine{
@@ -481,10 +501,11 @@ func (e *Engine) Get(key []byte) ([]byte, bool, error) {
 			continue
 		}
 
-		// Bloom check.
-		e.bloomChecks++
+		// Bloom check. Use atomic increments because Get holds only RLock and
+		// multiple concurrent readers may reach this branch simultaneously.
+		e.bloomChecks.Add(1)
 		if !th.bloom.MightContain(key) {
-			e.bloomNegSkips++
+			e.bloomNegSkips.Add(1)
 			continue
 		}
 
@@ -653,7 +674,10 @@ func (e *Engine) flush() error {
 		e.nextFileID--
 		return fmt.Errorf("%w: marshal Bloom: %v", ErrFlushFailed, err)
 	}
-	if err := os.WriteFile(bloomAbsPath, bloomData, 0o600); err != nil {
+	// Write Bloom sidecar atomically (temp file + fsync + rename) so that a
+	// crash between the SSTable write and the manifest update leaves only a
+	// harmless orphan temp file rather than a truncated sidecar.
+	if err := writeFileAtomic(bloomAbsPath, bloomData, 0o600); err != nil {
 		os.Remove(sstAbsPath)
 		e.nextFileID--
 		return fmt.Errorf("%w: write Bloom sidecar: %v", ErrFlushFailed, err)
@@ -725,6 +749,11 @@ func (e *Engine) flush() error {
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
 // Stats returns a point-in-time snapshot of engine counters.
+//
+// MemTableEntries, MemTableApproxBytes, SSTableCount, NextSeq, and FlushCount
+// are read under the read lock. BloomChecks and BloomNegativeSkips are atomic
+// counters read without the lock; they may reflect operations that completed
+// after the lock was released, but are always consistent in isolation.
 func (e *Engine) Stats() Stats {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -734,8 +763,8 @@ func (e *Engine) Stats() Stats {
 		SSTableCount:        len(e.tables),
 		NextSeq:             e.nextSeq,
 		FlushCount:          e.flushCount,
-		BloomChecks:         e.bloomChecks,
-		BloomNegativeSkips:  e.bloomNegSkips,
+		BloomChecks:         e.bloomChecks.Load(),
+		BloomNegativeSkips:  e.bloomNegSkips.Load(),
 	}
 }
 

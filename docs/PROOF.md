@@ -1414,4 +1414,99 @@ git status --short
 
 ---
 
+## Phase 6 — Engine: Review Fixes
+
+**Date:** 2026-06-09
+**Branch:** `phase-6-engine`
+**Go version:** go1.26.4 darwin/arm64
+
+### Review Blockers Fixed
+
+| # | Blocker | Fix |
+|---|---------|-----|
+| 1 | **Bloom stats race in Get** — `e.bloomChecks` and `e.bloomNegSkips` were plain `uint64` fields incremented inside `Get` while holding only `e.mu.RLock()`. Multiple concurrent readers could increment them simultaneously → data race. | Changed both fields to `atomic.Uint64` (from `sync/atomic`); incremented with `.Add(1)` in `Get` and read with `.Load()` in `Stats()`. No write lock downgrade needed. |
+| 2 | **Non-atomic Bloom sidecar write** — `flush()` wrote the Bloom sidecar with `os.WriteFile`, which is not atomic. A crash mid-write could leave a truncated sidecar file. | Extracted `writeFileAtomic(path, data, perm)` helper (temp file + `fsync` + rename, matching `saveManifest`). `flush()` now calls it for the Bloom sidecar. `saveManifest` refactored to call the same helper. |
+| 3 | **First Open does not write manifest** — package comments said "first Open writes an empty manifest" but the code only created an in-memory manifest and never persisted it. | After `loadManifest` returns `existed == false`, `Open` now calls `saveManifest` to write `MANIFEST.json` before proceeding. |
+| 4 | **Weak manifest validation** — table entries had no per-entry checks (ID zero, duplicate IDs, absolute/traversal paths, bad base64, MinKey > MaxKey, zero Count). | Added `validateTableEntries([]tableEntry) error` called from `loadManifest`; checks all rules listed in DESIGN.md. Uses `filepath.IsLocal` (Go 1.20+) for path safety. |
+
+### Tests Added
+
+| Test | Blocker |
+|------|---------|
+| `TestConcurrentGet_AfterFlush_BloomStatsRaceSafe` | 1 — 32 goroutines × 50 Gets on a Bloom-filtered missing key; verifies counter delta and passes `-race` |
+| `TestAtomicBloomWrite_NoTempFileLeftAfterFlush` | 2 — verifies no `*.tmp` files remain after successful Flush |
+| `TestFlush_BloomWriteFailureDoesNotCommitManifest` | 2 — chmod sstables dir to 0o555; verifies manifest is unchanged after failed second Flush; skipped as root |
+| `TestOpen_CreatesManifest` | 3 — verifies `MANIFEST.json` exists after first Open with correct fields |
+| `TestOpen_ManifestRejectsAbsolutePaths` | 4 — injects `/etc/passwd` for SSTablePath and BloomPath |
+| `TestOpen_ManifestRejectsPathTraversal` | 4 — injects `../../../etc/passwd` |
+| `TestOpen_ManifestRejectsDuplicateTableIDs` | 4 — two entries with the same ID |
+| `TestOpen_ManifestRejectsBadBase64Keys` | 4 — injects `!!not-valid-base64!!` for MinKey and MaxKey |
+| `TestOpen_ManifestRejectsMinKeyGreaterThanMaxKey` | 4 — injects MinKey="z", MaxKey="a" |
+| `TestOpen_ManifestRejectsEmptyTablePaths` | 4 — empty SSTablePath and BloomPath |
+
+### Files Changed
+
+```
+internal/engine/engine.go          — atomic.Uint64 counters; atomic bloom sidecar; first-Open manifest save; updated package docs
+internal/engine/manifest.go        — writeFileAtomic helper; validateTableEntries; saveManifest refactored
+internal/engine/engine_test.go     — 15 new tests (10 validation + 4 blocker-specific + 1 helper); encoding/json import
+docs/DESIGN.md                     — Bloom sidecar atomicity, Bloom stats concurrency, manifest init, validation table
+docs/PROOF.md                      — this section
+```
+
+### Updated Total Test Count
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge        3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/bloom       35 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config       8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/engine      60 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging      7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable    30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/sstable     46 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal         24 PASS
+```
+
+**Total: 213 tests, 213 PASS, 0 FAIL** (was 198; +15 Engine review-fix tests)
+
+### Benchmark Results (Apple M3, darwin/arm64, `-benchtime=3s`)
+
+```
+BenchmarkPut-8                             2657474     1374 ns/op      112 B/op    4 allocs/op
+BenchmarkGet_MemTable_Existing-8          92614130       38.85 ns/op    48 B/op    3 allocs/op
+BenchmarkGet_MemTable_Missing-8          223369108       15.95 ns/op     0 B/op    0 allocs/op
+BenchmarkFlush_1k-8                            207  16382193 ns/op   443951 B/op  5094 allocs/op
+BenchmarkFlush_100k-8                            5 639477567 ns/op 63294595 B/op 500130 allocs/op
+BenchmarkGet_SSTable_Existing-8            4257411      848.8 ns/op    96 B/op    4 allocs/op
+BenchmarkGet_SSTable_Missing_BloomSkip-8  86600826       44.03 ns/op    0 B/op    0 allocs/op
+BenchmarkScan_1k-8                            5773   618596 ns/op   544496 B/op  6554 allocs/op
+BenchmarkRestart_WALReplay-8                  6854   527941 ns/op   279569 B/op  3551 allocs/op
+BenchmarkRestart_ManifestLoad-8              49316    73317 ns/op    50552 B/op   557 allocs/op
+```
+
+Performance is unchanged from the initial Phase 6 submission. The atomic counter change adds no measurable overhead (atomic 64-bit ops on Apple M3 are single-cycle).
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./internal/engine/...
+go test -race -count=1 ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### Confirmation: Scope Unchanged
+
+No compaction, vector search, sharding, replication, dashboard, distributed, networking, or Raft logic was implemented. Only correctness fixes: atomic stats, atomic file writes, manifest initialization, and manifest validation.
+
+---
+
 *Future phases will append their own sections to this document.*

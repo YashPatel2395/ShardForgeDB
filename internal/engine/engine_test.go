@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -892,5 +893,363 @@ func TestSeq_MonotonicWithinSession(t *testing.T) {
 			t.Errorf("NextSeq not increasing: prev=%d cur=%d", prevSeq, cur)
 		}
 		prevSeq = cur
+	}
+}
+
+// ── Review fix 1: Bloom stats are race-safe under concurrent Get ──────────────
+
+// TestConcurrentGet_AfterFlush_BloomStatsRaceSafe launches many goroutines
+// that all call Get on a key absent from the SSTable but within its [min,max]
+// range, so the Bloom filter is consulted on every call. The test must pass
+// under go test -race and verify that BloomChecks and BloomNegativeSkips both
+// increase.
+func TestConcurrentGet_AfterFlush_BloomStatsRaceSafe(t *testing.T) {
+	e := openEngine(t, tmpDir(t))
+	defer e.Close()
+
+	// Two keys that bracket the missing key so the bounds check passes and
+	// the Bloom filter is always consulted ("alpha" < "missing" < "zebra").
+	mustPut(t, e, "alpha", "a")
+	mustPut(t, e, "zebra", "z")
+	mustFlush(t, e)
+
+	before := e.Stats()
+
+	const goroutines = 32
+	const iters = 50
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				_, ok, err := e.Get([]byte("missing"))
+				if err != nil {
+					t.Errorf("Get: %v", err)
+					return
+				}
+				if ok {
+					t.Errorf("Get returned true for absent key")
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	after := e.Stats()
+	total := uint64(goroutines * iters)
+	if after.BloomChecks <= before.BloomChecks {
+		t.Errorf("BloomChecks did not increase: before=%d after=%d", before.BloomChecks, after.BloomChecks)
+	}
+	if after.BloomNegativeSkips <= before.BloomNegativeSkips {
+		t.Errorf("BloomNegativeSkips did not increase: before=%d after=%d", before.BloomNegativeSkips, after.BloomNegativeSkips)
+	}
+	if got := after.BloomChecks - before.BloomChecks; got != total {
+		t.Errorf("BloomChecks delta = %d, want %d", got, total)
+	}
+	if got := after.BloomNegativeSkips - before.BloomNegativeSkips; got != total {
+		t.Errorf("BloomNegativeSkips delta = %d, want %d", got, total)
+	}
+}
+
+// ── Review fix 2: Atomic Bloom sidecar write leaves no temp file ──────────────
+
+// TestAtomicBloomWrite_NoTempFileLeftAfterFlush verifies that after a
+// successful Flush, no .tmp files remain in the sstables directory.
+func TestAtomicBloomWrite_NoTempFileLeftAfterFlush(t *testing.T) {
+	dir := tmpDir(t)
+	e := openEngine(t, dir)
+	defer e.Close()
+
+	mustPut(t, e, "k1", "v1")
+	mustPut(t, e, "k2", "v2")
+	mustFlush(t, e)
+
+	// A second flush ensures we clean up across multiple calls.
+	mustPut(t, e, "k3", "v3")
+	mustFlush(t, e)
+
+	pattern := filepath.Join(dir, sstablesDir, "*.tmp")
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatalf("Glob: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("found leftover .tmp files after successful Flush: %v", matches)
+	}
+}
+
+// TestFlush_BloomWriteFailureDoesNotCommitManifest verifies that if the
+// sstables directory is made unwritable after a first successful flush, a
+// second flush fails and leaves the manifest unchanged.
+//
+// This test uses os.Chmod to simulate write failure. It is skipped when
+// running as root because root bypasses permission checks, making the
+// simulation unreliable.
+func TestFlush_BloomWriteFailureDoesNotCommitManifest(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("cannot simulate write failure as root")
+	}
+
+	dir := tmpDir(t)
+	e := openEngine(t, dir)
+	defer func() {
+		// Restore permissions before cleanup so TempDir can remove files.
+		os.Chmod(filepath.Join(dir, sstablesDir), 0o700)
+		e.Close()
+	}()
+
+	// First flush succeeds; manifest now has 1 table.
+	mustPut(t, e, "k1", "v1")
+	mustFlush(t, e)
+
+	if n := e.Stats().SSTableCount; n != 1 {
+		t.Fatalf("expected 1 SSTable after first flush, got %d", n)
+	}
+
+	// Make sstables/ unwritable so the next SSTable (and Bloom) write fails.
+	if err := os.Chmod(filepath.Join(dir, sstablesDir), 0o555); err != nil {
+		t.Fatalf("Chmod: %v", err)
+	}
+
+	mustPut(t, e, "k2", "v2")
+	err := e.Flush()
+	if err == nil {
+		t.Fatal("expected Flush to fail with unwritable sstables dir, got nil")
+	}
+
+	// Restore permissions before reading manifest.
+	os.Chmod(filepath.Join(dir, sstablesDir), 0o700)
+
+	// Manifest must still record only 1 table (the failed flush must not have
+	// updated it).
+	m, _, merr := loadManifest(dir)
+	if merr != nil {
+		t.Fatalf("loadManifest: %v", merr)
+	}
+	if len(m.Tables) != 1 {
+		t.Errorf("manifest has %d tables after failed flush, want 1", len(m.Tables))
+	}
+}
+
+// ── Review fix 3: First Open writes manifest to disk ─────────────────────────
+
+// TestOpen_CreatesManifest verifies that the very first Open writes an empty
+// MANIFEST.json with version=1, NextFileID=1, NextSeq=1, and zero tables.
+func TestOpen_CreatesManifest(t *testing.T) {
+	dir := tmpDir(t)
+
+	manifestPath := filepath.Join(dir, manifestFilename)
+	if _, err := os.Stat(manifestPath); err == nil {
+		t.Fatal("MANIFEST.json exists before first Open — test precondition failed")
+	}
+
+	e := openEngine(t, dir)
+	e.Close()
+
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("MANIFEST.json not found after Open: %v", err)
+	}
+
+	var m manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("parse MANIFEST.json: %v", err)
+	}
+	if m.Version != 1 {
+		t.Errorf("Version = %d, want 1", m.Version)
+	}
+	if m.NextFileID != 1 {
+		t.Errorf("NextFileID = %d, want 1", m.NextFileID)
+	}
+	if m.NextSeq != 1 {
+		t.Errorf("NextSeq = %d, want 1", m.NextSeq)
+	}
+	if len(m.Tables) != 0 {
+		t.Errorf("Tables = %v, want []", m.Tables)
+	}
+}
+
+// ── Review fix 4: Manifest validation — per-entry checks ─────────────────────
+
+// writeRawManifest writes arbitrary JSON to MANIFEST.json in dir, bypassing
+// the engine's saveManifest so we can inject corrupt data.
+func writeRawManifest(t *testing.T, dir string, v any) {
+	t.Helper()
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal raw manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, manifestFilename), data, 0o600); err != nil {
+		t.Fatalf("write raw manifest: %v", err)
+	}
+}
+
+// baseValidManifest returns the smallest valid manifest JSON structure with
+// the given single table entry.
+func baseManifestWithTable(te map[string]any) map[string]any {
+	return map[string]any{
+		"version":      1,
+		"next_file_id": 2,
+		"next_seq":     10,
+		"tables":       []any{te},
+	}
+}
+
+// validTableEntry returns a table entry that passes all validation.
+// MinKey = encodeKey([]byte("a")), MaxKey = encodeKey([]byte("z")).
+func validTableEntry() map[string]any {
+	return map[string]any{
+		"id":           1,
+		"sstable_path": "sstables/table-000001.sst",
+		"bloom_path":   "sstables/table-000001.bloom",
+		"count":        100,
+		"min_key":      "YQ==", // base64("a")
+		"max_key":      "eg==", // base64("z")
+	}
+}
+
+func TestOpen_ManifestRejectsAbsolutePaths(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field string
+		path  string
+	}{
+		{"abs_sstable", "sstable_path", "/etc/passwd"},
+		{"abs_bloom", "bloom_path", "/etc/passwd"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tmpDir(t)
+			// Create sstables dir so Open doesn't fail on MkdirAll.
+			os.MkdirAll(filepath.Join(dir, sstablesDir), 0o700)
+
+			te := validTableEntry()
+			te[tc.field] = tc.path
+			writeRawManifest(t, dir, baseManifestWithTable(te))
+
+			_, err := Open(Options{Dir: dir})
+			if err != nil {
+				err2 := err // shadow to avoid loop-variable capture
+				_ = err2
+			}
+			if !errors.Is(err, ErrCorruptManifest) {
+				t.Errorf("expected ErrCorruptManifest for absolute %s %q, got %v",
+					tc.field, tc.path, err)
+			}
+		})
+	}
+}
+
+func TestOpen_ManifestRejectsPathTraversal(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field string
+		path  string
+	}{
+		{"traversal_sstable", "sstable_path", "../../../etc/passwd"},
+		{"traversal_bloom", "bloom_path", "sstables/../../../etc/passwd"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tmpDir(t)
+			os.MkdirAll(filepath.Join(dir, sstablesDir), 0o700)
+
+			te := validTableEntry()
+			te[tc.field] = tc.path
+			writeRawManifest(t, dir, baseManifestWithTable(te))
+
+			_, err := Open(Options{Dir: dir})
+			if !errors.Is(err, ErrCorruptManifest) {
+				t.Errorf("expected ErrCorruptManifest for traversal %s %q, got %v",
+					tc.field, tc.path, err)
+			}
+		})
+	}
+}
+
+func TestOpen_ManifestRejectsDuplicateTableIDs(t *testing.T) {
+	dir := tmpDir(t)
+	os.MkdirAll(filepath.Join(dir, sstablesDir), 0o700)
+
+	te1 := validTableEntry()
+	te2 := validTableEntry()
+	te2["sstable_path"] = "sstables/table-000002.sst"
+	te2["bloom_path"] = "sstables/table-000002.bloom"
+	// Both entries have id=1 → duplicate.
+
+	writeRawManifest(t, dir, map[string]any{
+		"version":      1,
+		"next_file_id": 3,
+		"next_seq":     10,
+		"tables":       []any{te1, te2},
+	})
+
+	_, err := Open(Options{Dir: dir})
+	if !errors.Is(err, ErrCorruptManifest) {
+		t.Errorf("expected ErrCorruptManifest for duplicate IDs, got %v", err)
+	}
+}
+
+func TestOpen_ManifestRejectsBadBase64Keys(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field string
+	}{
+		{"bad_min_key", "min_key"},
+		{"bad_max_key", "max_key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tmpDir(t)
+			os.MkdirAll(filepath.Join(dir, sstablesDir), 0o700)
+
+			te := validTableEntry()
+			te[tc.field] = "!!not-valid-base64!!"
+			writeRawManifest(t, dir, baseManifestWithTable(te))
+
+			_, err := Open(Options{Dir: dir})
+			if !errors.Is(err, ErrCorruptManifest) {
+				t.Errorf("expected ErrCorruptManifest for bad base64 %s, got %v", tc.field, err)
+			}
+		})
+	}
+}
+
+func TestOpen_ManifestRejectsMinKeyGreaterThanMaxKey(t *testing.T) {
+	dir := tmpDir(t)
+	os.MkdirAll(filepath.Join(dir, sstablesDir), 0o700)
+
+	te := validTableEntry()
+	// min_key = "z", max_key = "a" — min > max.
+	te["min_key"] = "eg==" // base64("z")
+	te["max_key"] = "YQ==" // base64("a")
+	writeRawManifest(t, dir, baseManifestWithTable(te))
+
+	_, err := Open(Options{Dir: dir})
+	if !errors.Is(err, ErrCorruptManifest) {
+		t.Errorf("expected ErrCorruptManifest for MinKey > MaxKey, got %v", err)
+	}
+}
+
+func TestOpen_ManifestRejectsEmptyTablePaths(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field string
+	}{
+		{"empty_sstable_path", "sstable_path"},
+		{"empty_bloom_path", "bloom_path"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tmpDir(t)
+			os.MkdirAll(filepath.Join(dir, sstablesDir), 0o700)
+
+			te := validTableEntry()
+			te[tc.field] = ""
+			writeRawManifest(t, dir, baseManifestWithTable(te))
+
+			_, err := Open(Options{Dir: dir})
+			if !errors.Is(err, ErrCorruptManifest) {
+				t.Errorf("expected ErrCorruptManifest for empty %s, got %v", tc.field, err)
+			}
+		})
 	}
 }

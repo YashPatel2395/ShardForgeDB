@@ -2,8 +2,8 @@
 
 An **explainable** distributed database engine for key-value and vector search workloads, written in Go.
 
-> **Phase 5 in review.** WAL, MemTable, SSTable, and Bloom Filter are implemented.
-> No Engine-level integration exists yet.
+> **Phase 6 in review.** WAL, MemTable, SSTable, Bloom Filter, and single-node Engine are implemented.
+> No compaction, distributed mode, or vector search exists yet.
 
 ---
 
@@ -29,7 +29,7 @@ Cluster
   └── Replication  — leader/follower replication
 ```
 
-WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable`), and Bloom Filter (`internal/bloom`) are implemented as of Phase 5. All other components are intended design only — not yet implemented.
+WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable`), Bloom Filter (`internal/bloom`), and the single-node Engine (`internal/engine`) are implemented as of Phase 6. All other components are intended design only — not yet implemented.
 
 ## Current Phase
 
@@ -75,7 +75,7 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] Concurrent-safe reads; `sync.RWMutex` around file access
 - [x] 46 tests, 7 benchmarks
 
-**Phase 5 — Bloom Filter** (branch: `phase-5-bloom`, in review)
+**Phase 5 — Bloom Filter** ✓ locked
 
 - [x] `internal/bloom` — deterministic, serializable Bloom filter
 - [x] `New`, `Add`, `MightContain`, `Metadata`, `MarshalBinary`, `UnmarshalBinary` API
@@ -84,11 +84,27 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] Compact bit array (packed `[]uint64`); no false negatives by design
 - [x] Self-describing binary serialization with magic, version, CRC-32, and trailing sentinel
 - [x] Concurrent-safe Add and MightContain via `sync.RWMutex`
-- [x] 34 tests, 9 benchmarks
+- [x] 35 tests, 9 benchmarks
 
-> Bloom Filter is not yet wired into SSTable or Engine.
-> SSTable is not yet connected to the MemTable or Engine.
-> No compaction or multi-SSTable lookup exists yet.
+**Phase 6 — Single-node Engine** (branch: `phase-6-engine`, in review)
+
+- [x] `internal/engine` — single-node LSM-tree key-value engine
+- [x] `Open`, `Put`, `Delete`, `Get`, `Scan`, `Flush`, `Stats`, `Close` API
+- [x] WAL + MemTable + SSTable + Bloom Filter wired end-to-end
+- [x] Atomic JSON manifest (`MANIFEST.json`) tracking SSTable and Bloom sidecar paths
+- [x] WAL replay on restart; monotonic sequence numbers across restarts
+- [x] Bloom filter sidecar per SSTable; negative-key skips tracked in `Stats`
+- [x] Min/max key bounds check before Bloom check per SSTable on Get
+- [x] Full range Scan merging MemTable and all SSTables; tombstone suppression
+- [x] Manual Flush: MemTable → SSTable → Bloom sidecar → manifest → WAL rotation
+- [x] Crash-safe invariants: orphan files pre-manifest-commit are ignored on restart
+- [x] Concurrent-safe via `sync.RWMutex`; idempotent `Close`
+- [x] 45 tests, 10 benchmarks
+- [x] This is a **single-node** engine only — no compaction, no distribution, no vector search
+
+> No compaction; read amplification grows with flush count.
+> No automatic flush; callers must call Flush explicitly.
+> No distributed/sharded/replicated mode planned for this phase.
 
 ## Planned Phases
 
@@ -108,10 +124,7 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 
 The following are **not** present in the current codebase:
 
-- WAL ↔ MemTable ↔ SSTable ↔ Bloom integration (write path not wired end-to-end)
-- Bloom Filter wired into SSTable lookups
-- Engine-level key-value read / write / delete
-- Compaction
+- Compaction (read amplification grows with flush count)
 - Vector search / ANN index
 - Sharding
 - Replication / consensus

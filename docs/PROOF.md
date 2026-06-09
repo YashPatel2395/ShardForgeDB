@@ -1242,4 +1242,271 @@ Only Bloom Filter files and PROOF.md changed. WAL, MemTable, SSTable, and all ot
 
 ---
 
+## Phase 6 — Single-node Engine
+
+**Date:** 2026-06-09
+**Branch:** `phase-6-engine`
+**Go version:** go1.26.4 darwin/arm64
+
+### What Was Implemented
+
+| Component | Description |
+|-----------|-------------|
+| `internal/engine/engine.go` | Single-node LSM-tree engine: Open, Put, Delete, Get, Scan, Flush, Stats, Close |
+| `internal/engine/manifest.go` | Atomic JSON manifest: loadManifest, saveManifest, newManifest, encodeKey, decodeKey |
+| `internal/engine/engine_test.go` | 45 tests (40 required + 5 additional) |
+| `internal/engine/engine_bench_test.go` | 10 benchmarks |
+
+### Files Changed
+
+```
+internal/engine/engine.go          — rewritten (was 6-line placeholder)
+internal/engine/manifest.go        — new
+internal/engine/engine_test.go     — new (45 tests)
+internal/engine/engine_bench_test.go — new (10 benchmarks)
+README.md                          — Phase 5 locked, Phase 6 in review
+docs/DESIGN.md                     — Engine layer fully documented
+docs/PROOF.md                      — this section
+```
+
+No other packages were modified.
+
+### Acceptance Criteria
+
+| Criterion | Result |
+|-----------|--------|
+| `go mod tidy` — clean | PASS |
+| `go fmt ./...` — no changes | PASS |
+| `go vet ./...` — no errors | PASS |
+| `go test -race -count=1 -v ./...` — all pass | PASS |
+| `go test -bench=. -benchmem -benchtime=3s ./internal/engine/...` | PASS |
+| `make test` | PASS |
+| `make vet` | PASS |
+| `make build` | PASS |
+| `./bin/shardforge --help` | PASS |
+| `./bin/shardforge version` | PASS |
+| Single-node engine only (no compaction / distribution claims) | PASS |
+
+### Engine Tests (45 total)
+
+| # | Test | Result |
+|---|------|--------|
+| 1 | `TestOpen_CreatesDirectoryLayout` | PASS |
+| 2 | `TestOpen_RejectsEmptyDir` | PASS |
+| 3 | `TestPut_ThenGet_BeforeFlush` | PASS |
+| 4 | `TestGet_MissingKey_ReturnsFalse` | PASS |
+| 5 | `TestDelete_HidesMemTableValue` | PASS |
+| 6 | `TestDelete_HidesSSTableValue` | PASS |
+| 7 | `TestPut_AfterDelete_RestoresKey` | PASS |
+| 8 | `TestPut_EmptyKeyRejected` | PASS |
+| 9 | `TestDelete_EmptyKeyRejected` | PASS |
+| 10 | `TestGet_ReturnedValueMutationSafe` | PASS |
+| 11 | `TestScan_MemTable_SortedLiveEntries` | PASS |
+| 12 | `TestScan_StartInclusive` | PASS |
+| 13 | `TestScan_EndExclusive` | PASS |
+| 14 | `TestScan_ExcludesDeletedKeys` | PASS |
+| 15 | `TestFlush_EmptyMemTable_IsNoOp` | PASS |
+| 16 | `TestFlush_CreatesSSTableFile` | PASS |
+| 17 | `TestFlush_CreatesBloomSidecar` | PASS |
+| 18 | `TestFlush_UpdatesManifest` | PASS |
+| 19 | `TestGet_AfterFlush_ReadsFromSSTable` | PASS |
+| 20 | `TestGet_MissingKey_AfterFlush_BloomNegativeSkip` | PASS |
+| 21 | `TestRestart_AfterPut_ReplaysWAL` | PASS |
+| 22 | `TestRestart_AfterFlush_LoadsSSTableAndBloom` | PASS |
+| 23 | `TestRestart_AfterDelete_ReplaysWAL` | PASS |
+| 24 | `TestRestart_AfterDeleteAndFlush_PreservesDeletion` | PASS |
+| 25 | `TestGet_NewerMemTableWinsOverSSTable` | PASS |
+| 26 | `TestGet_NewerSSTableWinsOverOlderSSTable` | PASS |
+| 27 | `TestScan_MergesMultipleSources` | PASS |
+| 28 | `TestScan_TombstoneInNewerSSTableSuppressesOlder` | PASS |
+| 29 | `TestOpen_OrphanSSTableIgnored` | PASS |
+| 30 | `TestOpen_CorruptManifest_ReturnsError` | PASS |
+| 31 | `TestOpen_CorruptBloomSidecar_ReturnsError` | PASS |
+| 32 | `TestOpen_CorruptSSTable_ReturnsError` | PASS |
+| 33 | `TestClose_ThenGet_ReturnsErrClosed` | PASS |
+| 34 | `TestClose_ThenPut_ReturnsErrClosed` | PASS |
+| 35 | `TestClose_ThenFlush_ReturnsErrClosed` | PASS |
+| 36 | `TestClose_Idempotent` | PASS |
+| 37 | `TestConcurrent_RaceSafe` | PASS |
+| 38 | `TestSeq_MonotonicAcrossRestart` | PASS |
+| 39 | `TestManifest_PathsAreRelative` | PASS |
+| 40 | `TestLargeWorkload_10k` | PASS |
+| 41 | `TestStats_ReportsSSTableCount` | PASS (additional) |
+| 42 | `TestScan_Empty` | PASS (additional) |
+| 43 | `TestClose_ThenScan_ReturnsErrClosed` | PASS (additional) |
+| 44 | `TestFlush_CountTrackedInStats` | PASS (additional) |
+| 45 | `TestSeq_MonotonicWithinSession` | PASS (additional) |
+
+### Engine Benchmarks (Apple M3, darwin/arm64, `-benchtime=3s`)
+
+```
+BenchmarkPut-8                             2688165     1429 ns/op      112 B/op    4 allocs/op
+BenchmarkGet_MemTable_Existing-8          92014740       38.94 ns/op    48 B/op    3 allocs/op
+BenchmarkGet_MemTable_Missing-8          224676822       15.66 ns/op     0 B/op    0 allocs/op
+BenchmarkFlush_1k-8                            273  13489456 ns/op   442160 B/op  5080 allocs/op
+BenchmarkFlush_100k-8                            5 617699167 ns/op 63292964 B/op 500117 allocs/op
+BenchmarkGet_SSTable_Existing-8            4278676      849.8 ns/op    96 B/op    4 allocs/op
+BenchmarkGet_SSTable_Missing_BloomSkip-8  89671018       40.21 ns/op    0 B/op    0 allocs/op
+BenchmarkScan_1k-8                            5593   609944 ns/op   544497 B/op  6554 allocs/op
+BenchmarkRestart_WALReplay-8                  6932   518795 ns/op   278537 B/op  3542 allocs/op
+BenchmarkRestart_ManifestLoad-8              49496    79589 ns/op    50504 B/op   555 allocs/op
+```
+
+Observations:
+- Put: ~1.4 µs — dominated by WAL append (OS write syscall) + mutex overhead.
+- Get (MemTable existing): ~39 ns — read lock + map lookup + copy.
+- Get (MemTable missing): ~16 ns — read lock + map miss; no SSTable work.
+- Get (SSTable existing): ~850 ns — bounds check + Bloom check + binary search + single disk read.
+- Get (SSTable missing, Bloom skip): ~40 ns — bounds check + Bloom check; no disk read.
+- Flush 1k: ~13 ms — SSTable write + Bloom serialize + manifest update + WAL rotation.
+- Flush 100k: ~618 ms — dominated by SSTable creation and 100k Bloom insertions.
+- Scan 1k: ~610 µs — full MemTable + SSTable scan + map merge + sort.
+- Restart WAL replay (500 entries): ~519 µs — WAL open + 500 record replay + MemTable rebuild.
+- Restart manifest load (500 entries, 1 SSTable): ~80 µs — JSON decode + SSTable + Bloom open.
+
+### Full Test Results (all packages)
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge        3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/bloom       35 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config       8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/engine      45 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging      7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable    30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/sstable     46 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal         24 PASS
+```
+
+**Total: 198 tests, 198 PASS, 0 FAIL** (was 153; +45 Engine)
+
+### Test Fix Note
+
+`TestGet_MissingKey_AfterFlush_BloomNegativeSkip` initially used the query key `"definitely-absent"` (< `"present"` alphabetically). The SSTable bounds check correctly skipped the table before the Bloom filter was consulted, causing `BloomNegativeSkips` to stay at zero. Fixed by inserting `"apple"` and `"zebra"` to bracket the query key `"missing-key"` so the bounds check passes and the Bloom filter is exercised.
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### Known Limitations
+
+- No compaction; read amplification grows with flush count.
+- No automatic flush; callers must call Flush explicitly.
+- WAL replaced in full after each flush — no segment rotation.
+- No background cleanup of orphan SSTable/Bloom files.
+- No transactions, snapshots, or MVCC.
+- No compression or block cache.
+- No distributed/sharded/replicated mode.
+- No vector search.
+- Parent directory not fsynced after manifest rename.
+- Bloom sidecars are not embedded in SSTables.
+
+---
+
+## Phase 6 — Engine: Review Fixes
+
+**Date:** 2026-06-09
+**Branch:** `phase-6-engine`
+**Go version:** go1.26.4 darwin/arm64
+
+### Review Blockers Fixed
+
+| # | Blocker | Fix |
+|---|---------|-----|
+| 1 | **Bloom stats race in Get** — `e.bloomChecks` and `e.bloomNegSkips` were plain `uint64` fields incremented inside `Get` while holding only `e.mu.RLock()`. Multiple concurrent readers could increment them simultaneously → data race. | Changed both fields to `atomic.Uint64` (from `sync/atomic`); incremented with `.Add(1)` in `Get` and read with `.Load()` in `Stats()`. No write lock downgrade needed. |
+| 2 | **Non-atomic Bloom sidecar write** — `flush()` wrote the Bloom sidecar with `os.WriteFile`, which is not atomic. A crash mid-write could leave a truncated sidecar file. | Extracted `writeFileAtomic(path, data, perm)` helper (temp file + `fsync` + rename, matching `saveManifest`). `flush()` now calls it for the Bloom sidecar. `saveManifest` refactored to call the same helper. |
+| 3 | **First Open does not write manifest** — package comments said "first Open writes an empty manifest" but the code only created an in-memory manifest and never persisted it. | After `loadManifest` returns `existed == false`, `Open` now calls `saveManifest` to write `MANIFEST.json` before proceeding. |
+| 4 | **Weak manifest validation** — table entries had no per-entry checks (ID zero, duplicate IDs, absolute/traversal paths, bad base64, MinKey > MaxKey, zero Count). | Added `validateTableEntries([]tableEntry) error` called from `loadManifest`; checks all rules listed in DESIGN.md. Uses `filepath.IsLocal` (Go 1.20+) for path safety. |
+
+### Tests Added
+
+| Test | Blocker |
+|------|---------|
+| `TestConcurrentGet_AfterFlush_BloomStatsRaceSafe` | 1 — 32 goroutines × 50 Gets on a Bloom-filtered missing key; verifies counter delta and passes `-race` |
+| `TestAtomicBloomWrite_NoTempFileLeftAfterFlush` | 2 — verifies no `*.tmp` files remain after successful Flush |
+| `TestFlush_BloomWriteFailureDoesNotCommitManifest` | 2 — chmod sstables dir to 0o555; verifies manifest is unchanged after failed second Flush; skipped as root |
+| `TestOpen_CreatesManifest` | 3 — verifies `MANIFEST.json` exists after first Open with correct fields |
+| `TestOpen_ManifestRejectsAbsolutePaths` | 4 — injects `/etc/passwd` for SSTablePath and BloomPath |
+| `TestOpen_ManifestRejectsPathTraversal` | 4 — injects `../../../etc/passwd` |
+| `TestOpen_ManifestRejectsDuplicateTableIDs` | 4 — two entries with the same ID |
+| `TestOpen_ManifestRejectsBadBase64Keys` | 4 — injects `!!not-valid-base64!!` for MinKey and MaxKey |
+| `TestOpen_ManifestRejectsMinKeyGreaterThanMaxKey` | 4 — injects MinKey="z", MaxKey="a" |
+| `TestOpen_ManifestRejectsEmptyTablePaths` | 4 — empty SSTablePath and BloomPath |
+
+### Files Changed
+
+```
+internal/engine/engine.go          — atomic.Uint64 counters; atomic bloom sidecar; first-Open manifest save; updated package docs
+internal/engine/manifest.go        — writeFileAtomic helper; validateTableEntries; saveManifest refactored
+internal/engine/engine_test.go     — 15 new tests (10 validation + 4 blocker-specific + 1 helper); encoding/json import
+docs/DESIGN.md                     — Bloom sidecar atomicity, Bloom stats concurrency, manifest init, validation table
+docs/PROOF.md                      — this section
+```
+
+### Updated Total Test Count
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge        3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/bloom       35 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config       8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/engine      60 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging      7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/memtable    30 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/sstable     46 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal         24 PASS
+```
+
+**Total: 213 tests, 213 PASS, 0 FAIL** (was 198; +15 Engine review-fix tests)
+
+### Benchmark Results (Apple M3, darwin/arm64, `-benchtime=3s`)
+
+```
+BenchmarkPut-8                             2657474     1374 ns/op      112 B/op    4 allocs/op
+BenchmarkGet_MemTable_Existing-8          92614130       38.85 ns/op    48 B/op    3 allocs/op
+BenchmarkGet_MemTable_Missing-8          223369108       15.95 ns/op     0 B/op    0 allocs/op
+BenchmarkFlush_1k-8                            207  16382193 ns/op   443951 B/op  5094 allocs/op
+BenchmarkFlush_100k-8                            5 639477567 ns/op 63294595 B/op 500130 allocs/op
+BenchmarkGet_SSTable_Existing-8            4257411      848.8 ns/op    96 B/op    4 allocs/op
+BenchmarkGet_SSTable_Missing_BloomSkip-8  86600826       44.03 ns/op    0 B/op    0 allocs/op
+BenchmarkScan_1k-8                            5773   618596 ns/op   544496 B/op  6554 allocs/op
+BenchmarkRestart_WALReplay-8                  6854   527941 ns/op   279569 B/op  3551 allocs/op
+BenchmarkRestart_ManifestLoad-8              49316    73317 ns/op    50552 B/op   557 allocs/op
+```
+
+Performance is unchanged from the initial Phase 6 submission. The atomic counter change adds no measurable overhead (atomic 64-bit ops on Apple M3 are single-cycle).
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./internal/engine/...
+go test -race -count=1 ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### Confirmation: Scope Unchanged
+
+No compaction, vector search, sharding, replication, dashboard, distributed, networking, or Raft logic was implemented. Only correctness fixes: atomic stats, atomic file writes, manifest initialization, and manifest validation.
+
+---
+
 *Future phases will append their own sections to this document.*

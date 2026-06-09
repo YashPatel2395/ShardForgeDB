@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/YashPatel2395/ShardForgeDB/internal/sstable"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -926,5 +928,103 @@ func TestCompact_StatsLastCompactionInputTables(t *testing.T) {
 
 	if n := e.Stats().LastCompactionInputTables; n != 4 {
 		t.Errorf("LastCompactionInputTables = %d, want 4", n)
+	}
+}
+
+// ── Test 33: Failed compacted-reader open leaves old state usable ─────────────
+//
+// If opening the new compacted SSTable reader fails (after writing the SSTable
+// and Bloom sidecar but before committing the manifest), Compact must:
+//   - return an error wrapping ErrCompactionFailed
+//   - leave e.tables unchanged (old readers still work)
+//   - leave the manifest unchanged (still lists old two tables)
+//   - not increment any compaction stats
+
+func TestCompact_NewReaderOpenFailureLeavesOldStateUsable(t *testing.T) {
+	dir := tmpDir(t)
+	e := openEngine(t, dir)
+	defer e.Close()
+
+	// Create two SSTables.
+	mustPut(t, e, "apple", "1")
+	mustFlush(t, e)
+	mustPut(t, e, "banana", "2")
+	mustFlush(t, e)
+
+	// Verify both keys are readable before the failed compact.
+	if v, ok := mustGet(t, e, "apple"); !ok || v != "1" {
+		t.Fatalf("pre-compact: apple: got (%q, %v)", v, ok)
+	}
+	if v, ok := mustGet(t, e, "banana"); !ok || v != "2" {
+		t.Fatalf("pre-compact: banana: got (%q, %v)", v, ok)
+	}
+
+	// Snapshot manifest state before compaction.
+	mBefore, _, err := loadManifest(dir)
+	if err != nil {
+		t.Fatalf("loadManifest before: %v", err)
+	}
+	if len(mBefore.Tables) != 2 {
+		t.Fatalf("expected 2 tables in manifest before compact, got %d", len(mBefore.Tables))
+	}
+
+	// Snapshot compaction stats before.
+	statsBefore := e.Stats()
+
+	// Install test hook: make the compacted SSTable reader open fail.
+	orig := openSSTableReader
+	defer func() { openSSTableReader = orig }()
+	openSSTableReader = func(path string, opts sstable.Options) (*sstable.Reader, error) {
+		return nil, fmt.Errorf("injected open failure")
+	}
+
+	// Compact must fail with ErrCompactionFailed.
+	compactErr := e.Compact()
+	if compactErr == nil {
+		t.Fatal("expected Compact to return an error, got nil")
+	}
+	if !errors.Is(compactErr, ErrCompactionFailed) {
+		t.Errorf("expected ErrCompactionFailed, got %v", compactErr)
+	}
+
+	// Restore hook; Get and Scan use already-open readers so they are unaffected
+	// even while the hook is installed, but restore early for clarity.
+	openSSTableReader = orig
+
+	// Old in-memory state must be completely unchanged.
+	if n := e.Stats().SSTableCount; n != 2 {
+		t.Errorf("SSTableCount = %d after failed compact, want 2", n)
+	}
+	if v, ok := mustGet(t, e, "apple"); !ok || v != "1" {
+		t.Errorf("apple: got (%q, %v) after failed compact", v, ok)
+	}
+	if v, ok := mustGet(t, e, "banana"); !ok || v != "2" {
+		t.Errorf("banana: got (%q, %v) after failed compact", v, ok)
+	}
+
+	// Manifest must still list exactly the original two tables with the same IDs.
+	mAfter, _, err := loadManifest(dir)
+	if err != nil {
+		t.Fatalf("loadManifest after: %v", err)
+	}
+	if len(mAfter.Tables) != 2 {
+		t.Errorf("manifest has %d tables after failed compact, want 2", len(mAfter.Tables))
+	}
+	for i, te := range mAfter.Tables {
+		if te.ID != mBefore.Tables[i].ID {
+			t.Errorf("manifest table[%d] ID changed: before=%d after=%d",
+				i, mBefore.Tables[i].ID, te.ID)
+		}
+	}
+
+	// Compaction stats must not have been touched.
+	statsAfter := e.Stats()
+	if statsAfter.CompactionCount != statsBefore.CompactionCount {
+		t.Errorf("CompactionCount changed: before=%d after=%d",
+			statsBefore.CompactionCount, statsAfter.CompactionCount)
+	}
+	if statsAfter.LastCompactionInputTables != statsBefore.LastCompactionInputTables {
+		t.Errorf("LastCompactionInputTables changed: before=%d after=%d",
+			statsBefore.LastCompactionInputTables, statsAfter.LastCompactionInputTables)
 	}
 }

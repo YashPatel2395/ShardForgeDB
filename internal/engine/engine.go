@@ -166,6 +166,14 @@ import (
 	"github.com/YashPatel2395/ShardForgeDB/internal/wal"
 )
 
+// ── Test hooks ────────────────────────────────────────────────────────────────
+
+// openSSTableReader is the function used to open an SSTable reader. It is a
+// package-level variable so that tests can replace it to inject failures.
+// Production code must not reassign this variable. Tests must restore the
+// original value with defer (e.g. defer func() { openSSTableReader = sstable.Open }()).
+var openSSTableReader = sstable.Open
+
 // ── Exported errors ───────────────────────────────────────────────────────────
 
 // ErrClosed is returned by any engine operation after Close has been called.
@@ -738,12 +746,24 @@ func (e *Engine) flush() error {
 		return fmt.Errorf("%w: write Bloom sidecar: %v", ErrFlushFailed, err)
 	}
 
+	// Open the new SSTable reader BEFORE committing the manifest. If opening
+	// fails we can safely undo: remove the new files, decrement the file ID,
+	// and return an error with the old tables and manifest unchanged.
+	r, err := openSSTableReader(sstAbsPath, sstable.Options{MaxRecordSize: e.opts.SSTableMaxRecordSize})
+	if err != nil {
+		os.Remove(sstAbsPath)
+		os.Remove(bloomAbsPath)
+		e.nextFileID--
+		return fmt.Errorf("%w: open new SSTable reader: %v", ErrFlushFailed, err)
+	}
+
 	// Load the current manifest, append the new table entry, and save
 	// atomically. We reload it from disk so concurrent restarts see a
 	// consistent view (within this single-node engine that is the same object,
 	// but loading keeps the logic clean).
 	m, _, err := loadManifest(e.opts.Dir)
 	if err != nil {
+		r.Close()
 		os.Remove(sstAbsPath)
 		os.Remove(bloomAbsPath)
 		e.nextFileID--
@@ -760,18 +780,14 @@ func (e *Engine) flush() error {
 		MaxKey:      encodeKey(sstMeta.MaxKey),
 	})
 	if err := saveManifest(e.opts.Dir, m); err != nil {
+		r.Close()
 		os.Remove(sstAbsPath)
 		os.Remove(bloomAbsPath)
 		e.nextFileID--
 		return fmt.Errorf("%w: save manifest: %v", ErrFlushFailed, err)
 	}
 
-	// Manifest committed. Open the reader for the new SSTable.
-	r, err := sstable.Open(sstAbsPath, sstable.Options{MaxRecordSize: e.opts.SSTableMaxRecordSize})
-	if err != nil {
-		// Manifest points to this SSTable; next Open will reload it.
-		return fmt.Errorf("%w: open new SSTable reader: %v", ErrFlushFailed, err)
-	}
+	// Manifest committed. Append the new table handle (reader already open).
 	e.tables = append(e.tables, &tableHandle{
 		id:        fileID,
 		reader:    r,
@@ -839,6 +855,19 @@ func (e *Engine) Compact() error {
 //     full compaction covers all SSTables; no older version of the key can
 //     exist below this level after the manifest swap.
 //  5. Sort surviving entries lexicographically by key before writing.
+//
+// Ordering invariant (live-output path):
+//
+//  1. Write compacted SSTable.
+//  2. Write compacted Bloom sidecar atomically.
+//  3. Open the new SSTable reader.
+//     — On failure: remove new files, decrement nextFileID, return error.
+//     — Old tables and manifest are unchanged; old reads continue working.
+//  4. Commit the new manifest.
+//     — On failure: close new reader, remove new files, decrement nextFileID,
+//     return error. Old tables and manifest are unchanged.
+//  5. Close old readers, replace e.tables, remove old files best-effort.
+//  6. Update compaction stats.
 //
 // Crash safety:
 //   - Crash before manifest commit: old manifest intact; compacted orphan ignored.
@@ -982,9 +1011,21 @@ func (e *Engine) compact() error {
 		return fmt.Errorf("%w: write Bloom sidecar: %v", ErrCompactionFailed, err)
 	}
 
+	// Open the new SSTable reader BEFORE committing the manifest. If opening
+	// fails, remove the new files, decrement the file ID, and return an error
+	// with the old tables and manifest unchanged — old reads continue working.
+	r, err := openSSTableReader(sstAbsPath, sstable.Options{MaxRecordSize: e.opts.SSTableMaxRecordSize})
+	if err != nil {
+		os.Remove(sstAbsPath)
+		os.Remove(bloomAbsPath)
+		e.nextFileID--
+		return fmt.Errorf("%w: open compacted SSTable reader: %v", ErrCompactionFailed, err)
+	}
+
 	// Atomic manifest update: replace all old table entries with one new entry.
 	m, _, err := loadManifest(e.opts.Dir)
 	if err != nil {
+		r.Close()
 		os.Remove(sstAbsPath)
 		os.Remove(bloomAbsPath)
 		e.nextFileID--
@@ -1003,25 +1044,14 @@ func (e *Engine) compact() error {
 		},
 	}
 	if err := saveManifest(e.opts.Dir, m); err != nil {
+		r.Close()
 		os.Remove(sstAbsPath)
 		os.Remove(bloomAbsPath)
 		e.nextFileID--
 		return fmt.Errorf("%w: save manifest: %v", ErrCompactionFailed, err)
 	}
 
-	// Manifest committed. Open the new SSTable reader.
-	r, err := sstable.Open(sstAbsPath, sstable.Options{MaxRecordSize: e.opts.SSTableMaxRecordSize})
-	if err != nil {
-		// Manifest already points to the new SSTable. Close old readers; engine
-		// has zero in-memory table handles until next Open (or Flush).
-		for _, th := range oldHandles {
-			th.reader.Close()
-		}
-		e.tables = nil
-		return fmt.Errorf("%w: open compacted SSTable reader: %v", ErrCompactionFailed, err)
-	}
-
-	// Replace in-memory table list.
+	// Manifest committed. Replace in-memory table list (reader already open).
 	for _, th := range oldHandles {
 		th.reader.Close()
 	}

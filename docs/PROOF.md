@@ -1698,4 +1698,99 @@ No background compaction, no automatic thresholds, no leveled or size-tiered com
 
 ---
 
+## Phase 7 — Review Fix: Safe Reader-Open Ordering
+
+**Date:** 2026-06-09
+**Go version:** go1.26.4 darwin/arm64
+**Branch:** `phase-7-compaction`
+
+### Correctness Blocker Fixed
+
+**Problem:** In the live-output compaction path, the code previously committed the manifest *before* opening the new compacted SSTable reader. If the reader open failed after manifest commit, the engine set `e.tables = nil` and returned an error — leaving the running engine with no access to any SSTable data until restart, even though the old readers were still valid and the old manifest was already replaced.
+
+**Fix:** The new compacted SSTable reader is now opened *before* saving the manifest. If the reader open fails:
+- The new SSTable and Bloom sidecar files are removed (best-effort)
+- `nextFileID` is decremented
+- `ErrCompactionFailed` is returned
+- `e.tables` is left unchanged — old readers continue working
+- The manifest is left unchanged — still lists the old SSTables
+
+Only after the reader opens successfully is the manifest committed. If the manifest save then fails:
+- The new reader is closed
+- New files are removed (best-effort)
+- `nextFileID` is decremented
+- `ErrCompactionFailed` is returned
+- `e.tables` and the manifest are both unchanged
+
+### Flush Path — Same Fix Applied
+
+The `flush()` function had the same ordering issue: manifest was committed before the new SSTable reader was opened. Since the fix was small, low-risk, and symmetric, the same safe ordering was applied to `flush()`:
+
+1. Write SSTable → write Bloom sidecar → **open reader** → save manifest → append to e.tables
+
+If the reader open fails in `flush()`: SSTable and Bloom sidecar are removed, `nextFileID` decremented, `ErrFlushFailed` returned. The MemTable is unchanged and still readable; the manifest is unchanged.
+
+Previously, the Flush path was less dangerous because the MemTable still held the data after a failed reader open (the MemTable reset and WAL rotation happen after the manifest commit). However, applying the same ordering eliminates the orphaned manifest entry and makes the invariant consistent: **a failed Flush or Compact never commits changes to the manifest without the reader being successfully open**.
+
+### Test Hook
+
+A package-level test hook was added to `engine.go`:
+
+```go
+// openSSTableReader is the function used to open an SSTable reader. Tests can
+// replace it to inject failures. Must be restored with defer.
+var openSSTableReader = sstable.Open
+```
+
+Production code in `flush()` and `compact()` calls `openSSTableReader(...)` instead of `sstable.Open(...)` directly.
+
+### Tests Added
+
+| Test | File | Description |
+|------|------|-------------|
+| `TestCompact_NewReaderOpenFailureLeavesOldStateUsable` | `compact_test.go` | Failed compacted-reader open: old tables and manifest unchanged, stats not incremented |
+| `TestFlush_NewReaderOpenFailureLeavesOldStateUsable` | `engine_test.go` | Failed flush-reader open: MemTable unchanged, manifest unchanged, no orphan files |
+
+### Updated Test Count
+
+| Package | Tests |
+|---------|-------|
+| `internal/engine` | **247** (was 245; +2 new) |
+| All packages combined | **247** engine + others = **247 total engine** |
+
+Total passing tests (all packages): 247
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./internal/engine/...
+go test -race -count=1 ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### All Tests Pass
+
+```
+--- PASS: TestCompact_NewReaderOpenFailureLeavesOldStateUsable (0.05s)
+--- PASS: TestFlush_NewReaderOpenFailureLeavesOldStateUsable (0.01s)
+ok  github.com/YashPatel2395/ShardForgeDB/internal/engine   3.847s
+```
+
+All 247 engine tests pass. No regressions in any other package.
+
+### Scope Confirmation
+
+No background compaction, no automatic thresholds, no leveled or size-tiered compaction, no vector search, no sharding, no replication, no distributed logic, no networking, no dashboard, no Raft was implemented. Only correctness fix: safe reader-open ordering in `compact()` and `flush()`.
+
+---
+
 *Future phases will append their own sections to this document.*

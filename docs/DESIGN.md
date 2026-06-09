@@ -1,6 +1,6 @@
 # ShardForgeDB — High-Level Architecture Design
 
-> **Status:** WAL (`internal/wal`), MemTable (`internal/memtable`), and SSTable (`internal/sstable`) are implemented as of Phase 4.
+> **Status:** WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable`), and Bloom Filter (`internal/bloom`) are implemented as of Phase 5.
 > All other components described here are intended design only — not yet implemented.
 
 ---
@@ -228,10 +228,76 @@ Limitation: the parent directory is not fsynced after rename (a future improveme
 
 ### Bloom Filters
 
-Each SSTable carries a per-key Bloom filter. Before reading an SSTable, the engine checks the filter to skip files that definitely do not contain the requested key.
+**Phase 5 — Implemented** in `internal/bloom`.
 
-- Reduces read amplification for missing keys.
-- Target false-positive rate: ≤ 1%.
+Each SSTable will carry a per-key Bloom filter. Before reading an SSTable, the engine checks the filter to skip files that definitely do not contain the requested key. The filter package is complete; SSTable integration is deferred to the Engine phase.
+
+#### Parameter Formulas
+
+Given `n = ExpectedItems` and `p = FalsePositiveRate`:
+
+```
+m = ceil( -n * ln(p) / (ln(2)^2) )   // bit count
+k = round( (m / n) * ln(2) )          // hash count, minimum 1, capped at 64
+```
+
+Example: n=1000, p=0.01 → m=9586 bits, k=7 hash functions.
+
+#### Hash Strategy
+
+Double hashing with two deterministic FNV-1a 64-bit variants:
+
+```
+h1(x) = FNV-1a-64(x)
+h2(x) = FNV-1a-64(salt_bytes || x)     salt = 0x9e3779b97f4a7c15
+```
+
+The i-th bit position for key x:
+
+```
+pos_i = (h1(x) + i * h2(x)) mod m
+```
+
+If h2 computes to zero it is replaced by the salt constant (an odd, well-distributed value) to prevent degenerate double-hashing where all positions collapse to multiples of h1.
+
+The salt is the fractional part of the golden ratio × 2⁶⁴ — a standard choice for hashing schemes that need a decorrelated secondary value with good bit distribution.
+
+#### Bitset Layout
+
+Bits are packed into a `[]uint64` word array. Bit `b` lives in word `b/64` at bit position `b%64`. All reads and writes are protected by a `sync.RWMutex`; readers hold only the read lock, so concurrent `MightContain` calls proceed in parallel.
+
+#### Serialization Format
+
+```
+[magic         uint64  ]  0x544c464d4f4f4c42  ("BLOOMFLT" little-endian)
+[version       uint16  ]  currently 1
+[bitCount      uint64  ]
+[hashCount     uint32  ]
+[expectedItems uint64  ]
+[insertedItems uint64  ]
+[fprBits       uint64  ]  math.Float64bits(FalsePositiveRate)
+[wordCount     uint64  ]
+[words ...     uint64  ]  wordCount × 8 bytes
+[crc32         uint32  ]  IEEE CRC-32 over all bytes from magic through last word
+[magic         uint64  ]  trailing sentinel — same value as leading magic
+```
+
+All integers are little-endian. The wordCount safety cap is 2³⁰ words (8 GiB of bits) to prevent OOM from corrupt length fields.
+
+#### Checksum and Corruption Handling
+
+- **CRC-32 (IEEE)** over the entire blob except the trailing checksum and magic bytes.
+- `UnmarshalBinary` rejects: too-short data, bad leading magic, unsupported version, zero bitCount, zero hashCount, impossible FPR (outside (0,1)), inconsistent wordCount, wordCount exceeding the safety cap, CRC mismatch, bad trailing magic.
+- Checks run before any allocation of the word array to prevent OOM from corrupt metadata.
+
+#### Known Limitations (Phase 5)
+
+- Not wired into SSTable or Engine yet; integration is the Engine's responsibility.
+- No scalable / partitioned Bloom filter; the entire bit array lives in RAM.
+- No counting Bloom filter; Delete is not supported.
+- No compression of the bit array.
+- `InsertedItems` counts successful `Add` calls, not unique keys.
+- False positives are possible by design; false negatives are impossible.
 
 ### Compaction
 

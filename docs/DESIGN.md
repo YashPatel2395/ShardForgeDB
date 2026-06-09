@@ -96,11 +96,17 @@ Key space is partitioned across nodes using consistent hashing.
 
 ### Replication
 
-Each shard is replicated across N nodes using the Raft consensus algorithm.
+Each shard is replicated across N nodes using a leader/follower model.
 
 - Leader handles all writes; followers serve reads (with optional staleness).
-- Leader election is triggered automatically on leader failure.
-- Log entries correspond to WAL entries; Raft provides ordering guarantees.
+- Automatic failover on leader failure is planned for a later sub-phase.
+- Log entries correspond to WAL entries, giving a natural replication unit.
+
+> **Note on Raft:** Full Raft-compatible consensus (leader election, term
+> handling, replicated log, commit index, voting, and failover) is a future
+> candidate algorithm, not the committed implementation. It will not be claimed
+> as implemented until leader election, term handling, replicated log, commit
+> index, voting, failover, and tests are all in place.
 
 ---
 
@@ -122,7 +128,7 @@ Read path:
 |----------|-----------|
 | LSM-tree over B-tree | Write-optimised; read amplification requires Bloom + cache |
 | Levelled compaction | Predictable read performance; higher write amplification than tiered |
-| Raft replication | Strong consistency; higher latency than eventual-consistency approaches |
+| Leader/follower replication | Simple to implement and reason about; Raft-compatible consensus is a future candidate if strong consistency is required |
 | HNSW for vector search | High recall; memory-intensive; no native disk-resident variant |
 
 ---

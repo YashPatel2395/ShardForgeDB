@@ -41,7 +41,7 @@ func newVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print ShardForgeDB version information",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("ShardForgeDB %s\n", version)
+			fmt.Fprintf(cmd.OutOrStdout(), "ShardForgeDB %s\n", version)
 		},
 	}
 }

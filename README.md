@@ -26,7 +26,7 @@ Engine (key-value + vector)
 
 Cluster
   ├── Sharding     — consistent-hash partitioning
-  └── Replication  — Raft-based leader/follower
+  └── Replication  — leader/follower replication
 ```
 
 None of the above components are implemented in Phase 1. The architecture diagram reflects the intended final design.
@@ -54,7 +54,7 @@ None of the above components are implemented in Phase 1. The architecture diagra
 | 6 | Engine — key-value read/write/delete, compaction |
 | 7 | Vector search — ANN index (HNSW or IVF) |
 | 8 | Sharding — consistent-hash partitioning |
-| 9 | Replication — Raft consensus |
+| 9 | Replication — leader/follower; Raft-compatible consensus only after full implementation |
 | 10 | Benchmarks, dashboard, chaos / failure simulation |
 
 ## Features NOT Yet Implemented

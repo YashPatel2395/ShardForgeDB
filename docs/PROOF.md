@@ -4,86 +4,111 @@ This file records the evidence that each phase was implemented correctly and pas
 
 ---
 
-## Phase 1 — Project Foundation
+## Phase 1 — Project Foundation (initial)
 
 **Date:** 2026-06-09
 **Go version:** go1.26.4 darwin/arm64
+
+See Phase 1 cleanup below for the authoritative final state.
+
+---
+
+## Phase 1 — Cleanup & Validation
+
+**Date:** 2026-06-09
+**Go version:** go1.26.4 darwin/arm64
+
+### Changes Made
+
+| Item | Change |
+|------|--------|
+| Module path | `github.com/shardforgedb/shardforgedb` → `github.com/YashPatel2395/ShardForgeDB` |
+| CLI testability | `version` command now writes via `cmd.OutOrStdout()` (no behavior change) |
+| CLI tests | 3 new tests in `cmd/shardforge/main_test.go` |
+| README.md | Removed "Raft-based" from architecture diagram; softened Phase 9 label |
+| docs/DESIGN.md | Replaced Raft-as-planned-impl with honest leader/follower description + Raft note |
+| go.mod | Module path corrected; cobra and yaml.v3 promoted from indirect to direct |
+| LICENSE | Added standard MIT license (Copyright 2026 Yash Patel) |
 
 ### Acceptance Criteria
 
 | Criterion | Result |
 |-----------|--------|
 | Project builds successfully (`make build`) | PASS |
-| All tests pass (`make test`) | PASS |
+| All 18 tests pass (`make test`) | PASS |
 | `go vet ./...` passes | PASS |
 | `go fmt ./...` — no formatting changes | PASS |
+| `go mod tidy` — clean | PASS |
 | `shardforge --help` works | PASS |
 | `shardforge version` works | PASS |
-| README states Phase 1 only | PASS |
-| DESIGN.md describes intended architecture without claiming it is implemented | PASS |
-| No database internals implemented | PASS |
+| Module path matches GitHub repo | PASS |
+| Raft not claimed as planned implementation | PASS |
+| MIT LICENSE file present | PASS |
 
 ### Commands Run
 
 ```
+go mod tidy
 go fmt ./...
 go vet ./...
-go test -race -count=1 ./...
-make build
+go test -race -count=1 -v ./...
 make test
+make vet
+make build
 ./bin/shardforge --help
 ./bin/shardforge version
 ```
 
-### Test Output
+### Full Test Output
 
 ```
-?   github.com/shardforgedb/shardforgedb/cmd/shardforge     [no test files]
-?   github.com/shardforgedb/shardforgedb/internal/bench     [no test files]
-?   github.com/shardforgedb/shardforgedb/internal/bloom     [no test files]
-?   github.com/shardforgedb/shardforgedb/internal/cluster   [no test files]
-ok  github.com/shardforgedb/shardforgedb/internal/config    1.206s
-?   github.com/shardforgedb/shardforgedb/internal/engine    [no test files]
-ok  github.com/shardforgedb/shardforgedb/internal/logging   1.329s
-?   github.com/shardforgedb/shardforgedb/internal/memtable  [no test files]
-?   github.com/shardforgedb/shardforgedb/internal/sstable   [no test files]
-?   github.com/shardforgedb/shardforgedb/internal/storage   [no test files]
-?   github.com/shardforgedb/shardforgedb/internal/vector    [no test files]
-?   github.com/shardforgedb/shardforgedb/internal/wal       [no test files]
+=== RUN   TestHelp
+--- PASS: TestHelp (0.00s)
+=== RUN   TestVersion
+--- PASS: TestVersion (0.00s)
+=== RUN   TestUnknownCommand
+--- PASS: TestUnknownCommand (0.00s)
+PASS
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge    1.313s
+
+=== RUN   TestDefault
+--- PASS: TestDefault (0.00s)
+=== RUN   TestLoad_ValidFile
+--- PASS: TestLoad_ValidFile (0.00s)
+=== RUN   TestLoad_PartialFile_UsesDefaults
+--- PASS: TestLoad_PartialFile_UsesDefaults (0.00s)
+=== RUN   TestLoad_MissingFile
+--- PASS: TestLoad_MissingFile (0.00s)
+=== RUN   TestLoad_InvalidYAML
+--- PASS: TestLoad_InvalidYAML (0.00s)
+=== RUN   TestLoad_InvalidPort
+--- PASS: TestLoad_InvalidPort (0.00s)
+=== RUN   TestLoad_InvalidLogLevel
+--- PASS: TestLoad_InvalidLogLevel (0.00s)
+=== RUN   TestLoad_InvalidLogFormat
+--- PASS: TestLoad_InvalidLogFormat (0.00s)
+PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config   1.617s
+
+=== RUN   TestNew_ReturnsLogger
+--- PASS: TestNew_ReturnsLogger (0.00s)
+=== RUN   TestNewWithWriter_JSONFormat
+--- PASS: TestNewWithWriter_JSONFormat (0.00s)
+=== RUN   TestNewWithWriter_TextFormat
+--- PASS: TestNewWithWriter_TextFormat (0.00s)
+=== RUN   TestNew_DebugLevelFiltersInfo
+--- PASS: TestNew_DebugLevelFiltersInfo (0.00s)
+=== RUN   TestNew_WarnLevelSuppressesInfo
+--- PASS: TestNew_WarnLevelSuppressesInfo (0.00s)
+=== RUN   TestNew_UnknownLevelDefaultsToInfo
+--- PASS: TestNew_UnknownLevelDefaultsToInfo (0.00s)
+=== RUN   TestNew_UnknownFormatDefaultsToJSON
+--- PASS: TestNew_UnknownFormatDefaultsToJSON (0.00s)
+PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging  1.470s
 ```
 
-#### internal/config — 8 tests, all PASS
-
-| Test | Status |
-|------|--------|
-| TestDefault | PASS |
-| TestLoad_ValidFile | PASS |
-| TestLoad_PartialFile_UsesDefaults | PASS |
-| TestLoad_MissingFile | PASS |
-| TestLoad_InvalidYAML | PASS |
-| TestLoad_InvalidPort | PASS |
-| TestLoad_InvalidLogLevel | PASS |
-| TestLoad_InvalidLogFormat | PASS |
-
-#### internal/logging — 7 tests, all PASS
-
-| Test | Status |
-|------|--------|
-| TestNew_ReturnsLogger | PASS |
-| TestNewWithWriter_JSONFormat | PASS |
-| TestNewWithWriter_TextFormat | PASS |
-| TestNew_DebugLevelFiltersInfo | PASS |
-| TestNew_WarnLevelSuppressesInfo | PASS |
-| TestNew_UnknownLevelDefaultsToInfo | PASS |
-| TestNew_UnknownFormatDefaultsToJSON | PASS |
-
-### Build Output
-
-```
-go build -o bin/shardforge ./cmd/shardforge
-```
-
-Binary produced at `bin/shardforge`.
+**Total: 18 tests, 18 PASS, 0 FAIL**
 
 ### CLI Verification
 
@@ -101,16 +126,7 @@ Database internals are NOT implemented yet.
 
 Usage:
   shardforge [command]
-
-Available Commands:
-  completion  Generate the autocompletion script for the specified shell
-  help        Help about any command
-  version     Print ShardForgeDB version information
-
-Flags:
-  -h, --help   help for shardforge
-
-Use "shardforge [command] --help" for more information about a command.
+...
 
 $ ./bin/shardforge version
 ShardForgeDB 0.1.0
@@ -118,10 +134,9 @@ ShardForgeDB 0.1.0
 
 ### Known Limitations
 
-- No database internals exist; this phase is foundation only.
-- `golangci-lint` is not installed; `make lint` degrades gracefully with a message.
-- Config format is YAML only; no TOML or environment variable override yet.
-- `go mod tidy` reduces the go.sum, but cobra brings in `mousetrap` (Windows tty helper) and `pflag` as indirect dependencies.
+- `golangci-lint` is not installed; `make lint` degrades gracefully.
+- Config format is YAML only; no env-var override or TOML support yet.
+- No database internals exist; foundation phase only.
 
 ---
 

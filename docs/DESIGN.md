@@ -1,7 +1,7 @@
 # ShardForgeDB — High-Level Architecture Design
 
-> **Status: Intended design only. Nothing below this line is implemented.**
-> This document describes where the project is going, not where it is.
+> **Status:** WAL (`internal/wal`) is implemented as of Phase 2.
+> All other components described here are intended design only — not yet implemented.
 
 ---
 
@@ -18,11 +18,50 @@
 
 ### Write-Ahead Log (WAL)
 
-All mutations are first written to an append-only WAL before being acknowledged. This guarantees durability in the event of a process crash.
+**Phase 2 — Implemented** in `internal/wal`.
 
-- Sequential writes for maximum throughput.
-- Entries include a CRC checksum for integrity verification.
-- Recovery scans the WAL on startup and replays any uncommitted entries.
+All mutations are first written to an append-only WAL before being acknowledged. This guarantees durability in the event of a process crash. The engine (not yet implemented) will replay the WAL on startup to recover any writes not yet flushed to an SSTable.
+
+#### Record Format
+
+Each record is encoded as a fixed-size frame header followed by a variable-length body. All integers are little-endian.
+
+```
+┌─────────┬─────────┬─────────┬──────┬────────┬──────────┬─────────────────┐
+│ length  │  crc32  │   seq   │ type │ keyLen │ valueLen │  key … value …  │
+│ uint32  │ uint32  │ uint64  │uint8 │ uint32 │  uint32  │   (raw bytes)   │
+│  4 B    │  4 B    │  8 B    │ 1 B  │  4 B   │   4 B    │   variable      │
+└─────────┴─────────┴─────────┴──────┴────────┴──────────┴─────────────────┘
+```
+
+- `length` — byte count of everything after the `crc32` field (body only).
+- `crc32` — IEEE CRC-32 of the body (`seq` through `value` bytes inclusive).
+- `seq` — monotonically increasing sequence number assigned by `Append`.
+- `type` — `1 = RecordPut`, `2 = RecordDelete`.
+- `keyLen` / `valueLen` — byte lengths of the key and value payloads.
+
+#### Durability Behaviour
+
+- `SyncOnWrite: true` — calls `fsync` after every `Append`. Guarantees the record is on stable storage before the call returns.
+- `SyncOnWrite: false` (default for tests) — the OS may buffer writes. Use `true` in production.
+
+#### Corruption Handling
+
+The distinction between a partial tail and corruption is based on which bytes are present, not on position:
+
+- **Partial header** — `io.ReadFull` returns `io.EOF` or `io.ErrUnexpectedEOF` while reading the 8-byte frame header → clean stop. The process crashed before it could write a complete frame header.
+- **Partial body** — `io.ReadFull` returns `io.EOF` or `io.ErrUnexpectedEOF` while reading the declared body → clean stop. The process crashed after writing the header but before finishing the body.
+- **Complete body, checksum mismatch** → `ErrCorruptRecord`, always, regardless of whether the record is the last one in the file. A crashed write leaves bytes *absent*, not bytes *present-but-wrong*. A complete record with the wrong CRC is data corruption, not a partial tail.
+- **Frame header claims `bodyLen > MaxRecordSize`** → `ErrCorruptRecord` immediately, before any allocation. Prevents OOM from a corrupt length field.
+- **Frame header claims `bodyLen < bodyFixedSize`** → `ErrCorruptRecord` immediately. No valid `Append` can produce a body smaller than the fixed overhead.
+
+#### Known Limitations (Phase 2)
+
+- Single WAL file only — no segment rotation.
+- No WAL compaction / GC.
+- No group commit (each `Append` is an independent write).
+- No compression or encryption.
+- WAL is not yet wired to the MemTable or Engine (future phases).
 
 ### MemTable
 

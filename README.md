@@ -33,7 +33,7 @@ None of the above components are implemented in Phase 1. The architecture diagra
 
 ## Current Phase
 
-**Phase 1 — Project Foundation**
+**Phase 1 — Project Foundation** ✓ locked
 
 - [x] Go module initialised
 - [x] CLI skeleton (`shardforge --help`, `shardforge version`)
@@ -42,6 +42,19 @@ None of the above components are implemented in Phase 1. The architecture diagra
 - [x] Makefile (`build`, `test`, `fmt`, `vet`, `lint`)
 - [x] Placeholder packages for all future components
 - [x] Design and proof documentation
+- [x] GitHub Actions CI
+
+**Phase 2 — WAL** (branch: `phase-2-wal`, in review)
+
+- [x] `internal/wal` — append-only, CRC-checksummed write-ahead log
+- [x] `Open`, `Append`, `Replay`, `Close` API
+- [x] Little-endian binary record format with sequence numbers
+- [x] Corruption detection and partial-tail tolerance
+- [x] Concurrent-safe appends
+- [x] 18 tests, 4 benchmarks
+
+> The WAL is not yet connected to a MemTable or Engine. No key-value reads or
+> writes are possible yet. No crash recovery pipeline exists end-to-end.
 
 ## Planned Phases
 

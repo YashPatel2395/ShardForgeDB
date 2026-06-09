@@ -267,4 +267,200 @@ The following packages contain only a package declaration and doc comment — no
 
 ---
 
+---
+
+## Phase 2 — WAL
+
+**Date:** 2026-06-09
+**Branch:** `phase-2-wal`
+**Go version:** go1.26.4 darwin/arm64
+
+### Implemented Behaviour
+
+| Feature | Detail |
+|---------|--------|
+| `Open` | Creates or opens WAL file; seeks to EOF; safe permissions (0o600) |
+| `Append` | Binary-encodes record; assigns monotonic seq; CRC-32 checksum; optional fsync; mutex-safe |
+| `Replay` | Sequential read from BOF; CRC verification; partial-tail tolerance; seq counter sync |
+| `Close` | Closes file; subsequent Append/Close return `ErrClosed` |
+| Error types | `ErrClosed`, `ErrInvalidRecord`, `ErrCorruptRecord`, `ErrRecordTooLarge` |
+| Record types | `RecordPut (1)`, `RecordDelete (2)` |
+| Format | Little-endian: `[length u32][crc32 u32][seq u64][type u8][keyLen u32][valueLen u32][key][value]` |
+
+### Tests Added — 18 tests, all PASS
+
+| # | Test | Status |
+|---|------|--------|
+| 1 | `TestOpen_CreatesFile` | PASS |
+| 2 | `TestAppendReplay_OnePut` | PASS |
+| 3 | `TestAppendReplay_OrderPreserved` | PASS |
+| 4 | `TestReplay_EmptyWAL` | PASS |
+| 5 | `TestAppendReplay_DeleteTombstone` | PASS |
+| 6 | `TestAppendReplay_BinaryData` | PASS |
+| 7 | `TestAppend_RejectsUnknownType` | PASS |
+| 8 | `TestAppend_RejectsEmptyKey` | PASS |
+| 9 | `TestAppend_RejectsOversizedRecord` | PASS |
+| 10 | `TestAppend_AfterClose` | PASS |
+| 11 | `TestReplay_DetectsChecksumCorruption` | PASS |
+| 12 | `TestReplay_IncompleteFinalHeader` | PASS |
+| 13 | `TestReplay_IncompleteFinalBody` | PASS |
+| 14 | `TestReplay_MidFileCorruptionNotIgnored` | PASS |
+| 15 | `TestAppend_ConcurrentSafe` | PASS |
+| 16 | `TestReplay_CallbackErrorStopsReplay` | PASS |
+| 17 | `TestAppend_CallerMutationSafe` | PASS |
+| 18 | `TestReopen_PreservesOldRecords` | PASS |
+
+### Benchmarks (Apple M3, darwin/arm64)
+
+```
+BenchmarkAppend_NoSync-8        2690473     1290 ns/op      64 B/op    1 allocs/op
+BenchmarkAppend_Sync-8             1718  2783271 ns/op      64 B/op    1 allocs/op
+BenchmarkReplay_1k-8               3616   879713 ns/op   88272 B/op 4005 allocs/op
+BenchmarkReplay_100k-8               39 87374610 ns/op 8800344 B/op 400005 allocs/op
+```
+
+Observations:
+- No-sync append: ~1.3 µs/op — dominated by allocations and encoding.
+- Sync append: ~2.8 ms/op — dominated by `fsync` latency (expected on Apple SSD).
+- Replay 1k records: ~880 µs total / ~880 ns/record.
+- Replay 100k records: ~87 ms total / ~873 ns/record — linear scaling confirmed.
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/wal/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### Full Test Results (all packages)
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge    3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config   8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging  7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal     18 PASS
+```
+
+**Total: 36 tests, 36 PASS, 0 FAIL**
+
+### git status --short (before commit)
+
+```
+ M internal/wal/wal.go
+?? internal/wal/wal_bench_test.go
+?? internal/wal/wal_test.go
+```
+
+Expected: only WAL files changed. No other packages touched.
+
+### Known Limitations
+
+- Single WAL file — no segment rotation or size-based rollover.
+- No WAL compaction / GC — deleted records remain in the file.
+- No group commit — each `Append` is a separate `write` syscall.
+- No compression or encryption.
+- WAL is isolated — not yet connected to MemTable or Engine.
+- Crash recovery is not end-to-end testable until the Engine is built.
+
+### Confirmation: No Other Database Internals Implemented
+
+- `internal/memtable` — placeholder only (package declaration)
+- `internal/sstable` — placeholder only
+- `internal/bloom` — placeholder only
+- `internal/engine` — placeholder only
+- `internal/vector` — placeholder only
+- `internal/cluster` — placeholder only
+- `internal/storage` — placeholder only
+- `internal/bench` — placeholder only
+
+---
+
+---
+
+## Phase 2 — WAL: Corruption-Handling Fix
+
+**Date:** 2026-06-09
+**Branch:** `phase-2-wal`
+**Go version:** go1.26.4 darwin/arm64
+
+### Bugs Fixed
+
+| # | Bug | Fix |
+|---|-----|-----|
+| 1 | CRC mismatch on a complete tail record was silently ignored (treated as a partial write). A "peek-ahead" read was used to decide; this is wrong — absent bytes ≠ present-but-wrong bytes. | Removed peek-ahead. Any complete body with a CRC mismatch now returns `ErrCorruptRecord` unconditionally. |
+| 2 | `make([]byte, bodyLen)` in `Replay` ran before size validation, allowing a corrupt `bodyLen` field to trigger OOM. | Added `bodyLen > MaxRecordSize` and `bodyLen < bodyFixedSize` checks before any allocation. |
+| 3 | `Append` validated body size after `encodeRecord` allocated the encoding buffer. | Moved size check to before any allocation using `uint64` arithmetic to guard overflow. |
+
+### Tests Added (6 new, total 24)
+
+| Test | What it proves |
+|------|----------------|
+| `TestReplay_SingleCorruptRecord_ReturnsError` | Single corrupt record → `ErrCorruptRecord` (not silent stop) |
+| `TestReplay_LastRecordCorrupt_ReturnsError` | Last of multiple records corrupt → `ErrCorruptRecord` |
+| `TestReplay_RejectsOversizedBodyBeforeAlloc` | Frame claims body > MaxRecordSize → `ErrCorruptRecord` before allocation |
+| `TestAppend_RejectsHugeRecordBeforeEncoding` | Key+value > MaxRecordSize → `ErrRecordTooLarge` before encoding alloc |
+| `TestReplay_RejectsBodySmallerThanFixedSize` | Frame claims body < bodyFixedSize → `ErrCorruptRecord` |
+| `TestClose_CalledTwiceReturnsErrClosed` | Second `Close()` → `ErrClosed` (matches documented behaviour) |
+
+### Updated Total Test Count
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge    3 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/config   8 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/logging  7 PASS
+ok  github.com/YashPatel2395/ShardForgeDB/internal/wal     24 PASS
+```
+
+**Total: 42 tests, 42 PASS, 0 FAIL**
+
+### Benchmark Results (Apple M3, unchanged performance)
+
+```
+BenchmarkAppend_NoSync-8        2799494     1277 ns/op      64 B/op    1 allocs/op
+BenchmarkAppend_Sync-8             1729  2811348 ns/op      64 B/op    1 allocs/op
+BenchmarkReplay_1k-8               3372  1012236 ns/op   88272 B/op 4005 allocs/op
+BenchmarkReplay_100k-8               40 87349798 ns/op 8800364 B/op 400005 allocs/op
+```
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./internal/wal/...
+go test -race -count=1 ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/wal/...
+make test
+make vet
+make build
+./bin/shardforge --help
+./bin/shardforge version
+git status --short
+```
+
+### git status --short (before commit)
+
+```
+ M internal/wal/wal.go
+ M internal/wal/wal_test.go
+```
+
+Only WAL files changed. No other packages touched.
+
+### Confirmation: No Non-WAL Internals Implemented
+
+All placeholder packages (`memtable`, `sstable`, `bloom`, `engine`, `vector`, `cluster`, `storage`, `bench`) are unchanged.
+
+---
+
 *Future phases will append their own sections to this document.*

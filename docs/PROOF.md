@@ -3280,3 +3280,113 @@ This confirms the core safety property: the proxy returns an error immediately w
 - No automatic compaction: correct
 - No core Engine/WAL/MemTable/SSTable/Bloom/Vector/Shard/Replica/Dashboard/Node/Gateway behavior changes: correct
 - No core Engine/WAL/MemTable/SSTable/Bloom/Vector/Shard/Replica/Dashboard/Node behavior changes: correct
+
+---
+
+## Phase 17 — Static Cluster Metadata (`internal/cluster`)
+
+### Validation Commands
+
+```bash
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/cluster/...
+make test
+make vet
+make build
+make cluster-validate
+./bin/shardforge-gateway --config configs/local-3node.json route user:1
+./bin/shardforge-cluster validate configs/local-3node.json
+./bin/shardforge-cluster validate configs/local-3node-with-proxy.json
+./bin/shardforge-cluster validate configs/docker-3node-with-proxy.json
+docker compose -f deploy/docker-compose.yml config
+git status --short
+```
+
+### Test Results
+
+All 23 packages pass `go test -race -count=1 ./...`.
+
+```
+ok  github.com/YashPatel2395/ShardForgeDB/internal/cluster        2.1s
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-cluster  1.3s
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-gateway  1.4s
+ok  github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-proxy    1.6s
+```
+
+Test counts:
+- `internal/cluster`: 47 tests (config, validate, loader, integration)
+- `cmd/shardforge-cluster`: 10 tests
+- `cmd/shardforge-gateway`: 12 tests (8 prior + 4 new --config tests)
+- `cmd/shardforge-proxy`: 13 tests (9 prior + 4 new --config tests)
+
+### Benchmark Results
+
+```
+BenchmarkCluster_Parse-8            516888     6962 ns/op   1448 B/op   28 allocs/op
+BenchmarkCluster_Validate-8       33941624      105 ns/op      0 B/op    0 allocs/op
+BenchmarkCluster_GatewayOptions-8 26254626      137 ns/op    128 B/op    1 allocs/op
+BenchmarkCluster_ProxyOptions-8   25481388      137 ns/op    128 B/op    1 allocs/op
+```
+
+Notes:
+- **Parse (~7 µs):** JSON decode + Normalize + Validate for a 3-node config.
+- **Validate (~106 ns):** zero allocations; pure struct field checks.
+- **GatewayOptions/ProxyOptions (~138 ns):** validates then copies node slice; 1 allocation for the slice.
+
+**To reproduce:**
+```bash
+make bench-cluster
+# or
+go test -bench=. -benchmem -benchtime=3s -run='^$' ./internal/cluster/...
+```
+
+### Config-Based Gateway Route Proof
+
+```
+$ ./bin/shardforge-gateway --config configs/local-3node.json route user:1
+key="user:1" → node_id=node-2  base_url=http://127.0.0.1:9102
+```
+
+Same result as `--nodes`:
+```
+$ ./bin/shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 route user:1
+key="user:1" → node_id=node-2  base_url=http://127.0.0.1:9102
+```
+
+Deterministic routing is preserved across both invocation styles.
+
+### Config Validation Proof
+
+```
+$ ./bin/shardforge-cluster validate configs/local-3node.json
+ok  "configs/local-3node.json" is valid (version=v1, name="local-3node", nodes=3)
+
+$ ./bin/shardforge-cluster validate configs/local-3node-with-proxy.json
+ok  "configs/local-3node-with-proxy.json" is valid (version=v1, name="local-3node-with-proxy", nodes=3)
+
+$ ./bin/shardforge-cluster validate configs/docker-3node-with-proxy.json
+ok  "configs/docker-3node-with-proxy.json" is valid (version=v1, name="docker-3node-with-proxy", nodes=3)
+```
+
+### Scope Confirmation (Phase 17)
+
+- Static config only: correct — loaded once at startup, no runtime updates
+- No dynamic membership: correct — no gossip, no discovery
+- No service discovery: correct
+- No gossip: correct
+- No Raft: correct
+- No consensus: correct
+- No leader election: correct
+- No quorum: correct
+- No replication: correct
+- No failover: correct
+- No automatic rebalancing: correct
+- No shard migration: correct
+- No resharding: correct
+- No distributed transactions: correct
+- No distributed vector search: correct
+- No production cluster manager: correct
+- No core Engine/WAL/MemTable/SSTable/Bloom/Vector/Shard/Replica/Dashboard/Node/Gateway/Proxy behavior changes: correct

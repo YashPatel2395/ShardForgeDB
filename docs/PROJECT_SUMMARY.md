@@ -2,7 +2,7 @@
 
 ## Overview
 
-ShardForgeDB is a ground-up Go database engine built layer-by-layer to be fully explainable at every level of the stack. Every design decision, data structure, trade-off, and benchmark result is documented alongside the code. The project is structured as a sequence of sixteen numbered phases, each building on the previous and producing its own tests, benchmarks, and documentation.
+ShardForgeDB is a ground-up Go database engine built layer-by-layer to be fully explainable at every level of the stack. Every design decision, data structure, trade-off, and benchmark result is documented alongside the code. The project is structured as a sequence of seventeen numbered phases, each building on the previous and producing its own tests, benchmarks, and documentation.
 
 The goal is not to compete with production databases. The goal is to demonstrate deep understanding of database internals — how LSM trees actually work, what makes replication hard, why compaction matters, how to design a real networked node transport — through working code that is honest about what it is and what it is not.
 
@@ -11,6 +11,9 @@ The goal is not to compete with production databases. The goal is to demonstrate
 ## Architecture Summary
 
 ```
+Cluster Config (configs/*.json)   ← Phase 17 — static metadata
+  │ cluster.Load / cluster.GatewayOptions / cluster.ProxyOptions
+  ▼
 HTTP Client
   │ HTTP/JSON
   ▼
@@ -33,11 +36,11 @@ Simulation Layers (single-process, no networking between database nodes)
   ├── Replica   — binary operation log, leader-commit semantics, follower pause/lag controls
   └── Dashboard — local HTTP observability, HTML + JSON endpoints, chaos scenario runner
 
-Docker Compose Demo (Phase 16)
+Docker Compose Demo (Phase 16/17)
   ├── shardforge-node-1 — independent node, port 9101, /data/node-1
   ├── shardforge-node-2 — independent node, port 9102, /data/node-2
   ├── shardforge-node-3 — independent node, port 9103, /data/node-3
-  └── shardforge-proxy  — stateless routing proxy, port 9200
+  └── shardforge-proxy  — stateless routing proxy (config from docker-3node-with-proxy.json), port 9200
 ```
 
 ---
@@ -62,6 +65,7 @@ Docker Compose Demo (Phase 16)
 | 14 | `internal/node` + `cmd/shardforge-node` | Real networked node runtime, HTTP/JSON API, Docker Compose 3-node demo | 36 | 6 |
 | 15 | `internal/gateway` + `cmd/shardforge-gateway` | Client-side consistent-hash routing gateway, FNV-1a ring, weight support | 41 | 6 |
 | 16 | `internal/proxy` + `cmd/shardforge-proxy` | Stateless HTTP routing proxy, 10 endpoints, scope flags, Docker Compose integration | 45 | 7 |
+| 17 | `internal/cluster` + `cmd/shardforge-cluster` | Static cluster metadata, JSON config format, --config for gateway/proxy CLIs, 3 example configs | 47 | 4 |
 
 ---
 

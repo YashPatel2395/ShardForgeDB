@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/YashPatel2395/ShardForgeDB/internal/cluster"
 	"github.com/YashPatel2395/ShardForgeDB/internal/gateway"
 )
 
@@ -49,13 +50,14 @@ func run(args []string) int {
 func runWithWriters(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("shardforge-gateway", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	nodes := fs.String("nodes", "", "comma-separated list of node base URLs (required)\n    e.g. http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103")
-	vn := fs.Int("virtual-nodes", 128, "number of virtual ring points per node")
+	configPath := fs.String("config", "", "path to cluster config JSON file (use instead of --nodes)")
+	nodes := fs.String("nodes", "", "comma-separated list of node base URLs\n    e.g. http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103")
+	vn := fs.Int("virtual-nodes", 128, "number of virtual ring points per node (ignored when --config is set)")
 	timeoutStr := fs.String("timeout", "5s", "per-request HTTP timeout (e.g. 5s, 1m)")
 
 	fs.Usage = func() {
 		fmt.Fprint(stderr, disclaimer)
-		fmt.Fprintf(stderr, "\nUsage: shardforge-gateway --nodes <urls> <command> [args]\n\nFlags:\n")
+		fmt.Fprintf(stderr, "\nUsage: shardforge-gateway --nodes <urls> <command> [args]\n       shardforge-gateway --config <path> <command> [args]\n\nFlags:\n")
 		fs.PrintDefaults()
 		fmt.Fprintf(stderr, `
 Commands:
@@ -67,14 +69,13 @@ Commands:
   flush-all             flush all configured nodes
   compact-all           compact all configured nodes
 
-Examples:
+Examples (--nodes):
   shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 route user:1
-  shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 put user:1 alice
-  shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 get user:1
-  shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 delete user:1
-  shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 health
-  shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 flush-all
-  shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 compact-all
+
+Examples (--config):
+  shardforge-gateway --config configs/local-3node.json route user:1
+  shardforge-gateway --config configs/local-3node.json put user:1 alice
+  shardforge-gateway --config configs/local-3node.json get user:1
 `)
 	}
 
@@ -84,8 +85,13 @@ Examples:
 		return 1
 	}
 
-	if *nodes == "" {
-		fmt.Fprintln(stderr, "error: --nodes is required")
+	// Reject using both --config and --nodes to avoid ambiguity.
+	if *configPath != "" && *nodes != "" {
+		fmt.Fprintln(stderr, "error: use either --config or --nodes, not both")
+		return 1
+	}
+	if *configPath == "" && *nodes == "" {
+		fmt.Fprintln(stderr, "error: --nodes or --config is required")
 		fs.Usage()
 		return 1
 	}
@@ -96,10 +102,30 @@ Examples:
 		return 1
 	}
 
-	nodeCfgs := buildNodeConfigs(*nodes)
-	if len(nodeCfgs) == 0 {
-		fmt.Fprintln(stderr, "error: --nodes must contain at least one valid URL")
-		return 1
+	var nodeCfgs []gateway.NodeConfig
+
+	if *configPath != "" {
+		cfg, err := cluster.Load(*configPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: load config: %v\n", err)
+			return 1
+		}
+		ncs, err := cluster.NodeConfigs(cfg)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: node configs: %v\n", err)
+			return 1
+		}
+		nodeCfgs = ncs
+		// Use virtual nodes from config unless --virtual-nodes was explicitly set.
+		if cfg.Routing.VirtualNodes > 0 {
+			*vn = cfg.Routing.VirtualNodes
+		}
+	} else {
+		nodeCfgs = buildNodeConfigs(*nodes)
+		if len(nodeCfgs) == 0 {
+			fmt.Fprintln(stderr, "error: --nodes must contain at least one valid URL")
+			return 1
+		}
 	}
 
 	g, err := gateway.Open(gateway.Options{

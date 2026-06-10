@@ -1,0 +1,47 @@
+{
+  "version": "v1",
+  "name": "local-3node-with-proxy",
+  "description": "3 independent nodes + 1 stateless routing proxy running locally. No Raft, no replication, no distributed cluster.",
+  "routing": {
+    "algorithm": "fnv1a-consistent-hash",
+    "virtual_nodes": 128
+  },
+  "proxy": {
+    "enabled": true,
+    "addr": "127.0.0.1:9200"
+  },
+  "nodes": [
+    {
+      "id": "node-1",
+      "base_url": "http://127.0.0.1:9101",
+      "addr": "127.0.0.1:9101",
+      "data_dir": "/tmp/shardforge-node-1",
+      "weight": 1
+    },
+    {
+      "id": "node-2",
+      "base_url": "http://127.0.0.1:9102",
+      "addr": "127.0.0.1:9102",
+      "data_dir": "/tmp/shardforge-node-2",
+      "weight": 1
+    },
+    {
+      "id": "node-3",
+      "base_url": "http://127.0.0.1:9103",
+      "addr": "127.0.0.1:9103",
+      "data_dir": "/tmp/shardforge-node-3",
+      "weight": 1
+    }
+  ],
+  "scope": {
+    "static_config_only": true,
+    "no_dynamic_membership": true,
+    "no_discovery": true,
+    "no_consensus": true,
+    "no_raft": true,
+    "no_replication": true,
+    "no_failover": true,
+    "no_shard_migration": true,
+    "no_distributed_txns": true
+  }
+}

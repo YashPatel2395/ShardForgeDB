@@ -2,13 +2,12 @@
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer with strict documentation, tests, and benchmarks at every phase.
 
-> **Phase 16 in review.** All fifteen prior phases are implemented and locked.
-> Phase 16 adds a stateless HTTP gateway proxy (`shardforge-proxy`) that wraps the Phase 15
-> `internal/gateway` routing layer in a long-running HTTP server.
+> **Phase 17 in review.** All sixteen prior phases are implemented and locked.
+> Phase 17 adds static cluster metadata (`internal/cluster`): a typed, validated,
+> file-based cluster configuration format used by gateway and proxy CLIs via `--config`.
 >
-> This is a stateless routing proxy only. No Raft. No consensus. No replication.
-> No automatic failover. No retry to another node. If the routed node is unavailable,
-> the operation fails immediately — no other node is tried.
+> This is static metadata only. No dynamic membership. No node discovery. No gossip.
+> No Raft. No consensus. No leader election. The config is loaded once at startup.
 
 ---
 
@@ -26,6 +25,7 @@ Built to demonstrate:
 - **Real networked node runtime** — independent `shardforge-node` processes, HTTP/JSON API, Docker Compose 3-node demo
 - **Client-side routing gateway** — deterministic consistent-hash routing to independent nodes via `shardforge-gateway`
 - **Stateless HTTP gateway proxy** — `shardforge-proxy` wraps the gateway ring in a long-running HTTP/JSON server (10 endpoints, no failover, no retry)
+- **Static cluster metadata** — `internal/cluster` provides a typed, validated JSON config format; gateway and proxy CLIs accept `--config <path>` instead of `--nodes`
 - **Strict test/benchmark/docs discipline** — race-safe tests, reproducible benchmarks, honest scope docs
 
 ---
@@ -44,6 +44,7 @@ Sharding, replication, and the dashboard are **local in-process simulations** �
 | Node runtime | Real independent `shardforge-node` processes, HTTP/JSON API, Docker Compose demo | Distributed sharding across nodes, networked replication, Raft, consensus |
 | Gateway | Client-side consistent-hash routing (`shardforge-gateway`), deterministic key→node mapping | Server-side routing, cluster metadata service, automatic failover, resharding |
 | Proxy | Stateless HTTP proxy (`shardforge-proxy`), routes requests to nodes via gateway ring, 10 endpoints | Fault-tolerant proxy, retry on failure, replication, distributed state |
+| Cluster config | Static JSON config (`configs/*.json`), typed/validated, loaded at startup by gateway/proxy via `--config` | Dynamic membership, node discovery, gossip, Raft, leader election, production cluster manager |
 
 ---
 
@@ -87,7 +88,7 @@ Implemented components are tracked in the phase list below.
 ## Quickstart
 
 ```bash
-# Build all six binaries (includes shardforge-node, shardforge-gateway, shardforge-proxy)
+# Build all seven binaries (includes shardforge-node, shardforge-gateway, shardforge-proxy, shardforge-cluster)
 make build
 
 # Run all tests (race detector on)
@@ -110,6 +111,15 @@ make bench-report
 
 # Start proxy (routes to nodes already running on 9101-9103)
 ./bin/shardforge-proxy --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103
+
+# Start proxy using cluster config file (Phase 17)
+./bin/shardforge-proxy --config configs/local-3node-with-proxy.json
+
+# Route a key using cluster config (no network call — pure ring computation)
+./bin/shardforge-gateway --config configs/local-3node.json route user:1
+
+# Validate a cluster config file
+./bin/shardforge-cluster validate configs/local-3node.json
 
 # Proxy quickstart: curl to proxy for Put/Get
 curl -X PUT http://127.0.0.1:9200/kv/user:1 -H "Content-Type: application/json" -d '{"value":"alice"}'
@@ -373,6 +383,7 @@ make node-demo-down
 
 **Phase 16 — Stateless Gateway Proxy Server** ✓ locked
 
+
 - [x] `internal/proxy` — stateless HTTP routing proxy wrapping `internal/gateway.Gateway`
 - [x] `cmd/shardforge-proxy` — long-running proxy server CLI binary
 - [x] 10 HTTP/JSON endpoints: `/healthz`, `/status`, `/route/{key}`, `/kv/{key}` (PUT/GET/DELETE), `/scan-node/{nodeID}`, `/flush-all`, `/compact-all`, `/nodes/health`
@@ -384,6 +395,23 @@ make node-demo-down
 - [x] Docker Compose updated: `shardforge-proxy` on port 9200 alongside 3 independent nodes
 - [x] **Stateless routing only** — proxy holds no data; can be restarted at any time
 - [x] **No Raft, no consensus, no replication, no failover, no retry**
+
+**Phase 17 — Static Cluster Metadata** (branch: `phase-17-static-cluster-metadata`, in review)
+
+- [x] `internal/cluster` — typed, validated, file-based cluster configuration
+- [x] `cmd/shardforge-cluster` — CLI utility: `validate`, `print`, `example-local-3node`
+- [x] `configs/local-3node.json` — 3-node local example config
+- [x] `configs/local-3node-with-proxy.json` — 3-node local config with proxy enabled
+- [x] `configs/docker-3node-with-proxy.json` — Docker Compose config with service DNS names
+- [x] `--config` support added to `shardforge-gateway` and `shardforge-proxy` CLIs
+- [x] Reject `--config` + `--nodes` together (ambiguity error)
+- [x] Docker Compose updated to load proxy config from `configs/docker-3node-with-proxy.json`
+- [x] 47 tests, 4 benchmarks in `internal/cluster` + `cmd/shardforge-cluster`
+- [x] Makefile targets: `bench-cluster`, `cluster-validate`, `cluster-help`, `cluster-example`, `gateway-config-demo`
+- [x] `bin/shardforge-cluster` added to `make build` (now 7 binaries)
+- [x] **Static metadata only** — no dynamic membership, no discovery, no gossip
+- [x] **No Raft, no consensus, no leader election, no replication, no failover**
+- [x] **Config loaded once at startup** — no runtime cluster updates
 
 ---
 
@@ -407,7 +435,7 @@ The following are **not** present in the current codebase and are not claimed:
 ## Build and Run
 
 ```bash
-# Build all six binaries into bin/
+# Build all seven binaries into bin/
 make build
 
 # Individual binaries
@@ -417,6 +445,7 @@ go build -o bin/shardforge-dashboard ./cmd/shardforge-dashboard
 go build -o bin/shardforge-node ./cmd/shardforge-node
 go build -o bin/shardforge-gateway ./cmd/shardforge-gateway
 go build -o bin/shardforge-proxy ./cmd/shardforge-proxy
+go build -o bin/shardforge-cluster ./cmd/shardforge-cluster
 ```
 
 ## Test and Benchmark
@@ -433,6 +462,7 @@ make bench-dashboard         # dashboard Go benchmarks
 make bench-node              # node package Go benchmarks
 make bench-gateway           # gateway package Go benchmarks
 make bench-proxy             # proxy package Go benchmarks
+make bench-cluster           # cluster package Go benchmarks
 ```
 
 ## Scripts
@@ -471,6 +501,11 @@ make proxy             # run shardforge-proxy (requires nodes running)
 make proxy-help        # print shardforge-proxy --help
 make proxy-route-demo  # show proxy route endpoint demo
 make bench-proxy       # proxy package Go benchmarks
+make bench-cluster     # cluster package Go benchmarks
+make cluster-validate  # run cluster package tests
+make cluster-help      # print shardforge-cluster help
+make cluster-example   # print example cluster config
+make gateway-config-demo  # route using config file (no network call)
 make smoke             # ./scripts/smoke.sh
 make demo              # ./scripts/demo.sh
 make release-check     # ./scripts/release_check.sh

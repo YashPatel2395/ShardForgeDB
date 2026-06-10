@@ -4,6 +4,7 @@ DASHBOARD_BINARY := shardforge-dashboard
 NODE_BINARY      := shardforge-node
 GATEWAY_BINARY   := shardforge-gateway
 PROXY_BINARY     := shardforge-proxy
+CLUSTER_BINARY   := shardforge-cluster
 BUILD_DIR        := bin
 CMD              := ./cmd/shardforge
 BENCH_CMD        := ./cmd/shardforge-bench
@@ -11,14 +12,15 @@ DASHBOARD_CMD    := ./cmd/shardforge-dashboard
 NODE_CMD         := ./cmd/shardforge-node
 GATEWAY_CMD      := ./cmd/shardforge-gateway
 PROXY_CMD        := ./cmd/shardforge-proxy
+CLUSTER_CMD      := ./cmd/shardforge-cluster
 GO               := go
 GOFLAGS          :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-report dashboard node node-demo node-demo-down gateway-help gateway-demo proxy proxy-help proxy-route-demo smoke demo release-check help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-report dashboard node node-demo node-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example smoke demo release-check help
 
 all: fmt vet build
 
-## build: compile all 6 binaries into bin/ (shardforge, bench, dashboard, node, gateway, proxy)
+## build: compile all 7 binaries into bin/ (shardforge, bench, dashboard, node, gateway, proxy, cluster)
 build:
 	@mkdir -p $(BUILD_DIR)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY) $(CMD)
@@ -27,6 +29,7 @@ build:
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(NODE_BINARY) $(NODE_CMD)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(GATEWAY_BINARY) $(GATEWAY_CMD)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(PROXY_BINARY) $(PROXY_CMD)
+	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(CLUSTER_BINARY) $(CLUSTER_CMD)
 
 ## test: run all tests with race detection
 test:
@@ -84,6 +87,10 @@ bench-gateway:
 bench-proxy:
 	$(GO) test -bench=. -benchmem ./internal/proxy/...
 
+## bench-cluster: run Go benchmarks for the cluster package only
+bench-cluster:
+	$(GO) test -bench=. -benchmem ./internal/cluster/...
+
 ## dashboard: run the local dashboard in demo mode
 dashboard:
 	$(GO) run $(DASHBOARD_CMD) --demo
@@ -100,6 +107,10 @@ gateway-help:
 gateway-demo:
 	./bin/shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 route user:1
 
+## gateway-config-demo: show routing using config file (ring-only, no network call)
+gateway-config-demo:
+	./bin/shardforge-gateway --config configs/local-3node.json route user:1
+
 ## proxy: run shardforge-proxy locally (listens on 127.0.0.1:9200, routes to 3 local nodes)
 proxy:
 	$(GO) run $(PROXY_CMD) --addr 127.0.0.1:9200 --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103
@@ -111,6 +122,18 @@ proxy-help:
 ## proxy-route-demo: show which node handles user:1 (requires proxy running on 9200)
 proxy-route-demo:
 	curl http://127.0.0.1:9200/route/user:1
+
+## cluster-validate: run cluster package tests (validates all config files)
+cluster-validate:
+	$(GO) test -race -count=1 ./internal/cluster/...
+
+## cluster-help: print shardforge-cluster help and scope disclaimer
+cluster-help:
+	./bin/shardforge-cluster --help
+
+## cluster-example: print a 3-node example config to stdout
+cluster-example:
+	./bin/shardforge-cluster example-local-3node
 
 ## node: run shardforge-node locally (node-1 on 127.0.0.1:9101)
 node:

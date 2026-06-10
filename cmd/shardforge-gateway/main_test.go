@@ -1,9 +1,20 @@
 package main
 
 import (
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Join(filepath.Dir(file), "..", "..")
+}
 
 // runCapture calls runWithWriters and returns stdout, stderr, and exit code.
 func runCapture(args []string) (stdout, stderr string, code int) {
@@ -121,6 +132,77 @@ func TestRun_Route_MissingKeyArg(t *testing.T) {
 	})
 	if code == 0 {
 		t.Fatal("expected non-zero exit when route key is missing")
+	}
+}
+
+// TestRun_HelpIncludesConfig verifies --help mentions --config flag.
+func TestRun_HelpIncludesConfig(t *testing.T) {
+	_, errOut, _ := runCapture([]string{"--help"})
+	if !strings.Contains(errOut, "--config") {
+		t.Errorf("help output missing --config flag\nstderr: %s", errOut)
+	}
+}
+
+// TestRun_ConfigAndNodes_ReturnsNonZero verifies that providing both --config and
+// --nodes is rejected.
+func TestRun_ConfigAndNodes_ReturnsNonZero(t *testing.T) {
+	_, errOut, code := runCapture([]string{
+		"--config", "configs/local-3node.json",
+		"--nodes", "http://127.0.0.1:9101",
+		"route", "user:1",
+	})
+	if code == 0 {
+		t.Fatal("expected non-zero exit when both --config and --nodes are provided")
+	}
+	if !strings.Contains(errOut, "not both") {
+		t.Errorf("error message should say 'not both': %q", errOut)
+	}
+}
+
+// TestRun_Config_MissingFile_ReturnsNonZero verifies that a missing config file fails.
+func TestRun_Config_MissingFile_ReturnsNonZero(t *testing.T) {
+	_, _, code := runCapture([]string{
+		"--config", "/nonexistent/cluster.json",
+		"route", "user:1",
+	})
+	if code == 0 {
+		t.Fatal("expected non-zero exit for missing config file")
+	}
+}
+
+// TestRun_Config_Route_PrintsSelectedNode verifies that --config route works
+// without network calls (route is a pure ring computation).
+func TestRun_Config_Route_PrintsSelectedNode(t *testing.T) {
+	path := filepath.Join(repoRoot(t), "configs", "local-3node.json")
+	out, _, code := runCapture([]string{
+		"--config", path,
+		"route", "user:1",
+	})
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+	if !strings.Contains(out, "node_id=") {
+		t.Errorf("output missing node_id: %q", out)
+	}
+	if !strings.Contains(out, "base_url=") {
+		t.Errorf("output missing base_url: %q", out)
+	}
+}
+
+// TestRun_Config_Route_DeterministicSameAsNodes verifies that --config and
+// --nodes produce the same routing for the same key.
+func TestRun_Config_Route_DeterministicSameAsNodes(t *testing.T) {
+	path := filepath.Join(repoRoot(t), "configs", "local-3node.json")
+	outConfig, _, code1 := runCapture([]string{"--config", path, "route", "stable-key"})
+	outNodes, _, code2 := runCapture([]string{
+		"--nodes", "http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103",
+		"route", "stable-key",
+	})
+	if code1 != 0 || code2 != 0 {
+		t.Fatalf("exit codes: config=%d nodes=%d", code1, code2)
+	}
+	if outConfig != outNodes {
+		t.Errorf("--config and --nodes produced different routing:\nconfig: %q\nnodes:  %q", outConfig, outNodes)
 	}
 }
 

@@ -1548,3 +1548,97 @@ per-node `ok` field to determine individual node health.
 - No distributed vector search.
 - If the routed node is unavailable, the operation fails clearly (502/503).
 - Duplicate node IDs or URLs → `ErrInvalidOptions` at `Open` time.
+
+---
+
+## Phase 17 — Static Cluster Metadata (`internal/cluster`)
+
+**Phase 17 — Implemented** in `internal/cluster`.
+
+### Purpose
+
+Instead of passing long `--nodes http://...` strings to every gateway/proxy invocation, Phase 17 adds a file-based, typed, validated cluster configuration format. A config file describes the nodes, routing settings, and proxy address once. CLI tools load it with `--config <path>`.
+
+### Config Load Path
+
+```
+configs/local-3node.json
+  │
+  ▼  cluster.Load(path)
+cluster.Config (normalised + validated)
+  │
+  ├─ cluster.GatewayOptions(cfg, timeout) → gateway.Options  → gateway.Open(opts)
+  └─ cluster.ProxyOptions(cfg, timeout)   → proxy.Options    → proxy.Open(opts)
+```
+
+### Config Schema
+
+```json
+{
+  "version": "v1",
+  "name": "local-3node",
+  "routing": {
+    "algorithm": "fnv1a-consistent-hash",
+    "virtual_nodes": 128
+  },
+  "proxy": { "enabled": true, "addr": "127.0.0.1:9200" },
+  "nodes": [
+    { "id": "node-1", "base_url": "http://127.0.0.1:9101", "weight": 1 }
+  ],
+  "scope": {
+    "static_config_only": true,
+    "no_dynamic_membership": true,
+    "no_discovery": true,
+    "no_consensus": true,
+    "no_raft": true,
+    "no_replication": true,
+    "no_failover": true,
+    "no_shard_migration": true,
+    "no_distributed_txns": true
+  }
+}
+```
+
+The `scope` object is required to be all-true. This prevents false capability claims: a config that claims `no_raft: false` is invalid and will be rejected by `Validate`.
+
+### Normalisation Before Validation
+
+`Normalize(cfg)` fills in safe defaults before validation:
+- `routing.virtual_nodes` → 128 if <= 0
+- `proxy.addr` → `127.0.0.1:9200` if empty
+- `node.weight` → 1 if <= 0
+- `scope` → `DefaultScope()` if all flags are false (zero JSON value)
+
+### Validation Rules
+
+`Validate(cfg)` enforces:
+- Version must be `"v1"`.
+- Name non-empty.
+- Algorithm must be `"fnv1a-consistent-hash"`.
+- Virtual nodes positive.
+- At least one node.
+- Node ID and BaseURL non-empty, BaseURL starts with `http://` or `https://`.
+- No duplicate node IDs or BaseURLs.
+- Weight positive (after normalization).
+- DataDir must not contain `..`.
+- All scope flags must be true.
+
+### No Dynamic Membership
+
+The config is loaded once at startup. There is no:
+- Node discovery or gossip
+- Dynamic membership change
+- Automatic ring rebalancing
+- Raft or consensus
+- Leader election
+- Replication
+- Failover
+
+The config is static. If nodes change, the config file is updated and the process is restarted.
+
+### Scope Honesty
+
+- Static metadata only; no runtime membership updates.
+- No distributed cluster management.
+- No production cluster manager.
+- Config-driven gateway/proxy startup is the only integration point.

@@ -58,7 +58,10 @@ func Validate(cfg Config) error {
 		return err
 	}
 
-	// Scope flags must all be true to prevent false capability claims.
+	// Determine whether any node has replication enabled.
+	replicationEnabled := hasReplicationEnabled(cfg.Nodes)
+
+	// Scope flags must be set honestly to prevent false capability claims.
 	s := cfg.Scope
 	if !s.StaticConfigOnly {
 		return fmt.Errorf("%w: scope.static_config_only must be true", ErrInvalidConfig)
@@ -75,9 +78,23 @@ func Validate(cfg Config) error {
 	if !s.NoRaft {
 		return fmt.Errorf("%w: scope.no_raft must be true", ErrInvalidConfig)
 	}
-	if !s.NoReplication {
-		return fmt.Errorf("%w: scope.no_replication must be true", ErrInvalidConfig)
+
+	if replicationEnabled {
+		// Replication is present: no_replication must be false (honest claim).
+		// no_quorum_replication must be true (no Raft log, no quorum, no automatic failover).
+		if s.NoReplication {
+			return fmt.Errorf("%w: scope.no_replication must be false when replication is enabled; use scope.no_quorum_replication=true instead", ErrInvalidConfig)
+		}
+		if !s.NoQuorumReplication {
+			return fmt.Errorf("%w: scope.no_quorum_replication must be true for read-replica configs (no Raft, no quorum, no automatic failover)", ErrInvalidConfig)
+		}
+	} else {
+		// No replication: no_replication must be true.
+		if !s.NoReplication {
+			return fmt.Errorf("%w: scope.no_replication must be true", ErrInvalidConfig)
+		}
 	}
+
 	if !s.NoFailover {
 		return fmt.Errorf("%w: scope.no_failover must be true", ErrInvalidConfig)
 	}
@@ -89,6 +106,16 @@ func Validate(cfg Config) error {
 	}
 
 	return nil
+}
+
+// hasReplicationEnabled returns true if any node in nodes has Replication.Enabled = true.
+func hasReplicationEnabled(nodes []Node) bool {
+	for _, n := range nodes {
+		if n.Replication.Enabled {
+			return true
+		}
+	}
+	return false
 }
 
 // validateReplication checks per-node replication config consistency.

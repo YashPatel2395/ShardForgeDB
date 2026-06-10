@@ -195,11 +195,15 @@ func (s *Server) handleReplicationStatus(w http.ResponseWriter, r *http.Request)
 }
 
 // handleReplicationLog serves GET /replication/log?after=<seq>&limit=<n>.
-// Only meaningful on primary nodes; returns empty entries for standalone/follower.
+// Only valid on primary nodes. Followers and standalone nodes return 403.
 func (s *Server) handleReplicationLog(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.opts.Replication.Role != replnet.RolePrimary {
+		s.writeError(w, http.StatusForbidden, "replication log is only available on primary nodes")
 		return
 	}
 	q := r.URL.Query()
@@ -238,12 +242,15 @@ func (s *Server) handleReplicationLog(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleReplicationApply serves POST /replication/apply.
-// Accepts a JSON body {"entries": [...]} and applies them to the local engine.
-// Intended for follower nodes, but any node may call it.
+// Only valid on follower nodes. Primary and standalone nodes return 403.
 func (s *Server) handleReplicationApply(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.opts.Replication.Role != replnet.RoleFollower {
+		s.writeError(w, http.StatusForbidden, "replication apply is only valid for follower nodes")
 		return
 	}
 	var body struct {

@@ -53,7 +53,8 @@
     "no_discovery": true,
     "no_consensus": true,
     "no_raft": true,
-    "no_replication": true,
+    "no_replication": false,
+    "no_quorum_replication": true,
     "no_failover": true,
     "no_shard_migration": true,
     "no_distributed_txns": true

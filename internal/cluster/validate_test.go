@@ -23,6 +23,25 @@ func validConfig() cluster.Config {
 	})
 }
 
+// validReplicaConfig returns a minimal valid normalised Config with one primary + one follower.
+func validReplicaConfig() cluster.Config {
+	return cluster.Normalize(cluster.Config{
+		Version: cluster.CurrentVersion,
+		Name:    "test-replica",
+		Routing: cluster.Routing{
+			Algorithm:    cluster.RoutingFNV1AConsistentHash,
+			VirtualNodes: 128,
+		},
+		Nodes: []cluster.Node{
+			{ID: "n1", BaseURL: "http://127.0.0.1:9101", Weight: 1,
+				Replication: cluster.Replication{Enabled: true, Role: "primary"}},
+			{ID: "n2", BaseURL: "http://127.0.0.1:9102", Weight: 1,
+				Replication: cluster.Replication{Enabled: true, Role: "follower", Primary: "n1"}},
+		},
+		Scope: cluster.DefaultReplicaScope(),
+	})
+}
+
 func TestValidate_ValidConfig(t *testing.T) {
 	if err := cluster.Validate(validConfig()); err != nil {
 		t.Fatalf("expected nil error, got %v", err)
@@ -188,20 +207,14 @@ func TestValidate_AbsoluteDataDir_Valid(t *testing.T) {
 }
 
 func TestValidate_Replication_ValidPrimaryFollower(t *testing.T) {
-	cfg := validConfig()
-	cfg.Nodes = []cluster.Node{
-		{ID: "n1", BaseURL: "http://127.0.0.1:9101", Weight: 1,
-			Replication: cluster.Replication{Enabled: true, Role: "primary"}},
-		{ID: "n2", BaseURL: "http://127.0.0.1:9102", Weight: 1,
-			Replication: cluster.Replication{Enabled: true, Role: "follower", Primary: "n1"}},
-	}
+	cfg := validReplicaConfig()
 	if err := cluster.Validate(cfg); err != nil {
-		t.Errorf("expected nil for valid primary+follower, got %v", err)
+		t.Errorf("expected nil for valid primary+follower replica config, got %v", err)
 	}
 }
 
 func TestValidate_Replication_MultiplePrimaries_ReturnsInvalidConfig(t *testing.T) {
-	cfg := validConfig()
+	cfg := validReplicaConfig()
 	cfg.Nodes = []cluster.Node{
 		{ID: "n1", BaseURL: "http://127.0.0.1:9101", Weight: 1,
 			Replication: cluster.Replication{Enabled: true, Role: "primary"}},
@@ -215,7 +228,7 @@ func TestValidate_Replication_MultiplePrimaries_ReturnsInvalidConfig(t *testing.
 }
 
 func TestValidate_Replication_NoPrimary_ReturnsInvalidConfig(t *testing.T) {
-	cfg := validConfig()
+	cfg := validReplicaConfig()
 	cfg.Nodes = []cluster.Node{
 		{ID: "n1", BaseURL: "http://127.0.0.1:9101", Weight: 1,
 			Replication: cluster.Replication{Enabled: true, Role: "follower", Primary: "n2"}},
@@ -227,7 +240,7 @@ func TestValidate_Replication_NoPrimary_ReturnsInvalidConfig(t *testing.T) {
 }
 
 func TestValidate_Replication_UnknownPrimary_ReturnsInvalidConfig(t *testing.T) {
-	cfg := validConfig()
+	cfg := validReplicaConfig()
 	cfg.Nodes = []cluster.Node{
 		{ID: "n1", BaseURL: "http://127.0.0.1:9101", Weight: 1,
 			Replication: cluster.Replication{Enabled: true, Role: "primary"}},
@@ -241,7 +254,7 @@ func TestValidate_Replication_UnknownPrimary_ReturnsInvalidConfig(t *testing.T) 
 }
 
 func TestValidate_Replication_FollowerMissingPrimary_ReturnsInvalidConfig(t *testing.T) {
-	cfg := validConfig()
+	cfg := validReplicaConfig()
 	cfg.Nodes = []cluster.Node{
 		{ID: "n1", BaseURL: "http://127.0.0.1:9101", Weight: 1,
 			Replication: cluster.Replication{Enabled: true, Role: "primary"}},
@@ -255,7 +268,7 @@ func TestValidate_Replication_FollowerMissingPrimary_ReturnsInvalidConfig(t *tes
 }
 
 func TestValidate_Replication_InvalidRole_ReturnsInvalidConfig(t *testing.T) {
-	cfg := validConfig()
+	cfg := validReplicaConfig()
 	cfg.Nodes = []cluster.Node{
 		{ID: "n1", BaseURL: "http://127.0.0.1:9101", Weight: 1,
 			Replication: cluster.Replication{Enabled: true, Role: "observer"}},
@@ -271,6 +284,38 @@ func TestValidate_Replication_Disabled_NoValidation(t *testing.T) {
 	cfg := validConfig()
 	if err := cluster.Validate(cfg); err != nil {
 		t.Errorf("expected nil for no replication, got %v", err)
+	}
+}
+
+// --- Scope honesty tests for replication configs ---
+
+func TestValidate_ReplicaScope_NoReplicationTrue_ReturnsInvalidConfig(t *testing.T) {
+	// A config with replication enabled must NOT claim no_replication=true.
+	cfg := validReplicaConfig()
+	cfg.Scope.NoReplication = true
+	err := cluster.Validate(cfg)
+	if !errors.Is(err, cluster.ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig when replica config claims no_replication=true, got %v", err)
+	}
+}
+
+func TestValidate_ReplicaScope_NoQuorumReplicationFalse_ReturnsInvalidConfig(t *testing.T) {
+	// A config with replication enabled must claim no_quorum_replication=true.
+	cfg := validReplicaConfig()
+	cfg.Scope.NoQuorumReplication = false
+	err := cluster.Validate(cfg)
+	if !errors.Is(err, cluster.ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig when replica config has no_quorum_replication=false, got %v", err)
+	}
+}
+
+func TestValidate_NonReplicaScope_NoReplicationFalse_ReturnsInvalidConfig(t *testing.T) {
+	// Existing behaviour: non-replica configs must claim no_replication=true.
+	cfg := validConfig()
+	cfg.Scope.NoReplication = false
+	err := cluster.Validate(cfg)
+	if !errors.Is(err, cluster.ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig when non-replica config has no_replication=false, got %v", err)
 	}
 }
 

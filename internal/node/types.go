@@ -55,11 +55,11 @@ type Options struct {
 
 // Status is returned by GET /status and the Server.Status() method.
 type Status struct {
-	NodeID      string               `json:"node_id"`
-	Addr        string               `json:"addr"`
-	DataDir     string               `json:"data_dir"`
-	StartedAt   time.Time            `json:"started_at"`
-	Engine      EngineStatus         `json:"engine"`
+	NodeID      string                `json:"node_id"`
+	Addr        string                `json:"addr"`
+	DataDir     string                `json:"data_dir"`
+	StartedAt   time.Time             `json:"started_at"`
+	Engine      EngineStatus          `json:"engine"`
 	Replication replnet.ReplicaStatus `json:"replication,omitempty"`
 }
 

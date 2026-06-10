@@ -1,8 +1,8 @@
 package cluster
 
-// DefaultScope returns a Scope with all limitation flags set to true.
-// These flags are honest self-documentation: every ShardForgeDB cluster config
-// must acknowledge what the system does and does not implement.
+// DefaultScope returns a Scope for non-replication configs (all nodes standalone).
+// All limitation flags are true, including NoReplication.
+// These flags are honest self-documentation: a config must acknowledge what it does and does not implement.
 func DefaultScope() Scope {
 	return Scope{
 		StaticConfigOnly:    true,
@@ -11,6 +11,24 @@ func DefaultScope() Scope {
 		NoConsensus:         true,
 		NoRaft:              true,
 		NoReplication:       true,
+		NoFailover:          true,
+		NoShardMigration:    true,
+		NoDistributedTxns:   true,
+	}
+}
+
+// DefaultReplicaScope returns a Scope for read-replica configs (any node has Replication.Enabled=true).
+// NoReplication is false (replication IS present).
+// NoQuorumReplication is true (no Raft, no quorum, no automatic failover).
+func DefaultReplicaScope() Scope {
+	return Scope{
+		StaticConfigOnly:    true,
+		NoDynamicMembership: true,
+		NoDiscovery:         true,
+		NoConsensus:         true,
+		NoRaft:              true,
+		NoReplication:       false, // explicit pull-based replication is present
+		NoQuorumReplication: true,  // no Raft log, no quorum, no automatic failover
 		NoFailover:          true,
 		NoShardMigration:    true,
 		NoDistributedTxns:   true,
@@ -36,13 +54,17 @@ func Normalize(cfg Config) Config {
 	}
 	cfg.Nodes = nodes
 
-	// If all scope flags are false (zero value), apply the default scope.
+	// If all scope flags are false (zero value), apply the appropriate default scope.
 	s := cfg.Scope
 	allFalse := !s.StaticConfigOnly && !s.NoDynamicMembership && !s.NoDiscovery &&
-		!s.NoConsensus && !s.NoRaft && !s.NoReplication && !s.NoFailover &&
-		!s.NoShardMigration && !s.NoDistributedTxns
+		!s.NoConsensus && !s.NoRaft && !s.NoReplication && !s.NoQuorumReplication &&
+		!s.NoFailover && !s.NoShardMigration && !s.NoDistributedTxns
 	if allFalse {
-		cfg.Scope = DefaultScope()
+		if hasReplicationEnabled(cfg.Nodes) {
+			cfg.Scope = DefaultReplicaScope()
+		} else {
+			cfg.Scope = DefaultScope()
+		}
 	}
 	return cfg
 }
@@ -63,6 +85,25 @@ func DefaultConfig(name string, nodes []Node) Config {
 		},
 		Nodes: nodes,
 		Scope: DefaultScope(),
+	}
+	return Normalize(cfg)
+}
+
+// defaultReplicaConfig constructs a normalised Config for a read-replica setup.
+// It uses DefaultReplicaScope (NoReplication=false, NoQuorumReplication=true).
+func defaultReplicaConfig(name string, nodes []Node) Config {
+	cfg := Config{
+		Version: CurrentVersion,
+		Name:    name,
+		Routing: Routing{
+			Algorithm:    RoutingFNV1AConsistentHash,
+			VirtualNodes: DefaultVirtualNodes,
+		},
+		Proxy: Proxy{
+			Addr: DefaultProxyAddr,
+		},
+		Nodes: nodes,
+		Scope: DefaultReplicaScope(),
 	}
 	return Normalize(cfg)
 }
@@ -100,7 +141,7 @@ func ExampleLocal3Node() Config {
 // Replication is explicit pull-based: followers call POST /replication/sync to pull entries
 // from the primary. There is no automatic background sync loop, no Raft, no automatic failover.
 func ExampleReadReplica3Node() Config {
-	cfg := DefaultConfig("local-read-replica-3node", []Node{
+	cfg := defaultReplicaConfig("local-read-replica-3node", []Node{
 		{
 			ID:      "node-primary",
 			BaseURL: "http://127.0.0.1:9111",

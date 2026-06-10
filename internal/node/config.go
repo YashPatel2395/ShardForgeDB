@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+
+	"github.com/YashPatel2395/ShardForgeDB/internal/replnet"
 )
 
 // ErrInvalidOptions is returned when Options validation fails.
@@ -25,6 +27,20 @@ func (o Options) validate() error {
 	}
 	if err := os.MkdirAll(o.DataDir, 0o755); err != nil {
 		return fmt.Errorf("%w: cannot create DataDir %q: %v", ErrInvalidOptions, o.DataDir, err)
+	}
+
+	// Validate replication role.
+	role := o.Replication.Role
+	switch role {
+	case "", replnet.RolePrimary:
+		// valid
+	case replnet.RoleFollower:
+		if o.Replication.PrimaryBaseURL == "" {
+			return fmt.Errorf("%w: PrimaryBaseURL is required when Role is %q", ErrInvalidOptions, replnet.RoleFollower)
+		}
+	default:
+		return fmt.Errorf("%w: unknown replication role %q (want %q, %q, or empty for standalone)",
+			ErrInvalidOptions, role, replnet.RolePrimary, replnet.RoleFollower)
 	}
 	return nil
 }

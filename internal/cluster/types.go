@@ -84,15 +84,29 @@ type Node struct {
 }
 
 // Scope documents what this cluster config does and does not support.
-// All fields must be true in a valid config — they exist for honest self-documentation
-// and to prevent false scope claims.
+// These fields exist for honest self-documentation and to prevent false capability claims.
+//
+// For configs without any replication (all nodes standalone):
+//   - All fields including NoReplication must be true.
+//
+// For configs with explicit pull-based read replicas (any node has Replication.Enabled=true):
+//   - NoReplication must be omitted or false (replication IS present).
+//   - NoQuorumReplication must be true (quorum/automatic replication is not present).
+//   - All other fields (NoRaft, NoConsensus, NoFailover, etc.) must still be true.
 type Scope struct {
 	StaticConfigOnly    bool `json:"static_config_only"`
 	NoDynamicMembership bool `json:"no_dynamic_membership"`
 	NoDiscovery         bool `json:"no_discovery"`
 	NoConsensus         bool `json:"no_consensus"`
 	NoRaft              bool `json:"no_raft"`
-	NoReplication       bool `json:"no_replication"`
+	// NoReplication must be true for non-replication configs.
+	// For read-replica configs (any node has Replication.Enabled=true), this field
+	// must be omitted (false) and NoQuorumReplication must be true instead.
+	NoReplication bool `json:"no_replication"`
+	// NoQuorumReplication must be true for read-replica configs to assert that
+	// there is no quorum replication, no automatic failover election, and no Raft log.
+	// This field is not required for non-replication configs.
+	NoQuorumReplication bool `json:"no_quorum_replication,omitempty"`
 	NoFailover          bool `json:"no_failover"`
 	NoShardMigration    bool `json:"no_shard_migration"`
 	NoDistributedTxns   bool `json:"no_distributed_txns"`

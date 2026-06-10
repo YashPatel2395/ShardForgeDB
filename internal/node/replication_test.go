@@ -197,9 +197,25 @@ func TestHandleReplicationLog_InvalidAfter(t *testing.T) {
 	}
 }
 
-func TestHandleReplicationLog_WrongMethod(t *testing.T) {
+func TestHandleReplicationLog_Follower_Returns403(t *testing.T) {
+	follower := newFollowerServer(t, "http://127.0.0.1:9999")
+	w := doRequest(t, follower, http.MethodGet, "/replication/log?after=0", "")
+	if w.Code != http.StatusForbidden {
+		t.Errorf("GET /replication/log on follower: got %d, want 403", w.Code)
+	}
+}
+
+func TestHandleReplicationLog_Standalone_Returns403(t *testing.T) {
 	s := newTestServer(t, "n1")
-	w := doRequest(t, s, http.MethodPost, "/replication/log", "")
+	w := doRequest(t, s, http.MethodGet, "/replication/log?after=0", "")
+	if w.Code != http.StatusForbidden {
+		t.Errorf("GET /replication/log on standalone: got %d, want 403", w.Code)
+	}
+}
+
+func TestHandleReplicationLog_WrongMethod(t *testing.T) {
+	primary := newPrimaryServer(t)
+	w := doRequest(t, primary, http.MethodPost, "/replication/log", "")
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("got %d, want 405", w.Code)
 	}
@@ -207,39 +223,83 @@ func TestHandleReplicationLog_WrongMethod(t *testing.T) {
 
 // --- POST /replication/apply ---
 
-func TestHandleReplicationApply_AppliesEntries(t *testing.T) {
-	s := newTestServer(t, "n1")
+func TestHandleReplicationApply_Follower_AppliesEntries(t *testing.T) {
+	follower := newFollowerServer(t, "http://127.0.0.1:9999")
 
 	entries := []replnet.Entry{
 		{Seq: 1, Op: replnet.OpPut, Key: "applied-key", Value: "applied-val"},
 	}
 	body, _ := json.Marshal(map[string]any{"entries": entries})
 
-	w := doRequest(t, s, http.MethodPost, "/replication/apply", string(body))
+	w := doRequest(t, follower, http.MethodPost, "/replication/apply", string(body))
 	if w.Code != http.StatusOK {
-		t.Fatalf("POST /replication/apply: got %d (body=%s)", w.Code, w.Body.String())
+		t.Fatalf("POST /replication/apply on follower: got %d (body=%s)", w.Code, w.Body.String())
 	}
 
 	// Verify key was applied to engine.
-	wGet := doRequest(t, s, http.MethodGet, "/kv/applied-key", "")
+	wGet := doRequest(t, follower, http.MethodGet, "/kv/applied-key", "")
 	var getResp map[string]any
 	decodeJSON(t, wGet, &getResp)
 	if getResp["value"] != "applied-val" {
-		t.Errorf("applied key not readable: %v", getResp)
+		t.Errorf("applied key not readable on follower: %v", getResp)
 	}
 }
 
-func TestHandleReplicationApply_InvalidJSON(t *testing.T) {
+func TestHandleReplicationApply_Primary_Returns403(t *testing.T) {
+	primary := newPrimaryServer(t)
+
+	entries := []replnet.Entry{
+		{Seq: 1, Op: replnet.OpPut, Key: "should-not-apply", Value: "v"},
+	}
+	body, _ := json.Marshal(map[string]any{"entries": entries})
+
+	w := doRequest(t, primary, http.MethodPost, "/replication/apply", string(body))
+	if w.Code != http.StatusForbidden {
+		t.Errorf("POST /replication/apply on primary: got %d, want 403", w.Code)
+	}
+
+	// Verify key was NOT written to primary engine.
+	wGet := doRequest(t, primary, http.MethodGet, "/kv/should-not-apply", "")
+	var getResp map[string]any
+	decodeJSON(t, wGet, &getResp)
+	if getResp["found"] == true {
+		t.Error("primary must not be mutated by /replication/apply")
+	}
+}
+
+func TestHandleReplicationApply_Standalone_Returns403(t *testing.T) {
 	s := newTestServer(t, "n1")
-	w := doRequest(t, s, http.MethodPost, "/replication/apply", "not-json")
+
+	entries := []replnet.Entry{
+		{Seq: 1, Op: replnet.OpPut, Key: "should-not-apply", Value: "v"},
+	}
+	body, _ := json.Marshal(map[string]any{"entries": entries})
+
+	w := doRequest(t, s, http.MethodPost, "/replication/apply", string(body))
+	if w.Code != http.StatusForbidden {
+		t.Errorf("POST /replication/apply on standalone: got %d, want 403", w.Code)
+	}
+
+	// Verify key was NOT written to standalone engine.
+	wGet := doRequest(t, s, http.MethodGet, "/kv/should-not-apply", "")
+	var getResp map[string]any
+	decodeJSON(t, wGet, &getResp)
+	if getResp["found"] == true {
+		t.Error("standalone node must not be mutated by /replication/apply")
+	}
+}
+
+func TestHandleReplicationApply_Follower_InvalidJSON(t *testing.T) {
+	follower := newFollowerServer(t, "http://127.0.0.1:9999")
+	w := doRequest(t, follower, http.MethodPost, "/replication/apply", "not-json")
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("got %d, want 400", w.Code)
 	}
 }
 
 func TestHandleReplicationApply_WrongMethod(t *testing.T) {
-	s := newTestServer(t, "n1")
-	w := doRequest(t, s, http.MethodGet, "/replication/apply", "")
+	follower := newFollowerServer(t, "http://127.0.0.1:9999")
+	w := doRequest(t, follower, http.MethodGet, "/replication/apply", "")
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("got %d, want 405", w.Code)
 	}
@@ -374,4 +434,78 @@ func TestReplicationStatus_Follower_HasPrimaryURL(t *testing.T) {
 	if st.PrimaryBaseURL != "http://127.0.0.1:9999" {
 		t.Errorf("PrimaryBaseURL = %q, want http://127.0.0.1:9999", st.PrimaryBaseURL)
 	}
+}
+
+// --- Role validation in Options.validate ---
+
+func TestOpen_UnknownReplicationRole_ReturnsError(t *testing.T) {
+	_, err := Open(Options{
+		NodeID:  "n1",
+		Addr:    "127.0.0.1:0",
+		DataDir: t.TempDir(),
+		Replication: ReplicationOptions{
+			Role: replnet.Role("leader"), // unknown role
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown replication role")
+	}
+}
+
+func TestOpen_FollowerWithoutPrimaryURL_ReturnsError(t *testing.T) {
+	_, err := Open(Options{
+		NodeID:  "n1",
+		Addr:    "127.0.0.1:0",
+		DataDir: t.TempDir(),
+		Replication: ReplicationOptions{
+			Role:           replnet.RoleFollower,
+			PrimaryBaseURL: "", // missing
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for follower without PrimaryBaseURL")
+	}
+}
+
+func TestOpen_FollowerWithPrimaryURL_Valid(t *testing.T) {
+	s, err := Open(Options{
+		NodeID:  "n1",
+		Addr:    "127.0.0.1:0",
+		DataDir: t.TempDir(),
+		Replication: ReplicationOptions{
+			Role:           replnet.RoleFollower,
+			PrimaryBaseURL: "http://127.0.0.1:9999",
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected valid follower options, got %v", err)
+	}
+	_ = s.Close()
+}
+
+func TestOpen_PrimaryRole_Valid(t *testing.T) {
+	s, err := Open(Options{
+		NodeID:  "n1",
+		Addr:    "127.0.0.1:0",
+		DataDir: t.TempDir(),
+		Replication: ReplicationOptions{
+			Role: replnet.RolePrimary,
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected valid primary options, got %v", err)
+	}
+	_ = s.Close()
+}
+
+func TestOpen_EmptyRole_Standalone_Valid(t *testing.T) {
+	s, err := Open(Options{
+		NodeID:  "n1",
+		Addr:    "127.0.0.1:0",
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("expected valid standalone options, got %v", err)
+	}
+	_ = s.Close()
 }

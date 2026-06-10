@@ -1994,4 +1994,285 @@ BenchmarkWorkload_ReadHeavy_Small-8    24         156691549 ns/op 2334784 B/op  
 
 No background compaction, no automatic compaction, no leveled or size-tiered compaction, no vector search, no sharding, no replication, no distributed logic, no networking, no dashboard, no Raft, and no core engine behavior changes were made in this fix.
 
+---
+
+## Phase 9 — Single-node Exact Vector Search
+
+**Date:** 2026-06-09
+**Go version:** go1.26.4 darwin/arm64
+**Branch:** phase-9-vector-search
+
+### API Implemented
+
+```go
+// Package vector — internal/vector
+func Open(opts Options) (*Store, error)
+func (s *Store) Upsert(id string, vector []float32, metadata []byte) error
+func (s *Store) Delete(id string) error
+func (s *Store) Get(id string) (Record, bool, error)
+func (s *Store) Search(query []float32, k int) ([]SearchResult, error)
+func (s *Store) Count() int
+func (s *Store) Stats() Stats
+func (s *Store) Flush() error
+func (s *Store) Compact() error
+func (s *Store) Close() error
+```
+
+Sentinel errors: `ErrClosed`, `ErrInvalidOptions`, `ErrInvalidID`, `ErrInvalidVector`, `ErrInvalidK`, `ErrCorruptRecord`.
+
+### Persistence Strategy
+
+Vectors are persisted through the existing single-node Engine (Phase 6). Each vector is serialised to a binary record and stored under the key `__vector__/<namespace>/<id>`. On `Open`, the store scans the namespace prefix from the engine and rebuilds the in-memory index. Deletes are engine-level tombstones — they survive WAL replay and SSTable compaction correctly.
+
+### Encoding Format
+
+```
+[magic      8 B ] 0x5348415244564543 ("SHARDVEC")
+[version    2 B ] uint16 (currently 1)
+[dimension  4 B ] uint32
+[metaLen    4 B ] uint32
+[vector   dim×4 ] float32 little-endian IEEE 754
+[metadata   var ] raw bytes
+[crc32      4 B ] CRC-32/IEEE over body [version..metadata]
+[magic      8 B ] same sentinel footer
+```
+
+Decoding rejects bad magic, unsupported versions, dimension mismatches, CRC failures, and truncated data — all return `ErrCorruptRecord`.
+
+### Metric Definitions
+
+| Metric | Score | Distance | Zero vector |
+|--------|-------|----------|-------------|
+| `cosine` | cosine similarity ∈ [−1,1] | 1 − score | rejected |
+| `l2` | −(squared L2) | squared L2 | allowed |
+| `dot` | dot product | −dot | allowed |
+
+NaN and ±Inf are rejected in all vectors regardless of metric.
+
+### Search Ordering Rules
+
+- Results sorted descending by score (higher = better).
+- Tie-breaking: ID ascending (lexicographic) for determinism.
+- `k > Count()`: all records returned.
+- Query vector is defensively copied; caller's slice is not mutated.
+
+### Crash and Recovery Behaviour
+
+| Scenario | Outcome |
+|----------|---------|
+| Clean `Close()` | Engine closed; all flushed data durable. |
+| Crash before `Flush()` | WAL replay recovers unflushed entries on next `Open`. |
+| `Delete` before crash | WAL DELETE record replays; vector absent from index after reopen. |
+| Corrupt encoded value | `Open` returns `ErrCorruptRecord`; store not opened. |
+
+### Tests Added
+
+| Test | Covers |
+|------|--------|
+| `TestOpen_RejectsEmptyDir` | options validation |
+| `TestOpen_RejectsZeroDimension` | options validation |
+| `TestOpen_DefaultsMetricToCosine` | default metric |
+| `TestOpen_RejectsUnknownMetric` | options validation |
+| `TestUpsert_RejectsEmptyID` | ID validation |
+| `TestUpsert_RejectsIDWithSlash` | ID validation |
+| `TestUpsert_RejectsWrongDimension` | vector validation |
+| `TestUpsert_RejectsNaN` | vector validation |
+| `TestUpsert_RejectsInf` | vector validation |
+| `TestUpsert_CosineRejectsZeroVector` | cosine invariant |
+| `TestSearch_CosineRejectsZeroQuery` | cosine invariant |
+| `TestUpsertGet_RoundTrip` | put/get correctness |
+| `TestGet_MissingReturnsFalse` | missing key |
+| `TestUpsert_OverwritesExisting` | overwrite |
+| `TestDelete_RemovesVector` | delete |
+| `TestDelete_MissingIsSafe` | delete no-op |
+| `TestSearch_RejectsInvalidK` | k validation |
+| `TestSearch_RejectsWrongQueryDimension` | query validation |
+| `TestSearch_CosineRanking` | cosine ranking |
+| `TestSearch_L2Ranking` | L2 ranking |
+| `TestSearch_DotRanking` | dot ranking |
+| `TestSearch_TieBreakByID` | deterministic tie-break |
+| `TestSearch_KGreaterThanCount` | k > count |
+| `TestSearch_ReturnsMetadataCopies` | defensive copy |
+| `TestGet_ReturnsDefensiveCopies` | defensive copy |
+| `TestUpsert_DefensivelyCopiesCaller` | defensive copy |
+| `TestSearch_DoesNotMutateQuery` | immutable query |
+| `TestClose_MakesOptsReturnErrClosed` | closed state |
+| `TestClose_IsIdempotent` | idempotent close |
+| `TestReopen_RestoresVectors` | persistence |
+| `TestReopen_PreservesMetadata` | metadata persistence |
+| `TestReopen_AfterDelete_DoesNotRestore` | delete persistence |
+| `TestNamespace_Isolation` | namespace scoping |
+| `TestFlush_PersistsThroughReopen` | flush + reopen |
+| `TestCompact_PreservesVectors` | compact + reopen |
+| `TestOpen_CorruptRecordReturnsError` | corrupt record detection |
+| `TestConcurrent_UpsertGetSearch` | race safety |
+| `TestLargeWorkload_InsertSearchReopen` | 1,000 vectors, search, reopen |
+| `TestCodec_RoundTrip` | codec correctness |
+| `TestCodec_RejectsBadMagic` | codec corruption |
+| `TestCodec_RejectsBadFooterMagic` | codec corruption |
+| `TestCodec_RejectsBadCRC` | codec corruption |
+| `TestCodec_RejectsTruncated` | codec corruption |
+| `TestCodec_RejectsDimensionMismatch` | codec corruption |
+
+**Total: 44 tests** in `internal/vector`.
+
+### Benchmarks Added
+
+| Benchmark | What it measures |
+|-----------|-----------------|
+| `BenchmarkUpsert_1k_dim128` | Upsert throughput for 1,000 dim-128 vectors |
+| `BenchmarkSearch_1k_dim128_Cosine` | Cosine search over 1,000 dim-128 vectors |
+| `BenchmarkSearch_10k_dim128_Cosine` | Cosine search over 10,000 dim-128 vectors |
+| `BenchmarkSearch_1k_dim128_L2` | L2 search over 1,000 dim-128 vectors |
+| `BenchmarkSearch_1k_dim128_Dot` | Dot search over 1,000 dim-128 vectors |
+| `BenchmarkReopen_1k` | Engine reopen + namespace scan for 1,000 vectors |
+| `BenchmarkCodec_Encode_dim128` | Binary encode one dim-128 record |
+| `BenchmarkCodec_Decode_dim128` | Binary decode one dim-128 record |
+| `BenchmarkConcurrentSearch` | Parallel search throughput |
+| `BenchmarkConcurrentUpsert` | Parallel upsert throughput |
+
+### Benchmark Results (Apple M3, phase-9-vector-search)
+
+```
+BenchmarkUpsert_1k_dim128-8           1099    3589932 ns/op   4304773 B/op   9804 allocs/op
+BenchmarkSearch_1k_dim128_Cosine-8   18508     195865 ns/op     58568 B/op      6 allocs/op
+BenchmarkSearch_10k_dim128_Cosine-8   1611    2226659 ns/op    566472 B/op      6 allocs/op
+BenchmarkSearch_1k_dim128_L2-8       18626     193760 ns/op     58568 B/op      6 allocs/op
+BenchmarkSearch_1k_dim128_Dot-8      18643     192834 ns/op     58568 B/op      6 allocs/op
+BenchmarkReopen_1k-8                  2426    1504049 ns/op   3349410 B/op  10125 allocs/op
+BenchmarkCodec_Encode_dim128-8    23052736       156.3 ns/op       576 B/op      1 allocs/op
+BenchmarkCodec_Decode_dim128-8    24491739       147.3 ns/op       512 B/op      1 allocs/op
+BenchmarkConcurrentSearch-8          71895      50062 ns/op     58569 B/op      6 allocs/op
+BenchmarkConcurrentUpsert-8         932530      20614 ns/op      4308 B/op     10 allocs/op
+```
+
+Observed: 1k-vector cosine search runs in ~196µs on Apple M3. Codec encode/decode is ~150ns per record.
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/vector/...
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...
+go test -bench=. -benchmem -benchtime=3s ./internal/bench/...
+make test
+make vet
+make build
+make bench-vector
+make bench-report
+./bin/shardforge --help
+./bin/shardforge version
+./bin/shardforge-bench --scale small --out /tmp/shardforge-bench.md
+git status --short
+```
+
+### Known Limitations
+
+- **Exact search only.** No ANN, HNSW, IVF, or approximate search.
+- **Single-node only.** No sharding, replication, or distributed search.
+- **Memory-bound.** All stored vectors must fit in the process heap.
+- **Linear scan.** Search is O(n·d); degrades with very large n.
+- **Manual flush/compact.** No background maintenance.
+- **No SIMD.** Float32 arithmetic uses scalar Go loops.
+
+### Confirmation: No ANN / Distributed Features
+
+No ANN, HNSW, IVF, approximate search, sharding, replication, dashboard, networking, distributed mode, Raft, background compaction, automatic compaction, leveled compaction, or core engine behavior changes were implemented. Phase 9 adds a persistent exact vector search layer only.
+
+---
+
+## Phase 9 — Review Fix: Store Close-Safety
+
+**Date:** 2026-06-09
+**Go version:** go1.26.4 darwin/arm64
+**Branch:** phase-9-vector-search
+
+### Issue Fixed
+
+The original `checkClosed()` helper acquired `s.mu.RLock()`, read `s.closed`, and **released the lock** before the calling method did any work. This created a time-of-check/time-of-use (TOCTOU) race:
+
+- `Search` could pass `checkClosed()`, then `Close()` could run and close the engine, then `Search` returned results from a closed store.
+- `Upsert` could pass `checkClosed()`, then `Close()` could close the engine, then `Upsert` hit an underlying engine error instead of `vector.ErrClosed`.
+
+### Fix: Lock-First Pattern
+
+Every public method now acquires the appropriate lock **first**, checks `s.closed` while holding the lock, and performs its work while still holding the lock. The `checkClosed()` helper has been removed.
+
+| Method | Lock held | Closed check |
+|--------|-----------|--------------|
+| `Upsert` | `s.mu.Lock()` | inside lock, before engine Put |
+| `Delete` | `s.mu.Lock()` | inside lock, before engine Delete |
+| `Flush` | `s.mu.Lock()` | inside lock, before engine Flush |
+| `Compact` | `s.mu.Lock()` | inside lock, before engine Compact |
+| `Get` | `s.mu.RLock()` | inside lock, before index read |
+| `Search` | `s.mu.RLock()` | inside lock, before candidate collection |
+| `Count` | `s.mu.RLock()` | no error return; reads len(index) |
+| `Stats` | `s.mu.RLock()` | no error return; reads index + engine |
+| `Close` | `s.mu.Lock()` | sets closed=true, closes engine |
+
+`s.opts` is immutable after `Open`; methods read it before acquiring the lock without data races. Encoding and input validation also happen before the lock.
+
+### Codec Hardening
+
+`decodeRecord` now rejects trailing bytes after the footer magic sentinel. Appended garbage was previously silently ignored; it is now treated as `ErrCorruptRecord`.
+
+### Tests Added
+
+| Test | Covers |
+|------|--------|
+| `TestCloseConcurrentWithSearchRaceSafe` | `Close` racing with concurrent `Search` — passes `-race`; post-close returns `ErrClosed` |
+| `TestCloseConcurrentWithUpsertRaceSafe` | `Close` racing with concurrent `Upsert` — passes `-race`; only `nil` or `ErrClosed` returned |
+| `TestFlushCompact_AfterClose` | `Flush` and `Compact` return `ErrClosed` after `Close` |
+| `TestCodec_RejectsTrailingBytes` | Trailing bytes after footer return `ErrCorruptRecord` |
+
+### Updated Total Test Count
+
+| Package | Tests |
+|---------|-------|
+| `internal/vector` | 49 (was 44; +5 new tests) |
+| All other packages | unchanged |
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/vector/...
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...
+go test -bench=. -benchmem -benchtime=3s ./internal/bench/...
+make test
+make vet
+make build
+make bench-vector
+make bench-report
+./bin/shardforge --help
+./bin/shardforge version
+./bin/shardforge-bench --scale small --out /tmp/shardforge-bench.md
+git status --short
+```
+
+### Benchmark Results (vector package, Apple M3, after fix)
+
+```
+BenchmarkUpsert_1k_dim128-8           1107    3498320 ns/op   4304707 B/op   9804 allocs/op
+BenchmarkSearch_1k_dim128_Cosine-8   18674     194899 ns/op     58568 B/op      6 allocs/op
+BenchmarkSearch_10k_dim128_Cosine-8   1598    2222066 ns/op    566472 B/op      6 allocs/op
+BenchmarkSearch_1k_dim128_L2-8       18744     192935 ns/op     58568 B/op      6 allocs/op
+BenchmarkSearch_1k_dim128_Dot-8      18783     191688 ns/op     58568 B/op      6 allocs/op
+BenchmarkReopen_1k-8                  2437    1494688 ns/op   3349410 B/op  10125 allocs/op
+BenchmarkCodec_Encode_dim128-8    23067963       155.1 ns/op       576 B/op      1 allocs/op
+BenchmarkCodec_Decode_dim128-8    24578278       146.1 ns/op       512 B/op      1 allocs/op
+BenchmarkConcurrentSearch-8          65497      52894 ns/op     58569 B/op      6 allocs/op
+BenchmarkConcurrentUpsert-8         886413      20605 ns/op      4101 B/op     10 allocs/op
+```
+
+### Confirmation: No ANN / Distributed Features
+
+No ANN, HNSW, IVF, approximate search, sharding, replication, dashboard, networking, distributed mode, Raft, background compaction, automatic compaction, leveled compaction, or core engine behavior changes were made in this fix.
+
 *Future phases will append their own sections to this document.*

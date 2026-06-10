@@ -138,3 +138,45 @@ This checklist must pass before any release or portfolio submission.
 - [ ] No claim of automatic leader election
 - [ ] `--help` output explicitly states NOT Raft, NOT consensus, NOT distributed sharding
 - [ ] Docker Compose README/docs state nodes are independent (no shared state)
+
+---
+
+## Phase 15 — Client-Side Routing Gateway Checklist
+
+- [ ] `make build` produces `bin/shardforge-gateway` as the 5th binary
+- [ ] `./bin/shardforge-gateway --help` prints scope disclaimer (client-side only, no Raft, no consensus, no failover)
+- [ ] `go test -race -count=1 ./internal/gateway/...` — all 41 tests PASS
+- [ ] `make bench-gateway` — 6 benchmarks PASS
+- [ ] `route <key>` prints correct node ID and BaseURL (deterministic)
+- [ ] `put <key> <value>` and `get <key>` work against live nodes
+- [ ] `delete <key>` removes key from routed node
+- [ ] `health` prints status for all configured nodes
+- [ ] `flush-all` and `compact-all` fan out to all nodes
+- [ ] Writing key via gateway only appears on the routed node, not others (test-verified)
+- [ ] Same key always routes to same node (test-verified)
+- [ ] Unavailable node returns clear error — no retry to another node (test-verified)
+- [ ] Close is idempotent; operations after Close return ErrClosed (test-verified)
+
+## Phase 15 Scope Honesty Checklist
+
+- [ ] No claim of distributed sharding inside nodes
+- [ ] No claim of networked replication between nodes
+- [ ] No claim of Raft or consensus
+- [ ] No claim of automatic failover
+- [ ] No claim of shard migration or resharding
+- [ ] `--help` output explicitly states client-side routing only, no failover
+- [ ] PROOF.md documents why no retry is the correct behavior
+
+## Resume / LinkedIn — Phase 15 Additions
+
+### Allowed claims (Phase 15)
+
+- Implemented a client-side routing gateway over independent HTTP nodes using FNV-1a consistent hashing.
+- Deterministic key-to-node mapping with configurable virtual nodes and weight support.
+
+### Forbidden claims (Phase 15)
+
+- ~~"Implemented distributed sharding."~~
+- ~~"Implemented automatic failover."~~
+- ~~"Nodes coordinate through the gateway."~~
+- ~~"The gateway is a distributed router."~~

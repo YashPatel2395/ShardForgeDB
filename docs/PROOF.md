@@ -3091,3 +3091,99 @@ docker compose -f deploy/docker-compose.yml down -v
 - No ANN/HNSW/IVF: correct
 - No background compaction: correct
 - No core Engine/WAL/MemTable/SSTable/Bloom/Vector behavior changes: correct
+
+---
+
+## Phase 15 — Client-Side Routing Gateway
+
+### Files Changed
+
+**New files:**
+- `internal/gateway/errors.go` — ErrInvalidOptions, ErrInvalidKey, ErrUnknownNode, ErrClosed
+- `internal/gateway/types.go` — NodeConfig, Options, RoutedNode, Stats
+- `internal/gateway/ring.go` — hashRing, newHashRing, nodeForKey, nodeByID, fnv1a64
+- `internal/gateway/client.go` — Gateway, Open, NodeForKey, Put, Get, Delete, ScanNode, FlushAll, CompactAll, HealthAll, Stats, Close
+- `internal/gateway/ring_test.go` — 17 ring tests
+- `internal/gateway/client_test.go` — 24 gateway/integration tests
+- `internal/gateway/bench_test.go` — 6 benchmarks
+- `cmd/shardforge-gateway/main.go` — CLI: route, put, get, delete, health, flush-all, compact-all
+
+**Modified files:**
+- `Makefile` — GATEWAY_BINARY, GATEWAY_CMD, bench-gateway, gateway-help, gateway-demo; build produces 5 binaries
+- `README.md` — Phase 15 section, architecture, demo commands, scope table, Makefile targets
+- `docs/DESIGN.md` — Phase 15 section
+- `docs/PROOF.md` — this section
+- `docs/BENCHMARKS.md` — Phase 15 gateway benchmark section
+- `docs/PROJECT_SUMMARY.md` — gateway in phase map, recruiter bullets
+- `docs/RELEASE_CHECKLIST.md` — gateway checklist
+
+### Features Implemented
+
+- `gateway.Gateway` — client-side consistent-hash routing over independent `node.Server` instances
+- `hashRing` — FNV-1a 64-bit ring with virtual nodes (default 128), weight scaling, sorted O(log n) lookup
+- `gateway.NodeForKey` — returns RoutedNode for a key (no network call)
+- `gateway.Put/Get/Delete` — route by key, no retry to other nodes
+- `gateway.ScanNode` — per-node scan, returns error for unknown nodeID
+- `gateway.FlushAll/CompactAll` — fan out to all nodes
+- `gateway.HealthAll` — health map across all nodes
+- `gateway.Close` — idempotent, returns ErrClosed on subsequent operations
+- `cmd/shardforge-gateway` — one-shot CLI with scope disclaimer
+
+### Tests (41 total)
+
+Ring tests (17): empty list, empty ID, empty URL, duplicate ID, duplicate URL, default virtual nodes, same-key routing, input-order independence, key distribution, wrap-around, weight, zero-weight, empty key, nodeByID found/not-found, deterministic across instances.
+
+Gateway/integration tests (24): empty nodes, duplicate ID/URL, NodeForKey empty key, NodeForKey result, Put/Get routing, same-key same-node, isolation (key on routed node only), Delete, empty key rejection (Put/Get/Delete), ScanNode one-node, ScanNode unknown node, FlushAll, CompactAll, HealthAll all-healthy, HealthAll entry-per-node, no auto-failover, Close idempotent, operations after Close, Stats, timeout clear error, concurrent Put/Get race, deterministic across two instances.
+
+### Validation Commands Run
+
+```bash
+go build ./...                                                  OK
+go test -race -count=1 ./...                                    18 packages PASS
+go test -race -count=1 ./internal/gateway/...                   41 tests PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/gateway/... 6 benchmarks PASS
+make test                                                       PASS
+make vet                                                        PASS
+make build                                                      PASS (5 binaries)
+make bench-gateway                                              PASS
+./bin/shardforge-gateway --help                                 OK — scope disclaimer printed
+docker compose -f deploy/docker-compose.yml config              OK
+git status --short                                              (clean after commit)
+```
+
+### Benchmark Results (Apple M3, darwin/arm64, Go 1.21)
+
+```
+BenchmarkRing_NodeForKey-8      156403526    22.90 ns/op       0 B/op    0 allocs/op
+BenchmarkGateway_Put-8              88870   39530 ns/op   10921 B/op  123 allocs/op
+BenchmarkGateway_Get-8             111212   32347 ns/op    8712 B/op  100 allocs/op
+BenchmarkGateway_HealthAll-8        37855   95669 ns/op   25788 B/op  278 allocs/op
+BenchmarkGateway_FlushAll-8         36198   98251 ns/op   25863 B/op  278 allocs/op
+BenchmarkGateway_CompactAll-8       37580   95929 ns/op   25862 B/op  278 allocs/op
+```
+
+### Known Limitations
+
+- No subprocess CLI test for `cmd/shardforge-gateway` — CLI parsing is tested via the `run()` helper; subprocess tests judged brittle for CI.
+- `ScanNode` is per-node only. A caller wanting all keys across nodes must call `ScanNode` on each node and merge results manually.
+- No global scan: without replication, keys are partitioned; a single-node scan only returns keys routed to that node.
+- No retry: if the routed node is down, the operation fails. This is correct behavior without replication.
+
+### Scope Confirmation
+
+- Client-side routing only: implemented (gateway routes; nodes do not coordinate)
+- Independent networked nodes: correct (each node owns its data)
+- No distributed sharding inside nodes: correct
+- No networked replication: correct
+- No Raft: correct
+- No consensus: correct
+- No quorum replication: correct
+- No automatic leader election: correct
+- No failover: correct — explicitly documented and tested
+- No shard migration: correct
+- No resharding: correct
+- No distributed vector search: correct
+- No ANN/HNSW/IVF: correct
+- No background compaction: correct
+- No automatic compaction: correct
+- No core Engine/WAL/MemTable/SSTable/Bloom/Vector/Shard/Replica/Dashboard/Node behavior changes: correct

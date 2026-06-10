@@ -2,12 +2,12 @@
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer with strict documentation, tests, and benchmarks at every phase.
 
-> **Phase 14 in review.** All thirteen prior phases are implemented and locked.
-> Phase 14 adds a real networked node runtime: independent `shardforge-node` processes, HTTP/JSON transport, and a Docker Compose 3-node demo.
+> **Phase 15 in review.** All fourteen prior phases are implemented and locked.
+> Phase 15 adds a client-side routing gateway: deterministic consistent-hash routing of Put/Get/Delete to independent nodes.
 >
-> This is NOT Raft, NOT consensus, NOT quorum replication, NOT distributed sharding.
-> Each node is an independent networked key-value store — the foundation for future distributed features.
-> No background compaction, no automatic leader election, no shard migration.
+> This is client-side routing only. Nodes do NOT coordinate. No Raft. No consensus.
+> No quorum replication. No automatic leader election. No failover. No shard migration.
+> Retrying to a different node is unsafe without replication.
 
 ---
 
@@ -23,6 +23,7 @@ Built to demonstrate:
 - **Local replication simulation** — leader/follower operation log, pause/lag/catch-up controls
 - **Local HTTP dashboard and chaos scenarios** — observable stats, HTML view, deterministic failure scenarios
 - **Real networked node runtime** — independent `shardforge-node` processes, HTTP/JSON API, Docker Compose 3-node demo
+- **Client-side routing gateway** — deterministic consistent-hash routing to independent nodes via `shardforge-gateway`
 - **Strict test/benchmark/docs discipline** — race-safe tests, reproducible benchmarks, honest scope docs
 
 ---
@@ -39,12 +40,16 @@ Sharding, replication, and the dashboard are **local in-process simulations** �
 | Vector search | Exact brute-force k-NN, cosine/L2/dot | ANN, HNSW, IVF, approximate search |
 | Compaction | Manual full compaction (`Compact()`) | Background compaction, automatic thresholds, leveled/size-tiered |
 | Node runtime | Real independent `shardforge-node` processes, HTTP/JSON API, Docker Compose demo | Distributed sharding across nodes, networked replication, Raft, consensus |
+| Gateway | Client-side consistent-hash routing (`shardforge-gateway`), deterministic key→node mapping | Server-side routing, cluster metadata service, automatic failover, resharding |
 
 ---
 
 ## Architecture
 
 ```
+shardforge-gateway CLI (Phase 15)
+  │ consistent-hash routing — client-side only, no coordination
+  ▼
 HTTP Client / shardforge-node CLI
   │ HTTP/JSON (real network transport, Phase 14)
   ▼
@@ -96,6 +101,9 @@ make bench-report
 # Start a single networked node
 ./bin/shardforge-node --node-id node-1 --addr 127.0.0.1:9101 --data-dir /tmp/node-1
 
+# Route a key with the gateway (show which node wins)
+./bin/shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 route user:1
+
 # Start 3-node Docker Compose demo
 make node-demo
 
@@ -139,6 +147,14 @@ curl http://localhost:9101/healthz
 curl http://localhost:9102/healthz
 curl http://localhost:9103/healthz
 make node-demo-down
+
+# Gateway routing demo (requires node-demo running)
+./bin/shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 route user:1
+./bin/shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 put user:1 alice
+./bin/shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 get user:1
+./bin/shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 delete user:1
+./bin/shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 health
+./bin/shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 flush-all
 ```
 
 ---
@@ -315,7 +331,7 @@ make node-demo-down
 - [x] Makefile targets: `smoke`, `demo`, `release-check`
 - [x] **No new engine features** — polish, docs, scripts, and release hardening only
 
-**Phase 14 — Real Networked Node Runtime + HTTP Transport Foundation** (branch: `phase-14-network-node-transport`, in review)
+**Phase 14 — Real Networked Node Runtime + HTTP Transport Foundation** ✓ locked
 
 - [x] `internal/node` — real networked database node package
 - [x] `cmd/shardforge-node` — CLI binary for independent node processes
@@ -323,12 +339,26 @@ make node-demo-down
 - [x] HTTP/JSON API: `GET /healthz`, `GET /status`, `PUT/GET/DELETE /kv/{key}`, `GET /scan`, `POST /flush`, `POST /compact`
 - [x] `node.Client` — HTTP/JSON network client with timeout and error handling
 - [x] `node.Server` — HTTP server wrapping a local Engine; each node has its own `DataDir`
-- [x] 25+ tests: handler tests, client tests, multi-server isolation, restart persistence, race tests
-- [x] 6 benchmarks: handler Put/Get/Status/Scan, Client Put/Get via httptest
+- [x] 36 tests, 6 benchmarks
 - [x] Makefile targets: `node`, `node-demo`, `node-demo-down`, `bench-node`
-- [x] `bin/shardforge-node` added to `make build`
 - [x] **NOT Raft, NOT consensus, NOT quorum replication, NOT distributed sharding, NOT automatic leader election**
 - [x] **Each node is independent** — no shared state, no cluster coordination, no shard migration
+
+**Phase 15 — Client-Side Routing Gateway** (branch: `phase-15-client-routing-gateway`, in review)
+
+- [x] `internal/gateway` — deterministic consistent-hash routing gateway library
+- [x] `cmd/shardforge-gateway` — CLI for routing-aware Put/Get/Delete/Health/Flush/Compact
+- [x] FNV-1a 64-bit consistent-hash ring with configurable virtual nodes and weight support
+- [x] `Gateway.Put/Get/Delete` — route by key to responsible node, no retry to other nodes
+- [x] `Gateway.ScanNode` — per-node scan (no global distributed scan without replication)
+- [x] `Gateway.FlushAll/CompactAll` — admin fanout to all configured nodes
+- [x] `Gateway.HealthAll` — health check map across all configured nodes
+- [x] 41 tests, 6 benchmarks
+- [x] Makefile targets: `bench-gateway`, `gateway-help`, `gateway-demo`
+- [x] `bin/shardforge-gateway` added to `make build` (now 5 binaries)
+- [x] **Client-side routing only** — nodes do NOT coordinate, replicate, or share state
+- [x] **No Raft, no consensus, no quorum, no automatic leader election, no failover, no shard migration**
+- [x] **No retry to another node** — explicitly unsafe without replication
 
 ---
 
@@ -352,7 +382,7 @@ The following are **not** present in the current codebase and are not claimed:
 ## Build and Run
 
 ```bash
-# Build all four binaries into bin/
+# Build all five binaries into bin/
 make build
 
 # Individual binaries
@@ -360,6 +390,7 @@ go build -o bin/shardforge ./cmd/shardforge
 go build -o bin/shardforge-bench ./cmd/shardforge-bench
 go build -o bin/shardforge-dashboard ./cmd/shardforge-dashboard
 go build -o bin/shardforge-node ./cmd/shardforge-node
+go build -o bin/shardforge-gateway ./cmd/shardforge-gateway
 ```
 
 ## Test and Benchmark
@@ -399,11 +430,14 @@ make bench-vector
 make bench-shard
 make bench-dashboard
 make bench-node        # node package Go benchmarks
+make bench-gateway     # gateway package Go benchmarks
 make bench-report      # generate docs/BENCHMARKS.md (small scale)
 make dashboard         # run shardforge-dashboard --demo
 make node              # run shardforge-node (node-1, 127.0.0.1:9101)
 make node-demo         # docker compose up --build (3-node demo)
 make node-demo-down    # docker compose down -v
+make gateway-help      # print shardforge-gateway --help
+make gateway-demo      # show route demo (requires node-demo running)
 make smoke             # ./scripts/smoke.sh
 make demo              # ./scripts/demo.sh
 make release-check     # ./scripts/release_check.sh

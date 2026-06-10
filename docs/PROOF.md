@@ -3186,4 +3186,97 @@ BenchmarkGateway_CompactAll-8       37580   95929 ns/op   25862 B/op  278 allocs
 - No ANN/HNSW/IVF: correct
 - No background compaction: correct
 - No automatic compaction: correct
+
+---
+
+## Phase 16 — Stateless Gateway Proxy Server
+
+**Date:** 2026-06-10
+**Go version:** go1.26.4 darwin/arm64
+
+### What Was Built
+
+- `internal/proxy` package: stateless HTTP routing proxy wrapping `internal/gateway`
+- `cmd/shardforge-proxy`: long-running proxy server CLI with `--addr`, `--nodes`, `--virtual-nodes`, `--timeout`
+- 45 tests in `internal/proxy` (server_test.go, integration_test.go) + 9 tests in `cmd/shardforge-proxy/main_test.go`
+- 7 benchmarks: Route, Put, Get, Status, NodesHealth, FlushAll, CompactAll
+- Docker Compose updated with `shardforge-proxy` service on port 9200
+- Dockerfile updated to build both `shardforge-node` and `shardforge-proxy`
+- Makefile updated: 6th binary `bin/shardforge-proxy`, targets `bench-proxy`, `proxy-help`, `proxy-route-demo`
+
+### Validation Commands Run
+
+```bash
+go mod tidy        # no changes
+go fmt ./...       # formatted 3 new files
+go vet ./...       # clean
+go test -race -count=1 ./...   # all packages pass
+make test          # PASS
+make vet           # PASS
+make build         # 6 binaries produced
+make bench-proxy   # all 7 benchmarks pass
+./bin/shardforge-proxy --help  # disclaimer printed
+docker compose -f deploy/docker-compose.yml config  # valid
+git status --short  # clean
+```
+
+### Test Results
+
+All packages pass with race detector:
+
+| Package | Result |
+|---------|--------|
+| `internal/proxy` | ok (45 tests, race-safe) |
+| `cmd/shardforge-proxy` | ok (9 tests) |
+| All other packages | ok (unchanged) |
+
+### Benchmark Results (Apple M3, darwin/arm64)
+
+```
+BenchmarkProxy_Route-8         116691    29342 ns/op    6062 B/op      70 allocs/op
+BenchmarkProxy_Put-8            48792    74416 ns/op   20824 B/op     238 allocs/op
+BenchmarkProxy_Get-8            55782    64914 ns/op   15875 B/op     188 allocs/op
+BenchmarkProxy_Status-8        118112    30831 ns/op    6269 B/op      74 allocs/op
+BenchmarkProxy_NodesHealth-8    28322   127771 ns/op   33031 B/op     358 allocs/op
+BenchmarkProxy_FlushAll-8       26460   125524 ns/op   33021 B/op     358 allocs/op
+BenchmarkProxy_CompactAll-8     29347   125802 ns/op   33037 B/op     358 allocs/op
+```
+
+Notes:
+- Route is fast (~30 µs) because it does no backend network call — pure ring computation.
+- Put/Get include full proxy→node round-trip over TCP loopback (~65–75 µs).
+- NodesHealth/FlushAll/CompactAll fan out to all 3 nodes (~128 µs = 3× single-node latency).
+- Benchmarks use custom HTTP client with keep-alives to prevent port exhaustion under load.
+
+### No-Failover Proof
+
+`TestIntegration_NoFailover_UnavailableNodeReturnsError` (integration_test.go):
+- Creates proxy with ONE node at a port that is not listening (grabbed and immediately released).
+- Sends `PUT /kv/any-key`.
+- Verifies response is 5xx (502 Bad Gateway), not 200.
+- No other node is tried — there is no other node configured.
+
+This confirms the core safety property: the proxy returns an error immediately when the routed node is unavailable. There is no retry to another node.
+
+### Scope Confirmation (Phase 16)
+
+- Stateless proxy only: correct — proxy stores no data, can be restarted at any time
+- Routes through internal/gateway: correct
+- Independent networked nodes: correct
+- No automatic failover: correct — explicitly tested
+- No retry to another node: correct — explicitly tested and documented
+- No distributed sharding inside nodes: correct
+- No networked replication: correct
+- No Raft: correct
+- No consensus: correct
+- No quorum replication: correct
+- No automatic leader election: correct
+- No shard migration: correct
+- No resharding: correct
+- No distributed transactions: correct
+- No distributed vector search: correct
+- No ANN/HNSW/IVF: correct
+- No background compaction: correct
+- No automatic compaction: correct
+- No core Engine/WAL/MemTable/SSTable/Bloom/Vector/Shard/Replica/Dashboard/Node/Gateway behavior changes: correct
 - No core Engine/WAL/MemTable/SSTable/Bloom/Vector/Shard/Replica/Dashboard/Node behavior changes: correct

@@ -3,20 +3,22 @@ BENCH_BINARY     := shardforge-bench
 DASHBOARD_BINARY := shardforge-dashboard
 NODE_BINARY      := shardforge-node
 GATEWAY_BINARY   := shardforge-gateway
+PROXY_BINARY     := shardforge-proxy
 BUILD_DIR        := bin
 CMD              := ./cmd/shardforge
 BENCH_CMD        := ./cmd/shardforge-bench
 DASHBOARD_CMD    := ./cmd/shardforge-dashboard
 NODE_CMD         := ./cmd/shardforge-node
 GATEWAY_CMD      := ./cmd/shardforge-gateway
+PROXY_CMD        := ./cmd/shardforge-proxy
 GO               := go
 GOFLAGS          :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-report dashboard node node-demo node-demo-down gateway-help gateway-demo smoke demo release-check help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-report dashboard node node-demo node-demo-down gateway-help gateway-demo proxy proxy-help proxy-route-demo smoke demo release-check help
 
 all: fmt vet build
 
-## build: compile shardforge, shardforge-bench, shardforge-dashboard, shardforge-node, shardforge-gateway into bin/
+## build: compile all 6 binaries into bin/ (shardforge, bench, dashboard, node, gateway, proxy)
 build:
 	@mkdir -p $(BUILD_DIR)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY) $(CMD)
@@ -24,6 +26,7 @@ build:
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(DASHBOARD_BINARY) $(DASHBOARD_CMD)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(NODE_BINARY) $(NODE_CMD)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(GATEWAY_BINARY) $(GATEWAY_CMD)
+	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(PROXY_BINARY) $(PROXY_CMD)
 
 ## test: run all tests with race detection
 test:
@@ -77,6 +80,10 @@ bench-node:
 bench-gateway:
 	$(GO) test -bench=. -benchmem ./internal/gateway/...
 
+## bench-proxy: run Go benchmarks for the proxy package only
+bench-proxy:
+	$(GO) test -bench=. -benchmem ./internal/proxy/...
+
 ## dashboard: run the local dashboard in demo mode
 dashboard:
 	$(GO) run $(DASHBOARD_CMD) --demo
@@ -93,11 +100,23 @@ gateway-help:
 gateway-demo:
 	./bin/shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 route user:1
 
+## proxy: run shardforge-proxy locally (listens on 127.0.0.1:9200, routes to 3 local nodes)
+proxy:
+	$(GO) run $(PROXY_CMD) --addr 127.0.0.1:9200 --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103
+
+## proxy-help: print shardforge-proxy help and scope disclaimer
+proxy-help:
+	./bin/shardforge-proxy --help
+
+## proxy-route-demo: show which node handles user:1 (requires proxy running on 9200)
+proxy-route-demo:
+	curl http://127.0.0.1:9200/route/user:1
+
 ## node: run shardforge-node locally (node-1 on 127.0.0.1:9101)
 node:
 	$(GO) run $(NODE_CMD) --node-id node-1 --addr 127.0.0.1:9101 --data-dir /tmp/shardforge-node-1
 
-## node-demo: start 3-node Docker Compose demo
+## node-demo: start 3-node + proxy Docker Compose demo
 node-demo:
 	docker compose -f deploy/docker-compose.yml up --build
 

@@ -265,3 +265,44 @@ make bench-report
 **Note on COMMIT file writes:** The COMMIT file (written on every leader Put/Delete) uses `os.WriteFile` + `os.Rename` — atomic on POSIX filesystems for same-directory renames. Neither the COMMIT file nor its parent directory is explicitly fsynced. This is reflected in benchmark numbers; there is no "COMMIT fsync" overhead.
 
 **Note on Phase 10/11/12 sections:** The benchmark report generator (`make bench-report`) only covers the engine workload suite. The Phase 10, 11, and 12 sections below are manually maintained from separate `go test -bench` runs and must be re-added if `make bench-report` strips them. Use `git restore docs/BENCHMARKS.md` after `make bench-report` if only timing numbers changed.
+
+---
+
+## Phase 14 — Node HTTP Transport Benchmarks
+
+Machine: Apple M3, darwin/arm64, Go 1.21  
+Run: `go test -bench=. -benchmem -benchtime=3s ./internal/node/...`
+
+These benchmarks measure the complete HTTP handler pipeline and client round-trip over loopback HTTP,
+including JSON encode/decode, handler dispatch, Engine operation, and response serialization.
+
+### Handler Benchmarks (in-process httptest, no real TCP)
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| BenchmarkHandler_Put-8 | 20,560 | 8,109 | 37 |
+| BenchmarkHandler_Get-8 | 1,458 | 6,373 | 26 |
+| BenchmarkHandler_Status-8 | 1,723 | 6,633 | 22 |
+| BenchmarkHandler_Scan-8 (100 entries) | 29,550 | 67,003 | 754 |
+
+### Client Benchmarks (real HTTP over loopback via httptest.Server)
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| BenchmarkClient_Put-8 | 40,876 | 10,837 | 123 |
+| BenchmarkClient_Get-8 | 32,741 | 8,723 | 100 |
+
+**Notes:**
+- Handler benchmarks use httptest.NewRequest/ResponseRecorder — no real TCP stack.
+- Client benchmarks use httptest.NewServer — real HTTP over loopback (includes TCP overhead).
+- Handler Put includes WAL append + MemTable write (same as Engine Put ~1.7µs in Phase 6, with added HTTP/JSON overhead).
+- Handler Get is a MemTable hit (no disk I/O).
+- Scan benchmark pre-populates 100 entries; cost scales with entry count.
+- Client round-trip is ~2× slower than handler-only due to HTTP TCP loopback overhead.
+
+**To reproduce:**
+```bash
+make bench-node
+# or
+go test -bench=. -benchmem -benchtime=3s ./internal/node/...
+```

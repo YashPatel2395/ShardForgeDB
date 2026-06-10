@@ -1,0 +1,11 @@
+# ShardForgeDB node-2 configuration (for documentation/reference)
+# Used by: docker compose -f deploy/docker-compose.yml up
+#
+# This node is an independent single-process key-value store.
+# It has NO knowledge of other nodes.
+# No Raft, no consensus, no quorum replication.
+node_id: node-2
+addr: "0.0.0.0:9102"
+data_dir: /data/node-2
+wal_sync_on_write: false
+memtable_max_bytes: 67108864  # 64 MiB

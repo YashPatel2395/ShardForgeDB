@@ -105,3 +105,36 @@ This checklist must pass before any release or portfolio submission.
 - [ ] GitHub Actions `CI` workflow passes on `main`
 - [ ] GitHub Actions `CI` workflow passes on the current PR branch
 - [ ] No flaky test patterns in CI history
+
+---
+
+## Phase 14 — Network Node Runtime Checklist
+
+- [ ] `make build` produces `bin/shardforge-node` in addition to the three prior binaries
+- [ ] `./bin/shardforge-node --help` prints scope disclaimer (NOT Raft, NOT consensus, NOT distributed)
+- [ ] `go test -race -count=1 ./internal/node/...` — all tests PASS
+- [ ] `make bench-node` — 6 benchmarks PASS
+- [ ] Single node starts: `./bin/shardforge-node --node-id node-1 --addr 127.0.0.1:9101 --data-dir /tmp/n1`
+- [ ] `GET /healthz` returns `{"status":"ok","node_id":"node-1"}`
+- [ ] `PUT /kv/{key}` stores key; `GET /kv/{key}` returns it
+- [ ] `DELETE /kv/{key}` removes key; subsequent GET returns `found:false`
+- [ ] `GET /scan?start=&end=~` returns sorted entries
+- [ ] `POST /flush` and `POST /compact` succeed
+- [ ] Node restart on same `DataDir` preserves data written before shutdown
+- [ ] Writing key to node-1 does NOT appear on node-2 (independent data dirs verified by test)
+- [ ] `docker compose -f deploy/docker-compose.yml config` — config valid
+- [ ] `docker compose -f deploy/docker-compose.yml up --build` — 3 nodes start (requires Docker daemon)
+- [ ] `curl http://localhost:9101/healthz`, `9102/healthz`, `9103/healthz` all return `{"status":"ok",...}`
+- [ ] Data written to node-1 does not appear on node-2 or node-3
+- [ ] Node restart in Docker Compose preserves data (named volume survives container restart)
+- [ ] `docker compose -f deploy/docker-compose.yml down -v` — tears down cleanly
+
+## Phase 14 Scope Honesty Checklist
+
+- [ ] No claim of distributed sharding
+- [ ] No claim of networked replication
+- [ ] No claim of Raft or consensus
+- [ ] No claim of quorum or fault tolerance
+- [ ] No claim of automatic leader election
+- [ ] `--help` output explicitly states NOT Raft, NOT consensus, NOT distributed sharding
+- [ ] Docker Compose README/docs state nodes are independent (no shared state)

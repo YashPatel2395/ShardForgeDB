@@ -1284,3 +1284,102 @@ Each could be extended to a real distributed system by adding an RPC transport l
 ### No Behavior Changes
 
 Phase 13 does not change any Go package behavior. No new packages. No Engine, Shard, Replica, Vector, Dashboard, WAL, MemTable, SSTable, or Bloom changes.
+
+---
+
+## Phase 14 — Real Networked Node Runtime + HTTP Transport Foundation
+
+### Goals
+
+- Implement the first real networked distributed-system foundation: independent `shardforge-node` processes backed by their own Engine directories.
+- Provide an HTTP/JSON transport API so nodes can be operated and tested over the network.
+- Demonstrate multi-process node independence with a Docker Compose 3-node demo.
+- Add integration tests proving cross-process/network behavior and data isolation.
+- Maintain strict scope: this is NOT Raft, NOT consensus, NOT quorum replication, NOT distributed sharding.
+
+### Node Architecture
+
+```
+shardforge-node process
+  │
+  ├── node.Server (internal/node/server.go)
+  │     ├── Options: NodeID, Addr, DataDir, WALSyncOnWrite, MemTableMaxBytes
+  │     ├── Engine (internal/engine) — local LSM-tree key-value store
+  │     ├── http.ServeMux — routes HTTP/JSON requests to handlers
+  │     └── net.Listener — binds to Addr for real TCP connections
+  │
+  ├── HTTP Handlers (internal/node/handlers.go)
+  │     ├── GET  /healthz   → {"status":"ok","node_id":"..."}
+  │     ├── GET  /status    → Status{NodeID, Addr, DataDir, StartedAt, Engine{...}}
+  │     ├── PUT  /kv/{key}  → Engine.Put(key, value)
+  │     ├── GET  /kv/{key}  → Engine.Get(key)
+  │     ├── DELETE /kv/{key} → Engine.Delete(key)
+  │     ├── GET  /scan      → Engine.Scan(start, end) — query params
+  │     ├── POST /flush     → Engine.Flush()
+  │     └── POST /compact   → Engine.Compact()
+  │
+  └── node.Client (internal/node/client.go)
+        ├── HTTP/JSON only — never calls Engine methods directly
+        ├── Timeout handling via http.Client.Timeout + context
+        └── Clear errors: node unavailable, timeout, invalid JSON, server error
+```
+
+### HTTP Transport Design
+
+All request/response bodies are JSON. The API is intentionally simple:
+
+| Endpoint | Method | Request body | Response body |
+|----------|--------|-------------|---------------|
+| `/healthz` | GET | — | `{"status":"ok","node_id":"..."}` |
+| `/status` | GET | — | `Status` struct |
+| `/kv/{key}` | PUT | `{"value":"..."}` | `{"ok":true,"node_id":"..."}` |
+| `/kv/{key}` | GET | — | `{"found":bool,"key":"...","value":"...","node_id":"..."}` |
+| `/kv/{key}` | DELETE | — | `{"ok":true,"node_id":"..."}` |
+| `/scan` | GET | query: `start`, `end` | `{"node_id":"...","entries":[...]}` |
+| `/flush` | POST | — | `{"ok":true,"node_id":"..."}` |
+| `/compact` | POST | — | `{"ok":true,"node_id":"..."}` |
+
+Wrong HTTP methods return 405 with `Allow` header. Empty key returns 400.
+
+### Data Independence
+
+Each `shardforge-node` process has its own `DataDir`. The Engine, WAL, MemTable, SSTables, and Bloom filters are fully isolated to that directory. Writing to node-1 never affects node-2. Data survives node restart because the Engine WAL and SSTable files persist in `DataDir`.
+
+### Error Handling
+
+- Handler errors: serialized as `{"error":"...","node_id":"..."}` with appropriate HTTP status codes.
+- Client errors: context cancellation → "node unavailable (context)"; connection refused → "node unavailable"; non-2xx status → "server error N: ..."; invalid JSON → "invalid JSON response".
+
+### Docker Compose Demo
+
+`deploy/docker-compose.yml` starts 3 independent `shardforge-node` processes as Docker containers, each with a unique port (9101, 9102, 9103) and a named volume for its data directory. The Dockerfile uses a two-stage build (Go builder + Alpine runtime). Health checks use `wget` to poll `/healthz`.
+
+### CLI (shardforge-node)
+
+```
+shardforge-node --node-id node-1 --addr 127.0.0.1:9101 --data-dir ./data/node-1
+```
+
+Flags: `--node-id`, `--addr`, `--data-dir`, `--wal-sync`, `--memtable-max-bytes`.  
+Prints a scope disclaimer on startup. Handles SIGTERM/SIGINT with clean shutdown.
+
+### Limitations
+
+- No distributed sharding: nodes do not know about each other; no routing layer.
+- No networked replication: writing to node-1 does not propagate to node-2.
+- No Raft, no consensus, no quorum, no automatic leader election.
+- No shard migration or resharding.
+- No distributed vector search.
+- No background compaction (inherited Engine limitation).
+- The Docker Compose demo is a foundation, not a production cluster.
+
+### Future Work
+
+The next natural steps after Phase 14:
+
+1. **Shard router** — a routing layer that maps keys to the correct node via consistent hashing over real HTTP.
+2. **Networked replication** — a leader node that replicates operations to follower nodes over the network.
+3. **Raft consensus** — leader election, log replication, cluster membership over the network.
+4. **Cluster membership** — node discovery, join/leave protocols, gossip.
+5. **ANN vector index** — HNSW or IVF for approximate nearest-neighbour at scale.
+6. **Background compaction** — size-tiered or leveled, triggered automatically.

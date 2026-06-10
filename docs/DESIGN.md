@@ -1080,3 +1080,133 @@ This phase is an **educational simulation** demonstrating the mechanics of opera
 ---
 
 *This document will be updated as each phase is implemented and design decisions are validated.*
+
+## Phase 12 — Local Dashboard and Chaos/Failure Simulation
+
+### Goals
+
+- Provide a local, in-process HTTP observability dashboard for ShardForgeDB components.
+- Expose JSON status endpoints and an HTML view of engine, shard, and replica state.
+- Run deterministic local failure scenarios using the existing replica API.
+- Record event timelines for scenarios and surface them through the dashboard.
+
+This phase is **local only**. It is NOT distributed chaos testing. It is NOT production monitoring. It is NOT networking between database nodes.
+
+### Dashboard Architecture
+
+The dashboard is implemented in `internal/dashboard` with six files:
+
+| File | Role |
+|------|------|
+| `types.go` | All exported types, constants, sentinel values |
+| `collector.go` | Engine/Shard/Replica/Multi/Scenario collectors |
+| `templates.go` | HTML template (Go stdlib `html/template`) |
+| `server.go` | HTTP server with route handler |
+| `scenario.go` | Three deterministic chaos scenarios |
+| `server_test.go` | Tests for server, collectors, rendering |
+| `scenario_test.go` | Tests for all chaos scenarios |
+
+### Collectors
+
+Collectors implement the `Collector` interface:
+
+```go
+type Collector interface {
+    Snapshot() Snapshot
+}
+```
+
+Each collector reads stats from an existing local store — it never mutates the underlying store:
+
+- **`NewEngineCollector`** — wraps `engine.Engine`, calls `Stats()`.
+- **`NewShardCollector`** — wraps `shard.Store`, calls `Stats()`.
+- **`NewReplicaCollector`** — wraps `replica.Store`, calls `Stats()`. Reports `HealthDegraded` when any follower's `AppliedIndex` < `CommitIndex`.
+- **`NewMultiCollector`** — merges components and events from multiple collectors.
+- **`NewScenarioCollector`** — exposes a `ScenarioResult`'s events through the dashboard.
+
+### HTTP Endpoints
+
+| Endpoint | Content-Type | Description |
+|----------|-------------|-------------|
+| `GET /` | `text/html` | HTML dashboard with component cards and timeline |
+| `GET /status` | `application/json` | Full `Snapshot` as JSON |
+| `GET /healthz` | `application/json` | `{"status":"ok"}` if server is running |
+| `GET /events` | `application/json` | JSON array of `TimelineEvent` |
+| Unknown path | — | 404 Not Found |
+
+### HTML Rendering
+
+- Template: Go standard library `html/template` (auto-escapes all user-controlled strings).
+- No external JavaScript dependencies.
+- No external CSS or font resources.
+- All styles are inlined.
+- Footer states: "Local dashboard only — no networking, no Raft, no consensus, no distributed cluster."
+
+### Scenario Runner
+
+Three deterministic chaos scenarios in `scenario.go`:
+
+**`RunFollowerPauseScenario`**
+1. Write a key to the leader.
+2. Pause the target follower (`SetFollowerPaused(true)`).
+3. `ReplicateAll` — follower is skipped.
+4. Verify key absent on follower.
+5. Unpause (`SetFollowerPaused(false)`).
+6. `ReplicateAll` — follower catches up.
+7. Verify key present on follower.
+
+**`RunFollowerLagScenario`**
+1. Set follower lag limit to 2 ops/call (`SetFollowerLag(2)`).
+2. Write 6 keys to the leader.
+3. `ReplicateOnce` — follower applies at most 2 ops.
+4. Confirm lag (follower `AppliedIndex` < `CommitIndex`).
+5. `ReplicateAll` — follower reaches full catch-up.
+6. Verify all 6 keys visible on follower.
+7. Clear lag limit (`SetFollowerLag(0)`).
+
+**`RunFollowerCatchupScenario`**
+1. Pause the follower.
+2. Write 4 keys to the leader.
+3. Verify all 4 keys absent on follower.
+4. Unpause follower.
+5. `ReplicateAll`.
+6. Verify all 4 keys visible on follower.
+
+Scenario rules:
+- Deterministic key names (no randomness).
+- No goroutine chaos, no sleeps.
+- All failures reported in `ScenarioResult.Error`.
+- Events are time-ordered.
+- Invalid inputs (nil store, invalid follower ID, leader ID as follower) return `ScenarioFailed` without panicking.
+
+### Failure Simulation Limits
+
+Scenarios use the existing `SetFollowerPaused` and `SetFollowerLag` APIs from Phase 11. These are in-memory simulation controls only:
+
+- **No process crash simulation.** Followers cannot actually die.
+- **No network partition simulation.** All replicas share the same in-process call path.
+- **No disk failure simulation.** Underlying engines always succeed.
+- **No leader failure simulation.** Only follower behaviour is exercised.
+
+### Why This Is Not Distributed Chaos Testing
+
+Real distributed chaos testing (e.g. Jepsen) injects failures across physical nodes over a real network. This phase operates entirely within one OS process, using in-memory flags on local structs. It validates the correctness of the `pause`/`lag`/`catch-up` replica controls, not network-level fault tolerance.
+
+### CLI Command
+
+`cmd/shardforge-dashboard/main.go` provides:
+
+```
+shardforge-dashboard --help
+shardforge-dashboard --demo
+shardforge-dashboard --demo --run-chaos
+shardforge-dashboard --addr 127.0.0.1:9090 --demo
+```
+
+In `--demo` mode the CLI:
+1. Opens a temp directory with a 3-replica store.
+2. Seeds 20 keys and replicates them.
+3. Optionally runs all three chaos scenarios (separate temp stores per scenario).
+4. Starts the HTTP server and blocks until Ctrl+C.
+
+Uses only Go standard library `flag` package — no external dependencies.

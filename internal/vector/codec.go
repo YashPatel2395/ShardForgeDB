@@ -166,6 +166,10 @@ func decodeRecord(data []byte, wantDim int) (vector []float32, metadata []byte, 
 		return nil, nil, fmt.Errorf("%w: bad footer magic %016x", ErrCorruptRecord, footerMagic)
 	}
 
-	_ = off // silence unused-variable warning
+	// Reject trailing bytes after the footer — appended data is treated as corrupt.
+	if off != len(data) {
+		return nil, nil, fmt.Errorf("%w: %d trailing bytes after footer", ErrCorruptRecord, len(data)-off)
+	}
+
 	return vec, meta, nil
 }

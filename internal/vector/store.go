@@ -7,6 +7,26 @@
 // search. All persistence is Engine-backed; no separate storage format is
 // introduced.
 //
+// # Locking model
+//
+// s.mu guards s.closed and s.index.  s.opts is set once in Open and never
+// modified; it may be read without holding the lock.
+//
+// Each public method acquires the appropriate lock FIRST, then checks
+// s.closed, then performs its work — still holding the lock.  This eliminates
+// the time-of-check/time-of-use window that exists when checkClosed() is
+// called before acquiring the lock.
+//
+//   - Upsert, Delete, Flush, Compact: hold write lock (s.mu.Lock) for the
+//     full operation so they cannot interleave with Close.
+//   - Get, Search: hold read lock (s.mu.RLock) while checking s.closed and
+//     reading from the index, then release before sorting.
+//   - Count: holds read lock briefly to read len(s.index).
+//   - Stats: holds read lock while reading s.index and calling s.eng.Stats().
+//     Stats has no error return; it is allowed after Close and returns the
+//     last known values (engine.Stats() is safe to call after engine.Close()).
+//   - Close: holds write lock, sets s.closed, closes the engine.  Idempotent.
+//
 // # Search
 //
 // Search is exact brute-force — every stored vector is scored against the
@@ -129,6 +149,10 @@ type SearchResult struct {
 }
 
 // Stats reports current Store state.
+//
+// Stats is safe to call after Close; it returns the last known values.
+// Engine statistics are collected while holding the read lock, so they are
+// consistent with the index count at the same point in time.
 type Stats struct {
 	Count      int
 	Dimension  int
@@ -147,12 +171,14 @@ type Stats struct {
 //
 // Concurrent calls to Upsert, Delete, Get, Search, Count, Stats, Flush,
 // Compact, and Close are safe.
+//
+// The locking contract is described in the package-level doc comment.
 type Store struct {
 	mu     sync.RWMutex
-	opts   Options
+	opts   Options // immutable after Open; safe to read without lock
 	eng    *engine.Engine
-	index  map[string]Record // in-memory exact index
-	closed bool
+	index  map[string]Record // guarded by mu
+	closed bool              // guarded by mu
 }
 
 // Open opens (or creates) a vector Store at opts.Dir.
@@ -187,8 +213,6 @@ func Open(opts Options) (*Store, error) {
 // populates the in-memory index.  Called once during Open.
 func (s *Store) loadIndex() error {
 	prefix := s.keyPrefix()
-	// Scan [prefix, prefix+"\xff") to load all namespace records.
-	// The end key uses the fact that '\xff' > any printable character.
 	startKey := []byte(prefix)
 	endKey := []byte(prefix + "\xff")
 
@@ -221,10 +245,12 @@ func (s *Store) loadIndex() error {
 // metadata may be nil or empty.
 //
 // Defensively copies vector and metadata before storing.
+//
+// Upsert holds the write lock for the full operation — including the Engine
+// Put — so it cannot interleave with Close.
 func (s *Store) Upsert(id string, vector []float32, metadata []byte) error {
-	if err := s.checkClosed(); err != nil {
-		return err
-	}
+	// Validate inputs before acquiring the lock; these reads only use s.opts
+	// which is immutable after Open.
 	if err := validateID(id); err != nil {
 		return err
 	}
@@ -232,20 +258,21 @@ func (s *Store) Upsert(id string, vector []float32, metadata []byte) error {
 		return err
 	}
 
-	// Defensive copies.
+	// Defensive copies and encoding can happen before the lock.
 	vec := cloneFloat32(vector)
 	meta := cloneBytes(metadata)
-
 	encoded, err := encodeRecord(s.opts.Dimension, vec, meta)
 	if err != nil {
 		return fmt.Errorf("vector: encode: %w", err)
 	}
-
 	key := []byte(s.engineKey(id))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.closed {
+		return ErrClosed
+	}
 	if err := s.eng.Put(key, encoded); err != nil {
 		return fmt.Errorf("vector: put: %w", err)
 	}
@@ -255,19 +282,20 @@ func (s *Store) Upsert(id string, vector []float32, metadata []byte) error {
 
 // Delete removes the vector with the given id.
 // If the id does not exist, Delete is a safe no-op.
+//
+// Delete holds the write lock for the full operation.
 func (s *Store) Delete(id string) error {
-	if err := s.checkClosed(); err != nil {
-		return err
-	}
 	if err := validateID(id); err != nil {
 		return err
 	}
-
 	key := []byte(s.engineKey(id))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.closed {
+		return ErrClosed
+	}
 	if err := s.eng.Delete(key); err != nil {
 		return fmt.Errorf("vector: delete: %w", err)
 	}
@@ -278,15 +306,16 @@ func (s *Store) Delete(id string) error {
 // Get returns the Record for id.
 // Returns (Record{}, false, nil) if id is not found.
 // The returned Record's Vector and Metadata are defensive copies.
+//
+// Get holds the read lock while checking s.closed and copying from the index.
 func (s *Store) Get(id string) (Record, bool, error) {
-	if err := s.checkClosed(); err != nil {
-		return Record{}, false, err
-	}
-
 	s.mu.RLock()
-	r, ok := s.index[id]
-	s.mu.RUnlock()
+	defer s.mu.RUnlock()
 
+	if s.closed {
+		return Record{}, false, ErrClosed
+	}
+	r, ok := s.index[id]
 	if !ok {
 		return Record{}, false, nil
 	}
@@ -305,10 +334,11 @@ func (s *Store) Get(id string) (Record, bool, error) {
 // k must be > 0.  If k > Count(), all records are returned.
 // The returned SearchResult.Metadata fields are defensive copies.
 // query is not mutated.
+//
+// Search holds the read lock while checking s.closed and collecting candidates
+// from the index, then releases the lock before sorting.
 func (s *Store) Search(query []float32, k int) ([]SearchResult, error) {
-	if err := s.checkClosed(); err != nil {
-		return nil, err
-	}
+	// Validate k and query using immutable s.opts — no lock needed.
 	if k <= 0 {
 		return nil, fmt.Errorf("%w: k must be > 0, got %d", ErrInvalidK, k)
 	}
@@ -323,11 +353,17 @@ func (s *Store) Search(query []float32, k int) ([]SearchResult, error) {
 		return nil, fmt.Errorf("%w: cosine search requires non-zero query vector", ErrInvalidVector)
 	}
 
-	// Defensive copy of query so we cannot be affected by caller mutation.
+	// Defensive copy of query before acquiring the lock.
 	q := cloneFloat32(query)
 
 	s.mu.RLock()
-	// Collect all candidates into a slice while holding the read lock.
+
+	if s.closed {
+		s.mu.RUnlock()
+		return nil, ErrClosed
+	}
+
+	// Collect all candidates while holding the read lock.
 	type candidate struct {
 		id    string
 		score float64
@@ -346,7 +382,7 @@ func (s *Store) Search(query []float32, k int) ([]SearchResult, error) {
 	}
 	s.mu.RUnlock()
 
-	// Sort: higher score first; tie-break by ID ascending.
+	// Sort and trim outside the lock.
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].score != candidates[j].score {
 			return candidates[i].score > candidates[j].score
@@ -379,46 +415,57 @@ func (s *Store) Count() int {
 }
 
 // Stats returns a snapshot of the Store's current state.
+//
+// Stats is safe to call after Close; it cannot return ErrClosed because it
+// has no error return value.  After Close it returns the last known index
+// count; engine.Stats() remains safe to call on a closed engine.
 func (s *Store) Stats() Stats {
 	s.mu.RLock()
 	count := len(s.index)
+	es := s.eng.Stats()
 	s.mu.RUnlock()
 
-	st := Stats{
-		Count:      count,
-		Dimension:  s.opts.Dimension,
-		Metric:     s.opts.Metric,
-		EnginePath: s.opts.Dir,
+	return Stats{
+		Count:           count,
+		Dimension:       s.opts.Dimension,
+		Metric:          s.opts.Metric,
+		EnginePath:      s.opts.Dir,
+		SSTableCount:    es.SSTableCount,
+		FlushCount:      es.FlushCount,
+		CompactionCount: es.CompactionCount,
 	}
-
-	es := s.eng.Stats()
-	st.SSTableCount = es.SSTableCount
-	st.FlushCount = es.FlushCount
-	st.CompactionCount = es.CompactionCount
-
-	return st
 }
 
 // Flush delegates to the underlying Engine's Flush.
 // It persists the current MemTable to an SSTable on disk.
+//
+// Flush holds the write lock for the full operation.
 func (s *Store) Flush() error {
-	if err := s.checkClosed(); err != nil {
-		return err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrClosed
 	}
 	return s.eng.Flush()
 }
 
 // Compact delegates to the underlying Engine's Compact.
 // It merges all SSTables into at most one compacted SSTable.
+//
+// Compact holds the write lock for the full operation.
 func (s *Store) Compact() error {
-	if err := s.checkClosed(); err != nil {
-		return err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrClosed
 	}
 	return s.eng.Compact()
 }
 
 // Close closes the Store and the underlying Engine.
-// After Close, all operations return ErrClosed.
+// After Close, all operations that can return errors return ErrClosed.
 // Close is idempotent.
 func (s *Store) Close() error {
 	s.mu.Lock()
@@ -432,16 +479,6 @@ func (s *Store) Close() error {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-func (s *Store) checkClosed() error {
-	s.mu.RLock()
-	closed := s.closed
-	s.mu.RUnlock()
-	if closed {
-		return ErrClosed
-	}
-	return nil
-}
 
 // keyPrefix returns the namespace prefix for engine keys.
 // Format: __vector__/<namespace>/
@@ -481,6 +518,7 @@ func validateID(id string) error {
 }
 
 // validateVector checks dimension, finiteness, and (for cosine) non-zero.
+// Only reads s.opts, which is immutable after Open — safe to call without lock.
 func (s *Store) validateVector(v []float32) error {
 	if len(v) != s.opts.Dimension {
 		return fmt.Errorf("%w: got %d elements, want %d", ErrInvalidVector, len(v), s.opts.Dimension)

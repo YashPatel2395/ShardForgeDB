@@ -52,12 +52,12 @@ Durations include preload time where applicable (see Interpretation).
 
 | Workload | Ops | Duration | Ops/sec | P50 | P95 | P99 | SSTables | Bloom Skips |
 |----------|----:|---------:|--------:|----:|----:|----:|:--------:|------------:|
-| write-heavy | 1000 | 134.8ms | 7419 | 1.7µs | 4.4µs | 11.0µs | 10 | 0 |
-| read-heavy | 1000 | 138.4ms | 7226 | 1.6µs | 1.9µs | 2.4µs | 10 | 0 |
-| mixed | 1000 | 197.4ms | 5066 | 2.7µs | 5.6µs | 25.0µs | 15 | 0 |
-| scan | 100 | 153.6ms | 651 | 78.6µs | 87.8µs | 107.0µs | 10 | 0 |
-| compaction | 240 | 95.0ms | 2526 | 1.4µs | 71.2µs | 76.5µs | 1 | 0 |
-| restart | 1 | 59.0ms | 17 | 1.1ms | 1.1ms | 1.1ms | 5 | 0 |
+| write-heavy | 1000 | 133.7ms | 7481 | 1.5µs | 4.2µs | 19.0µs | 10 | 0 |
+| read-heavy | 1000 | 126.3ms | 7916 | 1.4µs | 1.8µs | 2.4µs | 10 | 0 |
+| mixed | 1000 | 198.0ms | 5050 | 3.0µs | 5.7µs | 27.8µs | 15 | 0 |
+| scan | 100 | 150.5ms | 665 | 85.5µs | 109.8µs | 222.3µs | 10 | 0 |
+| compaction | 240 | 105.3ms | 2279 | 1.7µs | 87.6µs | 91.1µs | 1 | 0 |
+| restart | 1 | 69.9ms | 14 | 1.2ms | 1.2ms | 1.2ms | 5 | 0 |
 
 | Workload | Bytes Written | Bytes Read | Flush Count | Compaction Count |
 |----------|:-------------:|:----------:|:-----------:|:----------------:|
@@ -79,7 +79,7 @@ Durations include preload time where applicable (see Interpretation).
 |--------|-------|
 | SSTables before compact | 5 |
 | SSTables after compact | 1 |
-| Compact duration | 18.9ms |
+| Compact duration | 24.3ms |
 | Gets before compact | 100 |
 | Gets after compact | 100 |
 | Scans before compact | 20 |

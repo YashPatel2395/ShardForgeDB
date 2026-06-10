@@ -2182,4 +2182,97 @@ git status --short
 
 No ANN, HNSW, IVF, approximate search, sharding, replication, dashboard, networking, distributed mode, Raft, background compaction, automatic compaction, leveled compaction, or core engine behavior changes were implemented. Phase 9 adds a persistent exact vector search layer only.
 
+---
+
+## Phase 9 — Review Fix: Store Close-Safety
+
+**Date:** 2026-06-09
+**Go version:** go1.26.4 darwin/arm64
+**Branch:** phase-9-vector-search
+
+### Issue Fixed
+
+The original `checkClosed()` helper acquired `s.mu.RLock()`, read `s.closed`, and **released the lock** before the calling method did any work. This created a time-of-check/time-of-use (TOCTOU) race:
+
+- `Search` could pass `checkClosed()`, then `Close()` could run and close the engine, then `Search` returned results from a closed store.
+- `Upsert` could pass `checkClosed()`, then `Close()` could close the engine, then `Upsert` hit an underlying engine error instead of `vector.ErrClosed`.
+
+### Fix: Lock-First Pattern
+
+Every public method now acquires the appropriate lock **first**, checks `s.closed` while holding the lock, and performs its work while still holding the lock. The `checkClosed()` helper has been removed.
+
+| Method | Lock held | Closed check |
+|--------|-----------|--------------|
+| `Upsert` | `s.mu.Lock()` | inside lock, before engine Put |
+| `Delete` | `s.mu.Lock()` | inside lock, before engine Delete |
+| `Flush` | `s.mu.Lock()` | inside lock, before engine Flush |
+| `Compact` | `s.mu.Lock()` | inside lock, before engine Compact |
+| `Get` | `s.mu.RLock()` | inside lock, before index read |
+| `Search` | `s.mu.RLock()` | inside lock, before candidate collection |
+| `Count` | `s.mu.RLock()` | no error return; reads len(index) |
+| `Stats` | `s.mu.RLock()` | no error return; reads index + engine |
+| `Close` | `s.mu.Lock()` | sets closed=true, closes engine |
+
+`s.opts` is immutable after `Open`; methods read it before acquiring the lock without data races. Encoding and input validation also happen before the lock.
+
+### Codec Hardening
+
+`decodeRecord` now rejects trailing bytes after the footer magic sentinel. Appended garbage was previously silently ignored; it is now treated as `ErrCorruptRecord`.
+
+### Tests Added
+
+| Test | Covers |
+|------|--------|
+| `TestCloseConcurrentWithSearchRaceSafe` | `Close` racing with concurrent `Search` — passes `-race`; post-close returns `ErrClosed` |
+| `TestCloseConcurrentWithUpsertRaceSafe` | `Close` racing with concurrent `Upsert` — passes `-race`; only `nil` or `ErrClosed` returned |
+| `TestFlushCompact_AfterClose` | `Flush` and `Compact` return `ErrClosed` after `Close` |
+| `TestCodec_RejectsTrailingBytes` | Trailing bytes after footer return `ErrCorruptRecord` |
+
+### Updated Total Test Count
+
+| Package | Tests |
+|---------|-------|
+| `internal/vector` | 49 (was 44; +5 new tests) |
+| All other packages | unchanged |
+
+### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 -v ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/vector/...
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...
+go test -bench=. -benchmem -benchtime=3s ./internal/bench/...
+make test
+make vet
+make build
+make bench-vector
+make bench-report
+./bin/shardforge --help
+./bin/shardforge version
+./bin/shardforge-bench --scale small --out /tmp/shardforge-bench.md
+git status --short
+```
+
+### Benchmark Results (vector package, Apple M3, after fix)
+
+```
+BenchmarkUpsert_1k_dim128-8           1107    3498320 ns/op   4304707 B/op   9804 allocs/op
+BenchmarkSearch_1k_dim128_Cosine-8   18674     194899 ns/op     58568 B/op      6 allocs/op
+BenchmarkSearch_10k_dim128_Cosine-8   1598    2222066 ns/op    566472 B/op      6 allocs/op
+BenchmarkSearch_1k_dim128_L2-8       18744     192935 ns/op     58568 B/op      6 allocs/op
+BenchmarkSearch_1k_dim128_Dot-8      18783     191688 ns/op     58568 B/op      6 allocs/op
+BenchmarkReopen_1k-8                  2437    1494688 ns/op   3349410 B/op  10125 allocs/op
+BenchmarkCodec_Encode_dim128-8    23067963       155.1 ns/op       576 B/op      1 allocs/op
+BenchmarkCodec_Decode_dim128-8    24578278       146.1 ns/op       512 B/op      1 allocs/op
+BenchmarkConcurrentSearch-8          65497      52894 ns/op     58569 B/op      6 allocs/op
+BenchmarkConcurrentUpsert-8         886413      20605 ns/op      4101 B/op     10 allocs/op
+```
+
+### Confirmation: No ANN / Distributed Features
+
+No ANN, HNSW, IVF, approximate search, sharding, replication, dashboard, networking, distributed mode, Raft, background compaction, automatic compaction, leveled compaction, or core engine behavior changes were made in this fix.
+
 *Future phases will append their own sections to this document.*

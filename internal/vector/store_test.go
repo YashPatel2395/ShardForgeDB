@@ -732,3 +732,123 @@ func TestCodec_RejectsDimensionMismatch(t *testing.T) {
 		t.Fatalf("want ErrCorruptRecord for dim mismatch, got %v", err)
 	}
 }
+
+// ── Codec: trailing bytes ─────────────────────────────────────────────────────
+
+func TestCodec_RejectsTrailingBytes(t *testing.T) {
+	encoded, _ := encodeRecord(4, []float32{1, 0, 0, 0}, nil)
+	withTrailing := append(encoded, 0x00, 0xFF) // append garbage after footer
+	_, _, err := decodeRecord(withTrailing, 4)
+	if !errors.Is(err, ErrCorruptRecord) {
+		t.Fatalf("want ErrCorruptRecord for trailing bytes, got %v", err)
+	}
+}
+
+// ── Close-safety concurrent tests ────────────────────────────────────────────
+
+// TestCloseConcurrentWithSearchRaceSafe verifies that Close racing with Search
+// does not trigger the race detector and that Search returns ErrClosed after
+// Close completes.
+func TestCloseConcurrentWithSearchRaceSafe(t *testing.T) {
+	s, err := Open(Options{Dir: t.TempDir(), Dimension: 4, Metric: MetricCosine})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("id-%d", i)
+		mustUpsert(t, s, id, vec(1, float32(i), 0, 0), nil)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Several goroutines search in a loop.
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_, _ = s.Search(vec(1, 0, 0, 0), 3)
+			}
+		}()
+	}
+
+	// Close concurrently.
+	if err := s.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	close(stop)
+	wg.Wait()
+
+	// After Close, Search must return ErrClosed.
+	_, err = s.Search(vec(1, 0, 0, 0), 1)
+	if !errors.Is(err, ErrClosed) {
+		t.Errorf("Search after Close: want ErrClosed, got %v", err)
+	}
+}
+
+// TestCloseConcurrentWithUpsertRaceSafe verifies that Close racing with Upsert
+// does not trigger the race detector and that errors are either nil (succeeded
+// before close) or ErrClosed (store was closed first) — never an unexpected
+// underlying engine error.
+func TestCloseConcurrentWithUpsertRaceSafe(t *testing.T) {
+	s, err := Open(Options{Dir: t.TempDir(), Dimension: 4, Metric: MetricCosine})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			i := 0
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				id := fmt.Sprintf("worker-%d-item-%d", n, i)
+				i++
+				err := s.Upsert(id, vec(1, float32(n), 0, 0), nil)
+				if err != nil && !errors.Is(err, ErrClosed) {
+					// Any error other than ErrClosed is unexpected.
+					t.Errorf("Upsert: unexpected error: %v", err)
+				}
+			}
+		}(g)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	close(stop)
+	wg.Wait()
+
+	// After Close, Upsert must return ErrClosed.
+	err = s.Upsert("post-close", vec(1, 0, 0, 0), nil)
+	if !errors.Is(err, ErrClosed) {
+		t.Errorf("Upsert after Close: want ErrClosed, got %v", err)
+	}
+}
+
+// TestFlushCompact_AfterClose verifies Flush and Compact return ErrClosed.
+func TestFlushCompact_AfterClose(t *testing.T) {
+	s, _ := Open(Options{Dir: t.TempDir(), Dimension: 4, Metric: MetricCosine})
+	s.Close()
+
+	if err := s.Flush(); !errors.Is(err, ErrClosed) {
+		t.Errorf("Flush after Close: want ErrClosed, got %v", err)
+	}
+	if err := s.Compact(); !errors.Is(err, ErrClosed) {
+		t.Errorf("Compact after Close: want ErrClosed, got %v", err)
+	}
+}

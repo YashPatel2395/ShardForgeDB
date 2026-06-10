@@ -1,0 +1,62 @@
+{
+  "version": "v1",
+  "name": "docker-read-replica-3node",
+  "description": "1 primary + 2 followers, pull-based explicit replication, Docker Compose service names",
+  "routing": {
+    "algorithm": "fnv1a-consistent-hash",
+    "virtual_nodes": 128
+  },
+  "proxy": {
+    "enabled": true,
+    "addr": "0.0.0.0:9210"
+  },
+  "nodes": [
+    {
+      "id": "shardforge-primary",
+      "base_url": "http://shardforge-primary:9111",
+      "addr": "0.0.0.0:9111",
+      "data_dir": "/data",
+      "weight": 1,
+      "replication": {
+        "enabled": true,
+        "role": "primary"
+      }
+    },
+    {
+      "id": "shardforge-replica-1",
+      "base_url": "http://shardforge-replica-1:9112",
+      "addr": "0.0.0.0:9112",
+      "data_dir": "/data",
+      "weight": 1,
+      "replication": {
+        "enabled": true,
+        "role": "follower",
+        "primary": "shardforge-primary"
+      }
+    },
+    {
+      "id": "shardforge-replica-2",
+      "base_url": "http://shardforge-replica-2:9113",
+      "addr": "0.0.0.0:9113",
+      "data_dir": "/data",
+      "weight": 1,
+      "replication": {
+        "enabled": true,
+        "role": "follower",
+        "primary": "shardforge-primary"
+      }
+    }
+  ],
+  "scope": {
+    "static_config_only": true,
+    "no_dynamic_membership": true,
+    "no_discovery": true,
+    "no_consensus": true,
+    "no_raft": true,
+    "no_replication": false,
+    "no_quorum_replication": true,
+    "no_failover": true,
+    "no_shard_migration": true,
+    "no_distributed_txns": true
+  }
+}

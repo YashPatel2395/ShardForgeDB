@@ -41,14 +41,16 @@ func runWithWriters(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, `Usage: shardforge-cluster <command> [args]
 
 Commands:
-  validate <path>        load and validate a cluster config file
-  print    <path>        load and pretty-print a cluster config file
-  example-local-3node    print a 3-node local example config to stdout
+  validate <path>              load and validate a cluster config file
+  print    <path>              load and pretty-print a cluster config file
+  example-local-3node          print a 3-node local example config to stdout
+  example-read-replica-3node   print a read-replica 3-node example config to stdout
 
 Examples:
   shardforge-cluster validate configs/local-3node.json
   shardforge-cluster print    configs/local-3node-with-proxy.json
   shardforge-cluster example-local-3node
+  shardforge-cluster example-read-replica-3node
 `)
 		return 1
 	}
@@ -91,6 +93,16 @@ Examples:
 
 	case "example-local-3node":
 		cfg := cluster.ExampleLocal3Node()
+		data, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			fmt.Fprintf(stderr, "error: marshal: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(stdout, string(data))
+		return 0
+
+	case "example-read-replica-3node":
+		cfg := cluster.ExampleReadReplica3Node()
 		data, err := json.MarshalIndent(cfg, "", "  ")
 		if err != nil {
 			fmt.Fprintf(stderr, "error: marshal: %v\n", err)

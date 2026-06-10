@@ -6,9 +6,11 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/YashPatel2395/ShardForgeDB/internal/engine"
+	"github.com/YashPatel2395/ShardForgeDB/internal/replnet"
 )
 
 // Server is a networked database node. It owns a local Engine and serves an HTTP/JSON API.
@@ -16,7 +18,7 @@ import (
 // Scope limitations:
 //   - No Raft, no consensus, no quorum replication, no automatic leader election.
 //   - No distributed sharding or shard migration.
-//   - No networked replication between nodes.
+//   - Replication is explicit pull-based only (no background sync loop).
 //   - Each Server is an independent single-process node.
 type Server struct {
 	opts   Options
@@ -27,6 +29,13 @@ type Server struct {
 	mu     sync.Mutex
 	closed bool
 	start  time.Time
+
+	// Replication state. replLog is non-nil only for primary nodes.
+	// replicator is non-nil only for follower nodes.
+	// lastApplied is the last replication log seq applied (follower only).
+	replLog     *replnet.Log
+	replicator  *replnet.Replicator
+	lastApplied uint64 // accessed via atomic
 }
 
 // Open validates opts, opens (or creates) the local Engine, and wires up the HTTP mux.
@@ -56,6 +65,14 @@ func Open(opts Options) (*Server, error) {
 		mux:   http.NewServeMux(),
 		start: time.Now(),
 	}
+
+	switch opts.Replication.Role {
+	case replnet.RolePrimary:
+		s.replLog = replnet.NewLog()
+	case replnet.RoleFollower:
+		s.replicator = replnet.NewReplicator(opts.Replication.PrimaryBaseURL, 0)
+	}
+
 	s.registerRoutes()
 	return s, nil
 }
@@ -142,6 +159,11 @@ func (s *Server) Close() error {
 			firstErr = err
 		}
 	}
+	if s.replLog != nil {
+		if err := s.replLog.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
 	if s.eng != nil {
 		if err := s.eng.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -166,5 +188,89 @@ func (s *Server) Status() Status {
 			FlushCount:          stats.FlushCount,
 			CompactionCount:     stats.CompactionCount,
 		},
+		Replication: s.ReplicationStatus(),
 	}
+}
+
+// ReplicationStatus returns the current replication state of this node.
+func (s *Server) ReplicationStatus() replnet.ReplicaStatus {
+	role := s.opts.Replication.Role
+	switch role {
+	case replnet.RolePrimary:
+		var lastSeq uint64
+		if s.replLog != nil {
+			if st, err := s.replLog.Stats(); err == nil {
+				lastSeq = st.LastSeq
+			}
+		}
+		return replnet.ReplicaStatus{
+			Role:         replnet.RolePrimary,
+			LastLocalSeq: lastSeq,
+		}
+	case replnet.RoleFollower:
+		return replnet.ReplicaStatus{
+			Role:           replnet.RoleFollower,
+			PrimaryBaseURL: s.opts.Replication.PrimaryBaseURL,
+			LastAppliedSeq: atomic.LoadUint64(&s.lastApplied),
+		}
+	default:
+		return replnet.ReplicaStatus{}
+	}
+}
+
+// ReplicationEntries returns up to limit log entries with Seq > after.
+// Only valid for primary nodes; returns nil for standalone and follower nodes.
+func (s *Server) ReplicationEntries(after uint64, limit int) ([]replnet.Entry, error) {
+	if s.replLog == nil {
+		return nil, nil
+	}
+	return s.replLog.EntriesAfter(after, limit)
+}
+
+// ApplyReplicationEntries applies a batch of entries from the primary to the local engine.
+// Entries must be in ascending Seq order. Already-applied entries (Seq <= lastApplied) are
+// safely skipped. Out-of-order gaps return replnet.ErrInvalidEntry.
+// Returns the last applied sequence number after this batch.
+func (s *Server) ApplyReplicationEntries(entries []replnet.Entry) (uint64, error) {
+	last := atomic.LoadUint64(&s.lastApplied)
+	for _, e := range entries {
+		if e.Seq <= last {
+			continue // already applied
+		}
+		if e.Seq != last+1 {
+			return last, fmt.Errorf("%w: expected seq %d, got %d", replnet.ErrInvalidEntry, last+1, e.Seq)
+		}
+		switch e.Op {
+		case replnet.OpPut:
+			if err := s.eng.Put([]byte(e.Key), []byte(e.Value)); err != nil {
+				return last, fmt.Errorf("node: apply put seq %d: %w", e.Seq, err)
+			}
+		case replnet.OpDelete:
+			if err := s.eng.Delete([]byte(e.Key)); err != nil {
+				return last, fmt.Errorf("node: apply delete seq %d: %w", e.Seq, err)
+			}
+		default:
+			return last, fmt.Errorf("%w: unknown op %q at seq %d", replnet.ErrInvalidEntry, e.Op, e.Seq)
+		}
+		last = e.Seq
+		atomic.StoreUint64(&s.lastApplied, last)
+	}
+	return last, nil
+}
+
+// SyncFromPrimary pulls new entries from the primary and applies them locally.
+// Only valid for follower nodes; returns an error for primary and standalone nodes.
+func (s *Server) SyncFromPrimary(ctx context.Context) (replnet.ReplicaStatus, error) {
+	if s.replicator == nil {
+		return replnet.ReplicaStatus{}, fmt.Errorf("node: SyncFromPrimary called on non-follower node")
+	}
+	after := atomic.LoadUint64(&s.lastApplied)
+	entries, err := s.replicator.PullEntries(ctx, after, 0)
+	if err != nil {
+		return s.ReplicationStatus(), fmt.Errorf("node: pull from primary: %w", err)
+	}
+	if _, err := s.ApplyReplicationEntries(entries); err != nil {
+		return s.ReplicationStatus(), err
+	}
+	return s.ReplicationStatus(), nil
 }

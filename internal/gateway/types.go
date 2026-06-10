@@ -54,3 +54,11 @@ type Stats struct {
 	VirtualNodes int      `json:"virtual_nodes"`
 	Nodes        []string `json:"nodes"`
 }
+
+// ForwardResult holds the result of forwarding a single request to a node.
+type ForwardResult struct {
+	// Body is the decoded JSON response body (nil on error).
+	Body map[string]any
+	// Err is non-nil when the request or decoding failed.
+	Err error
+}

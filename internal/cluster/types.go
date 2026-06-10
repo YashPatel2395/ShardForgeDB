@@ -52,6 +52,18 @@ type Proxy struct {
 	Addr string `json:"addr"`
 }
 
+// Replication describes the optional replication role of a node.
+// All fields are omitted when replication is not configured.
+type Replication struct {
+	// Enabled indicates that this node participates in pull-based replication.
+	Enabled bool `json:"enabled"`
+	// Role is the node's replication role: "primary" or "follower".
+	// Empty means standalone (replication disabled).
+	Role string `json:"role,omitempty"`
+	// Primary is the ID of this node's primary (follower nodes only).
+	Primary string `json:"primary,omitempty"`
+}
+
 // Node describes one independent shardforge-node process.
 type Node struct {
 	// ID is a unique human-readable identifier (e.g. "node-1").
@@ -66,18 +78,35 @@ type Node struct {
 	// Weight controls how many virtual ring points this node receives relative to others.
 	// Normalized to 1 when <= 0.
 	Weight int `json:"weight,omitempty"`
+	// Replication describes the optional replication role of this node.
+	// Omitted when replication is not configured.
+	Replication Replication `json:"replication,omitempty"`
 }
 
 // Scope documents what this cluster config does and does not support.
-// All fields must be true in a valid config — they exist for honest self-documentation
-// and to prevent false scope claims.
+// These fields exist for honest self-documentation and to prevent false capability claims.
+//
+// For configs without any replication (all nodes standalone):
+//   - All fields including NoReplication must be true.
+//
+// For configs with explicit pull-based read replicas (any node has Replication.Enabled=true):
+//   - NoReplication must be omitted or false (replication IS present).
+//   - NoQuorumReplication must be true (quorum/automatic replication is not present).
+//   - All other fields (NoRaft, NoConsensus, NoFailover, etc.) must still be true.
 type Scope struct {
 	StaticConfigOnly    bool `json:"static_config_only"`
 	NoDynamicMembership bool `json:"no_dynamic_membership"`
 	NoDiscovery         bool `json:"no_discovery"`
 	NoConsensus         bool `json:"no_consensus"`
 	NoRaft              bool `json:"no_raft"`
-	NoReplication       bool `json:"no_replication"`
+	// NoReplication must be true for non-replication configs.
+	// For read-replica configs (any node has Replication.Enabled=true), this field
+	// must be omitted (false) and NoQuorumReplication must be true instead.
+	NoReplication bool `json:"no_replication"`
+	// NoQuorumReplication must be true for read-replica configs to assert that
+	// there is no quorum replication, no automatic failover election, and no Raft log.
+	// This field is not required for non-replication configs.
+	NoQuorumReplication bool `json:"no_quorum_replication,omitempty"`
 	NoFailover          bool `json:"no_failover"`
 	NoShardMigration    bool `json:"no_shard_migration"`
 	NoDistributedTxns   bool `json:"no_distributed_txns"`

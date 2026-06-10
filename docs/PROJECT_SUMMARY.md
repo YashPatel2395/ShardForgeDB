@@ -2,7 +2,7 @@
 
 ## Overview
 
-ShardForgeDB is a ground-up Go database engine built layer-by-layer to be fully explainable at every level of the stack. Every design decision, data structure, trade-off, and benchmark result is documented alongside the code. The project is structured as a sequence of seventeen numbered phases, each building on the previous and producing its own tests, benchmarks, and documentation.
+ShardForgeDB is a ground-up Go database engine built layer-by-layer to be fully explainable at every level of the stack. Every design decision, data structure, trade-off, and benchmark result is documented alongside the code. The project is structured as a sequence of eighteen numbered phases, each building on the previous and producing its own tests, benchmarks, and documentation.
 
 The goal is not to compete with production databases. The goal is to demonstrate deep understanding of database internals — how LSM trees actually work, what makes replication hard, why compaction matters, how to design a real networked node transport — through working code that is honest about what it is and what it is not.
 
@@ -17,11 +17,20 @@ Cluster Config (configs/*.json)   ← Phase 17 — static metadata
 HTTP Client
   │ HTTP/JSON
   ▼
-shardforge-proxy (internal/proxy, port 9200)   ← Phase 16
+shardforge-proxy (internal/proxy, port 9200/9210)   ← Phase 16/18
   │ client-side consistent-hash routing
   │ uses internal/gateway
+  │ GET /replication/status  (fan-out to all nodes)
+  │ POST /replication/sync-node/{id}  (forward to follower)
   ▼
-shardforge-node-{1,2,3} (internal/node, ports 9101–9103)  ← Phase 14
+shardforge-node-{primary,replica-1,replica-2} (internal/node)  ← Phase 14/18
+  │ primary: GET /replication/log  (pull-based replication source)
+  │ follower: POST /replication/sync  (explicit pull from primary)
+  │           POST /replication/apply  (manual entry application)
+  ▼
+replnet.Log (internal/replnet)   ← Phase 18 — in-memory mutation log
+  primary appends: PUT/DELETE → replnet.Log.Append
+  follower pulls:  GET /replication/log?after=<seq>
   │
   ▼
 Engine (key-value + vector)
@@ -36,11 +45,17 @@ Simulation Layers (single-process, no networking between database nodes)
   ├── Replica   — binary operation log, leader-commit semantics, follower pause/lag controls
   └── Dashboard — local HTTP observability, HTML + JSON endpoints, chaos scenario runner
 
-Docker Compose Demo (Phase 16/17)
+Docker Compose Demo (Phase 16/17 — 3-node sharded)
   ├── shardforge-node-1 — independent node, port 9101, /data/node-1
   ├── shardforge-node-2 — independent node, port 9102, /data/node-2
   ├── shardforge-node-3 — independent node, port 9103, /data/node-3
   └── shardforge-proxy  — stateless routing proxy (config from docker-3node-with-proxy.json), port 9200
+
+Docker Compose Demo (Phase 18 — 1-primary + 2-replica read replicas)
+  ├── shardforge-primary    — primary node, port 9111, explicit pull-based replication
+  ├── shardforge-replica-1  — follower, port 9112, pulls from primary on demand
+  ├── shardforge-replica-2  — follower, port 9113, pulls from primary on demand
+  └── shardforge-proxy      — proxy with /replication/status and /replication/sync-node, port 9210
 ```
 
 ---
@@ -66,6 +81,7 @@ Docker Compose Demo (Phase 16/17)
 | 15 | `internal/gateway` + `cmd/shardforge-gateway` | Client-side consistent-hash routing gateway, FNV-1a ring, weight support | 41 | 6 |
 | 16 | `internal/proxy` + `cmd/shardforge-proxy` | Stateless HTTP routing proxy, 10 endpoints, scope flags, Docker Compose integration | 45 | 7 |
 | 17 | `internal/cluster` + `cmd/shardforge-cluster` | Static cluster metadata, JSON config format, --config for gateway/proxy CLIs, 3 example configs | 47 | 4 |
+| 18 | `internal/replnet` + `internal/node` + `internal/proxy` | Networked read replicas v1: in-memory mutation log, explicit pull-based sync, 4 node replication endpoints, 2 proxy replication admin endpoints, Docker Compose replica demo | 55+ | 5 |
 
 ---
 
@@ -110,6 +126,7 @@ ShardForgeDB is honest about what it is and is not:
 - A local simulation of sharding, replication, and a chaos-testing dashboard
 - A real networked node runtime with HTTP/JSON API and Docker Compose multi-node demo
 - A stateless HTTP routing proxy that routes requests to independent nodes via consistent hashing
+- Networked read replicas: primary/follower roles, explicit pull-based sync, in-memory mutation log
 - A portfolio project designed to demonstrate deep database internals knowledge
 
 **What it is not:**
@@ -136,7 +153,8 @@ The design documents explicitly state these boundaries at every phase.
 - Built a real networked node runtime: independent `shardforge-node` processes, HTTP/JSON API, Docker Compose 3-node demo
 - Implemented a client-side routing gateway (`shardforge-gateway`) with deterministic consistent-hash routing, virtual nodes, weight support, and per-node health/flush/compact fanout
 - Implemented a stateless HTTP routing proxy (`shardforge-proxy`) that exposes one HTTP/JSON API and routes requests to independent nodes; includes scope flags, no-failover proof, and Docker Compose integration
-- 600+ tests across all packages, race-safe, with reproducible benchmark results documented at every phase
+- Implemented networked read replicas (`internal/replnet`): in-memory append-only mutation log with monotonic seq numbers, explicit pull-based follower sync, follower write rejection (403), 4 node endpoints + 2 proxy admin endpoints, Docker Compose 1-primary+2-replica demo
+- 650+ tests across all packages, race-safe, with reproducible benchmark results documented at every phase
 - Full documentation: DESIGN.md (architecture), PROOF.md (per-phase evidence), BENCHMARKS.md (reproducible numbers)
 
 ---
@@ -145,7 +163,7 @@ The design documents explicitly state these boundaries at every phase.
 
 If this were a real production system, the logical next steps would be:
 
-1. **Networked replication** — a leader node that replicates writes to follower nodes over the network
+1. **Automatic background replication** — background sync loop so followers stay up-to-date continuously
 2. **Raft consensus** — leader election, log replication, cluster membership changes
 3. **Cluster membership** — node discovery, join/leave protocols, gossip
 4. **ANN vector index** — HNSW or IVF for approximate nearest-neighbour at scale

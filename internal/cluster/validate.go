@@ -53,7 +53,15 @@ func Validate(cfg Config) error {
 		}
 	}
 
-	// Scope flags must all be true to prevent false capability claims.
+	// Validate replication config if any node has it enabled.
+	if err := validateReplication(cfg.Nodes); err != nil {
+		return err
+	}
+
+	// Determine whether any node has replication enabled.
+	replicationEnabled := hasReplicationEnabled(cfg.Nodes)
+
+	// Scope flags must be set honestly to prevent false capability claims.
 	s := cfg.Scope
 	if !s.StaticConfigOnly {
 		return fmt.Errorf("%w: scope.static_config_only must be true", ErrInvalidConfig)
@@ -70,9 +78,23 @@ func Validate(cfg Config) error {
 	if !s.NoRaft {
 		return fmt.Errorf("%w: scope.no_raft must be true", ErrInvalidConfig)
 	}
-	if !s.NoReplication {
-		return fmt.Errorf("%w: scope.no_replication must be true", ErrInvalidConfig)
+
+	if replicationEnabled {
+		// Replication is present: no_replication must be false (honest claim).
+		// no_quorum_replication must be true (no Raft log, no quorum, no automatic failover).
+		if s.NoReplication {
+			return fmt.Errorf("%w: scope.no_replication must be false when replication is enabled; use scope.no_quorum_replication=true instead", ErrInvalidConfig)
+		}
+		if !s.NoQuorumReplication {
+			return fmt.Errorf("%w: scope.no_quorum_replication must be true for read-replica configs (no Raft, no quorum, no automatic failover)", ErrInvalidConfig)
+		}
+	} else {
+		// No replication: no_replication must be true.
+		if !s.NoReplication {
+			return fmt.Errorf("%w: scope.no_replication must be true", ErrInvalidConfig)
+		}
 	}
+
 	if !s.NoFailover {
 		return fmt.Errorf("%w: scope.no_failover must be true", ErrInvalidConfig)
 	}
@@ -83,5 +105,67 @@ func Validate(cfg Config) error {
 		return fmt.Errorf("%w: scope.no_distributed_txns must be true", ErrInvalidConfig)
 	}
 
+	return nil
+}
+
+// hasReplicationEnabled returns true if any node in nodes has Replication.Enabled = true.
+func hasReplicationEnabled(nodes []Node) bool {
+	for _, n := range nodes {
+		if n.Replication.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+// validateReplication checks per-node replication config consistency.
+// It is a no-op when no nodes have Replication.Enabled = true.
+func validateReplication(nodes []Node) error {
+	var anyEnabled bool
+	for _, n := range nodes {
+		if n.Replication.Enabled {
+			anyEnabled = true
+			break
+		}
+	}
+	if !anyEnabled {
+		return nil
+	}
+
+	// Build an index of node IDs for reference validation.
+	nodeIDs := make(map[string]struct{}, len(nodes))
+	for _, n := range nodes {
+		nodeIDs[n.ID] = struct{}{}
+	}
+
+	var primaryCount int
+	for i, n := range nodes {
+		if !n.Replication.Enabled {
+			continue
+		}
+		switch n.Replication.Role {
+		case "primary":
+			primaryCount++
+		case "follower":
+			if n.Replication.Primary == "" {
+				return fmt.Errorf("%w: node[%d] (%q) is a follower but replication.primary is empty",
+					ErrInvalidConfig, i, n.ID)
+			}
+			if _, ok := nodeIDs[n.Replication.Primary]; !ok {
+				return fmt.Errorf("%w: node[%d] (%q) references unknown primary node %q",
+					ErrInvalidConfig, i, n.ID, n.Replication.Primary)
+			}
+		default:
+			return fmt.Errorf("%w: node[%d] (%q) has replication.enabled=true but unsupported role %q (want \"primary\" or \"follower\")",
+				ErrInvalidConfig, i, n.ID, n.Replication.Role)
+		}
+	}
+
+	if primaryCount == 0 {
+		return fmt.Errorf("%w: replication is enabled but no node has role \"primary\"", ErrInvalidConfig)
+	}
+	if primaryCount > 1 {
+		return fmt.Errorf("%w: multiple primaries are not supported (found %d)", ErrInvalidConfig, primaryCount)
+	}
 	return nil
 }

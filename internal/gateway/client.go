@@ -224,6 +224,57 @@ func (g *Gateway) Close() error {
 	return nil
 }
 
+// ForwardToAll sends method+path to every configured node concurrently
+// and returns a map of nodeID → ForwardResult.
+// body is encoded as JSON if non-nil.
+// Returns ErrClosed if the Gateway has been closed.
+func (g *Gateway) ForwardToAll(ctx context.Context, method, path string, body any) map[string]ForwardResult {
+	clients, err := g.allClients()
+	if err != nil {
+		result := make(map[string]ForwardResult, len(g.clients))
+		for id := range g.clients {
+			result[id] = ForwardResult{Err: err}
+		}
+		return result
+	}
+
+	type pair struct {
+		id  string
+		res ForwardResult
+	}
+	ch := make(chan pair, len(clients))
+	for id, c := range clients {
+		id, c := id, c
+		go func() {
+			respBody, callErr := c.Do(ctx, method, path, body)
+			ch <- pair{id: id, res: ForwardResult{Body: respBody, Err: callErr}}
+		}()
+	}
+	result := make(map[string]ForwardResult, len(clients))
+	for range clients {
+		p := <-ch
+		result[p.id] = p.res
+	}
+	return result
+}
+
+// ForwardToNode sends method+path to the named node.
+// Returns ErrUnknownNode if nodeID is not in the configured set.
+// Returns ErrClosed if the Gateway has been closed.
+func (g *Gateway) ForwardToNode(ctx context.Context, nodeID, method, path string, body any) (map[string]any, error) {
+	g.mu.Lock()
+	closed := g.closed
+	c, ok := g.clients[nodeID]
+	g.mu.Unlock()
+	if closed {
+		return nil, ErrClosed
+	}
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownNode, nodeID)
+	}
+	return c.Do(ctx, method, path, body)
+}
+
 // clientForKey selects the node.Client for key via the ring.
 func (g *Gateway) clientForKey(key []byte) (*node.Client, error) {
 	g.mu.Lock()

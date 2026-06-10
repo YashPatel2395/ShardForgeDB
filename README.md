@@ -2,12 +2,13 @@
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer with strict documentation, tests, and benchmarks at every phase.
 
-> **Phase 17 in review.** All sixteen prior phases are implemented and locked.
-> Phase 17 adds static cluster metadata (`internal/cluster`): a typed, validated,
-> file-based cluster configuration format used by gateway and proxy CLIs via `--config`.
+> **Phase 18 in review.** All seventeen prior phases are implemented and locked.
+> Phase 18 adds networked read replicas v1 (`internal/replnet`): in-memory mutation log,
+> explicit pull-based follower sync, follower write rejection (403), 4 node replication
+> endpoints, 2 proxy admin endpoints, Docker Compose 1-primary+2-replica demo.
 >
-> This is static metadata only. No dynamic membership. No node discovery. No gossip.
-> No Raft. No consensus. No leader election. The config is loaded once at startup.
+> This is explicit pull-based replication only. No automatic sync. No Raft. No consensus.
+> No automatic failover. No quorum. Followers sync on demand via `POST /replication/sync`.
 
 ---
 
@@ -396,7 +397,7 @@ make node-demo-down
 - [x] **Stateless routing only** — proxy holds no data; can be restarted at any time
 - [x] **No Raft, no consensus, no replication, no failover, no retry**
 
-**Phase 17 — Static Cluster Metadata** (branch: `phase-17-static-cluster-metadata`, in review)
+**Phase 17 — Static Cluster Metadata** (merged)
 
 - [x] `internal/cluster` — typed, validated, file-based cluster configuration
 - [x] `cmd/shardforge-cluster` — CLI utility: `validate`, `print`, `example-local-3node`
@@ -413,6 +414,24 @@ make node-demo-down
 - [x] **No Raft, no consensus, no leader election, no replication, no failover**
 - [x] **Config loaded once at startup** — no runtime cluster updates
 
+**Phase 18 — Networked Read Replicas v1** (branch: `phase-18-read-replicas-networked-v1`, in review)
+
+- [x] `internal/replnet` — new package: `Role`, `Operation`, `Entry`, `Log` (in-memory mutation log), `Replicator` (HTTP pull client)
+- [x] `internal/node` — primary/follower roles, `replLog` mutation log, `--replication-role`, `--primary-url` CLI flags
+- [x] Follower rejects `PUT`/`DELETE` with 403 ("follower: writes are not accepted; this node is a read replica")
+- [x] Primary appends to mutation log on every successful `PUT`/`DELETE`
+- [x] 4 new node endpoints: `GET /replication/status`, `GET /replication/log`, `POST /replication/apply`, `POST /replication/sync`
+- [x] `internal/proxy` — 2 new admin endpoints: `GET /replication/status` (fan-out), `POST /replication/sync-node/{nodeID}` (forward)
+- [x] `internal/gateway` — `ForwardToAll`, `ForwardToNode` methods; `ForwardResult` type
+- [x] `internal/cluster` — `Replication{Enabled, Role, Primary}` per-node config, replication validation in `Validate`
+- [x] `cmd/shardforge-cluster` — `example-read-replica-3node` command
+- [x] `configs/local-read-replica-3node.json`, `configs/docker-read-replica-3node.json`
+- [x] `deploy/docker-compose-replica.yml` — primary (9111) + replica-1 (9112) + replica-2 (9113) + proxy (9210)
+- [x] 55+ new tests; `bench-replnet` Makefile target
+- [x] **Explicit pull-based only** — no automatic background sync, no background goroutine
+- [x] **In-memory mutation log** — not persisted; engine WAL provides data durability
+- [x] **No Raft, no consensus, no quorum, no automatic failover, no strong consistency**
+
 ---
 
 ## Not Implemented
@@ -424,7 +443,7 @@ The following are **not** present in the current codebase and are not claimed:
 | Compaction | Background compaction, automatic thresholds, leveled compaction, size-tiered compaction |
 | Consensus | Raft, Paxos, full consensus, automatic leader election, fault-tolerant quorum |
 | Distribution | Distributed sharding across nodes, shard migration, resharding, distributed transactions |
-| Replication | Networked replication between nodes, quorum replication, network-based leader election |
+| Replication | Automatic background replication, quorum replication, network-based leader election, strong consistency guarantee |
 | Vector search | ANN, HNSW, IVF, approximate nearest-neighbour |
 | Monitoring | Production monitoring, real-time alerting, distributed tracing |
 | Dashboard | Networked node discovery, multi-host monitoring, production deployment |

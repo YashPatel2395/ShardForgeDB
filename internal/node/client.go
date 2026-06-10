@@ -122,6 +122,17 @@ func (c *Client) Compact(ctx context.Context) error {
 	return nil
 }
 
+// Do executes an HTTP request with optional JSON body and decodes the response into a
+// map[string]any. Useful for proxy-forwarding when the exact response shape is unknown.
+// Returns an error for non-2xx status codes.
+func (c *Client) Do(ctx context.Context, method, path string, body any) (map[string]any, error) {
+	var out map[string]any
+	if err := c.doJSON(ctx, method, path, body, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // doJSON executes an HTTP request with optional JSON body and decodes the JSON response into out.
 // It returns clear errors for: node unavailable, timeout, invalid status code, invalid JSON,
 // server-side error responses.

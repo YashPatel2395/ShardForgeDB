@@ -16,7 +16,7 @@ CLUSTER_CMD      := ./cmd/shardforge-cluster
 GO               := go
 GOFLAGS          :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-report dashboard node node-demo node-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example smoke demo release-check help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-replnet bench-report dashboard node node-demo node-demo-down replica-demo replica-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example replica-config-demo replica-status-demo smoke demo release-check help
 
 all: fmt vet build
 
@@ -91,6 +91,10 @@ bench-proxy:
 bench-cluster:
 	$(GO) test -bench=. -benchmem ./internal/cluster/...
 
+## bench-replnet: run Go benchmarks for the replnet package only
+bench-replnet:
+	$(GO) test -bench=. -benchmem ./internal/replnet/...
+
 ## dashboard: run the local dashboard in demo mode
 dashboard:
 	$(GO) run $(DASHBOARD_CMD) --demo
@@ -135,6 +139,10 @@ cluster-help:
 cluster-example:
 	./bin/shardforge-cluster example-local-3node
 
+## cluster-example-replica: print a 3-node read-replica example config to stdout
+cluster-example-replica:
+	./bin/shardforge-cluster example-read-replica-3node
+
 ## node: run shardforge-node locally (node-1 on 127.0.0.1:9101)
 node:
 	$(GO) run $(NODE_CMD) --node-id node-1 --addr 127.0.0.1:9101 --data-dir /tmp/shardforge-node-1
@@ -146,6 +154,22 @@ node-demo:
 ## node-demo-down: tear down Docker Compose demo and remove volumes
 node-demo-down:
 	docker compose -f deploy/docker-compose.yml down -v
+
+## replica-demo: start 1-primary + 2-replica + proxy Docker Compose demo
+replica-demo:
+	docker compose -f deploy/docker-compose-replica.yml up --build
+
+## replica-demo-down: tear down replica Docker Compose demo and remove volumes
+replica-demo-down:
+	docker compose -f deploy/docker-compose-replica.yml down -v
+
+## replica-config-demo: print the read-replica 3-node example config to stdout
+replica-config-demo:
+	./bin/shardforge-cluster example-read-replica-3node
+
+## replica-status-demo: show replication status from all nodes via the proxy (requires replica-demo running)
+replica-status-demo:
+	curl -s http://127.0.0.1:9210/replication/status
 
 ## smoke: fast smoke validation (test + vet + build + CLI checks)
 smoke:

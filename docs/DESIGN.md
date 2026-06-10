@@ -1642,3 +1642,68 @@ The config is static. If nodes change, the config file is updated and the proces
 - No distributed cluster management.
 - No production cluster manager.
 - Config-driven gateway/proxy startup is the only integration point.
+
+---
+
+## Phase 18 — Networked Read Replicas v1 (`internal/replnet`)
+
+**Phase 18 — Implemented** in `internal/replnet`, `internal/node`, `internal/proxy`.
+
+### Purpose
+
+Phase 18 adds the first real networked replication: a primary node that maintains an in-memory mutation log, and follower nodes that explicitly pull entries from the primary and apply them locally. This is pull-based, explicit, non-automatic replication.
+
+**Scope:**
+- Primary manually configured via `--replication-role=primary`.
+- Follower sync is explicit (manual): `POST /replication/sync` or via proxy `POST /replication/sync-node/{nodeID}`.
+- No automatic background sync loop. No automatic failover. No Raft. No consensus. No quorum.
+- Replication log is in-memory only (not persisted; cleared on restart). Engine data is durable via WAL.
+- Followers reject client `PUT`/`DELETE` with HTTP 403.
+
+### Replication Architecture
+
+```
+Primary Node (port 9111)
+  ├── PUT/DELETE → replnet.Log.Append → in-memory entries [{Seq:1,Op:put,Key:k,Value:v}, ...]
+  ├── GET /replication/log?after=<seq>&limit=<n>  → returns entries as JSON
+  └── GET /replication/status  → {role:"primary", last_local_seq:N}
+
+Follower Node (port 9112)
+  ├── GET/SCAN allowed — serves local engine reads
+  ├── PUT/DELETE → 403 Forbidden ("follower: writes are not accepted; this node is a read replica")
+  ├── POST /replication/sync
+  │     → calls primary GET /replication/log?after=lastAppliedSeq
+  │     → applies entries to local engine
+  │     → updates lastAppliedSeq
+  └── GET /replication/status  → {role:"follower", last_applied_seq:N, primary_base_url:"..."}
+
+Proxy (port 9210)
+  ├── GET /replication/status  → fan-out to all nodes, aggregate results
+  └── POST /replication/sync-node/{nodeID}  → forward to that node's POST /replication/sync
+```
+
+### Mutation Log (`replnet.Log`)
+
+- Append-only, goroutine-safe in-memory log.
+- Entries assigned monotonically increasing `uint64` sequence numbers starting at 1.
+- `Append(op, key, value)` → assigns next seq, records timestamp (UTC), returns Entry.
+- `EntriesAfter(after, limit)` → returns entries with Seq > after in ascending order, up to limit.
+- `Stats()` → returns `{Count: N, LastSeq: N}`.
+- Not persisted to disk. Cleared on restart. Engine WAL provides durability for the actual data.
+
+### Sequence Number Protocol
+
+- Follower tracks `lastAppliedSeq` (atomic uint64).
+- Sync: pull entries with `Seq > lastAppliedSeq` from primary.
+- Apply: entries must be in strict sequential order (`Seq == lastApplied+1`).
+- Already-applied entries (`Seq <= lastApplied`) are safely skipped.
+- Out-of-order gaps return `replnet.ErrInvalidEntry`.
+
+### Scope Honesty
+
+- No strong consistency. Replication lag is expected.
+- No automatic failover. If the primary is down, followers cannot elect a new primary.
+- No multi-primary. Exactly one node may have `replication.role = "primary"` per config.
+- Replication log is in-memory. It is cleared on primary restart.
+- Followers are read-only for client operations but can have their engine written via `/replication/apply`.
+- The cluster config `scope.no_replication: true` is preserved — it refers to *automatic* background replication at the cluster layer, which this phase does not implement.

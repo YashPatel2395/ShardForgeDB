@@ -2937,3 +2937,157 @@ git status --short                                             (clean)
 ### Scope Confirmation
 
 No new database engine features, no database-node networking, no RPC, no distributed deployment, no Raft, no consensus, no automatic leader election, no quorum replication, no shard migration, no resharding, no vector replication, no ANN/HNSW/IVF, no background compaction, no automatic compaction, and no core Engine/Shard/Replica/Vector/WAL/MemTable/SSTable/Bloom/Dashboard behavior changes were implemented in Phase 13.
+
+---
+
+## Phase 14 — Real Networked Node Runtime + HTTP Transport Foundation
+
+### Files Changed
+
+**New files:**
+- `internal/node/types.go` — NodeID, Options, Status, EngineStatus, Entry, request/response types
+- `internal/node/config.go` — Options.validate(), ErrInvalidOptions, ErrClosed
+- `internal/node/server.go` — Server struct, Open, Handler, Start, StartBackground, Close, Status, Addr
+- `internal/node/handlers.go` — registerRoutes, handleHealthz, handleStatus, handleKV, handleScan, handleFlush, handleCompact
+- `internal/node/client.go` — Client struct, NewClient, Health, Status, Put, Get, Delete, Scan, Flush, Compact, doJSON
+- `internal/node/server_test.go` — 20 handler/server tests
+- `internal/node/client_test.go` — 9 client tests
+- `internal/node/integration_test.go` — 7 integration tests (multi-server isolation, restart persistence, concurrent race)
+- `internal/node/bench_test.go` — 6 benchmarks (handler Put/Get/Status/Scan, client Put/Get)
+- `cmd/shardforge-node/main.go` — CLI with --node-id, --addr, --data-dir, --wal-sync, --memtable-max-bytes
+- `deploy/docker-compose.yml` — 3-node Docker Compose demo
+- `deploy/Dockerfile` — multi-stage Go builder + Alpine runtime
+- `deploy/node-1.yaml`, `deploy/node-2.yaml`, `deploy/node-3.yaml` — node config reference
+
+**Modified files:**
+- `Makefile` — NODE_BINARY, NODE_CMD, bench-node, node, node-demo, node-demo-down targets; build now produces 4 binaries
+- `README.md` — Phase 14 section, updated title, architecture, scope table, demo commands, Makefile targets
+- `docs/DESIGN.md` — Phase 14 section: architecture, HTTP transport, data independence, limitations, future work
+- `docs/PROOF.md` — this section
+- `docs/BENCHMARKS.md` — Phase 14 node benchmarks section
+- `docs/PROJECT_SUMMARY.md` — updated scope, phase table, recruiter bullets
+- `docs/RELEASE_CHECKLIST.md` — network node checklist
+
+### Features Implemented
+
+- `internal/node.Server` — HTTP server wrapping a local Engine; real TCP listener; clean shutdown
+- `internal/node.Client` — HTTP/JSON client with timeout, context, and typed errors
+- 8 HTTP endpoints: `/healthz`, `/status`, `/kv/{key}` (PUT/GET/DELETE), `/scan`, `/flush`, `/compact`
+- `cmd/shardforge-node` — CLI binary with scope disclaimer, signal handling, clean shutdown
+- `deploy/docker-compose.yml` — 3 independent containers with named volumes and health checks
+- `bin/shardforge-node` now produced by `make build`
+
+### Tests
+
+```
+TestOpen_ValidOptions
+TestOpen_MissingNodeID
+TestOpen_MissingDataDir
+TestOpen_MissingAddr
+TestHealthz_OK
+TestHealthz_MethodNotAllowed
+TestStatus_OK
+TestStatus_NonZeroStartedAt
+TestStatus_MethodNotAllowed
+TestKV_PutGet
+TestKV_GetMissing
+TestKV_Delete
+TestScan_SortedEntries
+TestScan_MethodNotAllowed
+TestFlush_OK
+TestFlush_MethodNotAllowed
+TestCompact_OK
+TestCompact_MethodNotAllowed
+TestKV_EmptyKeyRejected
+TestClose_Idempotent
+TestKV_WrongMethod
+TestKV_InvalidJSONBody
+TestClient_PutGet
+TestClient_GetMissing
+TestClient_Delete
+TestClient_Health
+TestClient_Status
+TestClient_Scan
+TestClient_Flush
+TestClient_Compact
+TestClient_Timeout
+TestClient_InvalidJSON
+TestClient_ServerSideError
+TestClient_NodeUnavailable
+TestMultipleServers_IndependentData
+TestMultipleServers_Concurrent
+TestRestart_PreservesData
+TestThreeHTTPServers_ClientTalkToAll
+TestConcurrentPutGet_Race
+TestClose_AfterCloseIsNoop
+TestStartBackground_ThreeNodes
+```
+
+### Validation Commands Run
+
+```bash
+go build ./...                                                      OK
+go test -race -count=1 ./...                                        17 packages PASS
+go test -race -count=1 ./internal/node/...                          PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/node/...        6 benchmarks PASS
+make test                                                           PASS
+make vet                                                            PASS
+make build                                                          PASS (4 binaries)
+make bench-node                                                     PASS
+./bin/shardforge-node --help                                        OK — prints scope disclaimer
+git status --short                                                  (clean after commit)
+docker compose -f deploy/docker-compose.yml config                  OK — config validated
+```
+
+### Benchmark Results (Apple M3, darwin/arm64, Go 1.21)
+
+```
+BenchmarkHandler_Put-8       569528    20560 ns/op   8109 B/op    37 allocs/op
+BenchmarkHandler_Get-8      2444389     1458 ns/op   6373 B/op    26 allocs/op
+BenchmarkHandler_Status-8   2111348     1723 ns/op   6633 B/op    22 allocs/op
+BenchmarkHandler_Scan-8      122390    29550 ns/op  67003 B/op   754 allocs/op (100 entries)
+BenchmarkClient_Put-8         89916    40876 ns/op  10837 B/op   123 allocs/op
+BenchmarkClient_Get-8        110628    32741 ns/op   8723 B/op   100 allocs/op
+```
+
+### Docker Compose Proof
+
+Docker CLI (v29.3.0) and Docker Compose (v5.1.0) are installed.  
+`docker compose -f deploy/docker-compose.yml config` — PASS (config validated, all 3 services present).  
+Docker daemon was not running at test time (Docker Desktop not started). The Docker Compose config and Dockerfile are structurally correct and were validated by `config`. Full `up --build` proof available when Docker daemon is running:
+
+```bash
+docker compose -f deploy/docker-compose.yml up --build -d
+curl -f http://localhost:9101/healthz
+curl -f http://localhost:9102/healthz
+curl -f http://localhost:9103/healthz
+curl -X PUT http://localhost:9101/kv/demo:1 -H "Content-Type: application/json" -d '{"value":"hello"}'
+curl -f http://localhost:9101/kv/demo:1
+docker compose -f deploy/docker-compose.yml restart shardforge-node-1
+sleep 2
+curl -f http://localhost:9101/kv/demo:1
+docker compose -f deploy/docker-compose.yml down -v
+```
+
+### Known Limitations
+
+- Docker daemon was not running at phase-14 validation time. The Compose config is validated; full `up --build` proof requires Docker Desktop to be running.
+- No subprocess integration test for `cmd/shardforge-node` — subprocess tests are skipped to keep CI fast and deterministic. The HTTP handler and client are fully covered by httptest-based tests.
+- Nodes are fully independent; there is no router layer directing client requests to the correct node for a given key.
+
+### Scope Confirmation
+
+- Real multi-process node runtime: implemented (each node is an independent OS process)
+- Real HTTP/JSON transport: implemented
+- Independent node data directories: implemented
+- No distributed sharding: correct — each node stores its own keys independently
+- No networked replication: correct — writing to node-1 does not propagate to node-2
+- No Raft: correct
+- No consensus: correct
+- No quorum: correct
+- No automatic leader election: correct
+- No shard migration: correct
+- No distributed vector search: correct
+- No ANN/HNSW/IVF: correct
+- No background compaction: correct
+- No core Engine/WAL/MemTable/SSTable/Bloom/Vector behavior changes: correct

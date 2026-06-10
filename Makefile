@@ -1,23 +1,26 @@
 BINARY           := shardforge
 BENCH_BINARY     := shardforge-bench
 DASHBOARD_BINARY := shardforge-dashboard
+NODE_BINARY      := shardforge-node
 BUILD_DIR        := bin
 CMD              := ./cmd/shardforge
 BENCH_CMD        := ./cmd/shardforge-bench
 DASHBOARD_CMD    := ./cmd/shardforge-dashboard
+NODE_CMD         := ./cmd/shardforge-node
 GO               := go
 GOFLAGS          :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-report dashboard smoke demo release-check help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-report dashboard node node-demo node-demo-down smoke demo release-check help
 
 all: fmt vet build
 
-## build: compile the shardforge, shardforge-bench, and shardforge-dashboard binaries into bin/
+## build: compile shardforge, shardforge-bench, shardforge-dashboard, and shardforge-node into bin/
 build:
 	@mkdir -p $(BUILD_DIR)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY) $(CMD)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BENCH_BINARY) $(BENCH_CMD)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(DASHBOARD_BINARY) $(DASHBOARD_CMD)
+	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(NODE_BINARY) $(NODE_CMD)
 
 ## test: run all tests with race detection
 test:
@@ -63,6 +66,10 @@ bench-replica:
 bench-dashboard:
 	$(GO) test -bench=. -benchmem ./internal/dashboard/...
 
+## bench-node: run Go benchmarks for the node package only
+bench-node:
+	$(GO) test -bench=. -benchmem ./internal/node/...
+
 ## dashboard: run the local dashboard in demo mode
 dashboard:
 	$(GO) run $(DASHBOARD_CMD) --demo
@@ -70,6 +77,18 @@ dashboard:
 ## bench-report: run the workload benchmark suite (small scale) and write docs/BENCHMARKS.md
 bench-report:
 	$(GO) run $(BENCH_CMD) --scale small --out docs/BENCHMARKS.md
+
+## node: run shardforge-node locally (node-1 on 127.0.0.1:9101)
+node:
+	$(GO) run $(NODE_CMD) --node-id node-1 --addr 127.0.0.1:9101 --data-dir /tmp/shardforge-node-1
+
+## node-demo: start 3-node Docker Compose demo
+node-demo:
+	docker compose -f deploy/docker-compose.yml up --build
+
+## node-demo-down: tear down Docker Compose demo and remove volumes
+node-demo-down:
+	docker compose -f deploy/docker-compose.yml down -v
 
 ## smoke: fast smoke validation (test + vet + build + CLI checks)
 smoke:

@@ -1,12 +1,13 @@
-# ShardForgeDB
+# ShardForgeDB — Explainable Go Database Engine with Networked Node Runtime
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer with strict documentation, tests, and benchmarks at every phase.
 
-> **Phase 13 in review.** All twelve prior phases are implemented and locked.
-> Phase 13 is final polish, release hardening, docs consistency, and scriptability — no new engine features.
+> **Phase 14 in review.** All thirteen prior phases are implemented and locked.
+> Phase 14 adds a real networked node runtime: independent `shardforge-node` processes, HTTP/JSON transport, and a Docker Compose 3-node demo.
 >
-> No background compaction, no database-node networking, no RPC, no distributed cluster, no Raft, no consensus.
-> The Phase 12 dashboard is a **local HTTP server only** — it does not implement networking between database nodes.
+> This is NOT Raft, NOT consensus, NOT quorum replication, NOT distributed sharding.
+> Each node is an independent networked key-value store — the foundation for future distributed features.
+> No background compaction, no automatic leader election, no shard migration.
 
 ---
 
@@ -21,6 +22,7 @@ Built to demonstrate:
 - **Local key-value sharding** — FNV-1a consistent-hash ring across multiple in-process Engine instances
 - **Local replication simulation** — leader/follower operation log, pause/lag/catch-up controls
 - **Local HTTP dashboard and chaos scenarios** — observable stats, HTML view, deterministic failure scenarios
+- **Real networked node runtime** — independent `shardforge-node` processes, HTTP/JSON API, Docker Compose 3-node demo
 - **Strict test/benchmark/docs discipline** — race-safe tests, reproducible benchmarks, honest scope docs
 
 ---
@@ -31,18 +33,22 @@ Sharding, replication, and the dashboard are **local in-process simulations** �
 
 | Feature | What is implemented | What is NOT implemented |
 |---------|--------------------|-----------------------|
-| Sharding | FNV-1a hash ring over local Engine instances, single process | Networked cluster, RPC, shard migration |
+| Sharding | FNV-1a hash ring over local Engine instances, single process | Networked cluster, shard migration, distributed routing |
 | Replication | Leader/follower log, pause/lag simulation, single process | Raft, consensus, automatic leader election, quorum, fault tolerance |
 | Dashboard | Local HTTP server (`127.0.0.1:8080`), chaos scenarios via replica API | Real distributed monitoring, networked node discovery |
 | Vector search | Exact brute-force k-NN, cosine/L2/dot | ANN, HNSW, IVF, approximate search |
 | Compaction | Manual full compaction (`Compact()`) | Background compaction, automatic thresholds, leveled/size-tiered |
+| Node runtime | Real independent `shardforge-node` processes, HTTP/JSON API, Docker Compose demo | Distributed sharding across nodes, networked replication, Raft, consensus |
 
 ---
 
 ## Architecture
 
 ```
-Client
+HTTP Client / shardforge-node CLI
+  │ HTTP/JSON (real network transport, Phase 14)
+  ▼
+Node Server (internal/node)
   │
   ▼
 Engine (key-value + vector)
@@ -52,10 +58,17 @@ Engine (key-value + vector)
   ├── Bloom    — deterministic probabilistic membership filters
   └── Vector   — exact k-nearest-neighbour index (cosine / L2 / dot)
 
-Simulation Layers (all single-process, no networking)
+Simulation Layers (all single-process, no networking between database nodes)
   ├── Shard    — consistent-hash routing over multiple local Engines
   ├── Replica  — leader/follower operation log with pause/lag/catch-up
   └── Dashboard — local HTTP observability + deterministic chaos scenarios
+
+Docker Compose Demo (Phase 14)
+  ├── shardforge-node-1 (port 9101, /data/node-1)
+  ├── shardforge-node-2 (port 9102, /data/node-2)
+  └── shardforge-node-3 (port 9103, /data/node-3)
+  — 3 independent nodes, each with its own Engine directory
+  — NOT distributed sharding, NOT Raft, NOT consensus
 ```
 
 Implemented components are tracked in the phase list below.
@@ -65,7 +78,7 @@ Implemented components are tracked in the phase list below.
 ## Quickstart
 
 ```bash
-# Build all three binaries
+# Build all four binaries (includes shardforge-node)
 make build
 
 # Run all tests (race detector on)
@@ -79,6 +92,12 @@ make bench-report
 
 # Run the local dashboard demo with chaos scenarios
 ./bin/shardforge-dashboard --demo --run-chaos
+
+# Start a single networked node
+./bin/shardforge-node --node-id node-1 --addr 127.0.0.1:9101 --data-dir /tmp/node-1
+
+# Start 3-node Docker Compose demo
+make node-demo
 
 # Fast smoke validation
 ./scripts/smoke.sh
@@ -100,6 +119,26 @@ make bench-report
 ./bin/shardforge-dashboard --demo
 ./bin/shardforge-dashboard --demo --run-chaos
 ./bin/shardforge-dashboard --addr 127.0.0.1:9090 --demo
+
+# Node runtime demo (single node)
+./bin/shardforge-node --help
+./bin/shardforge-node --node-id node-1 --addr 127.0.0.1:9101 --data-dir /tmp/shardforge-node-1
+
+# Node HTTP API (while node is running)
+curl http://127.0.0.1:9101/healthz
+curl http://127.0.0.1:9101/status
+curl -X PUT http://127.0.0.1:9101/kv/user:1 -H "Content-Type: application/json" -d '{"value":"alice"}'
+curl http://127.0.0.1:9101/kv/user:1
+curl "http://127.0.0.1:9101/scan?start=user:&end=user:~"
+curl -X POST http://127.0.0.1:9101/flush
+curl -X POST http://127.0.0.1:9101/compact
+
+# 3-node Docker Compose demo
+make node-demo
+curl http://localhost:9101/healthz
+curl http://localhost:9102/healthz
+curl http://localhost:9103/healthz
+make node-demo-down
 ```
 
 ---
@@ -266,7 +305,7 @@ make bench-report
 - [x] 52 tests, 8 benchmarks in `internal/dashboard`
 - [x] **Local only** — no database-node networking, no RPC, no Raft, no consensus, no distributed cluster
 
-**Phase 13 — Final Polish + Release Hardening** (branch: `phase-13-polish-release`, in review)
+**Phase 13 — Final Polish + Release Hardening** ✓ locked
 
 - [x] Docs consistency pass across all phases
 - [x] README: full rewrite with portfolio pitch, quickstart, scope section, demo commands
@@ -275,6 +314,21 @@ make bench-report
 - [x] Project summary: `docs/PROJECT_SUMMARY.md`
 - [x] Makefile targets: `smoke`, `demo`, `release-check`
 - [x] **No new engine features** — polish, docs, scripts, and release hardening only
+
+**Phase 14 — Real Networked Node Runtime + HTTP Transport Foundation** (branch: `phase-14-network-node-transport`, in review)
+
+- [x] `internal/node` — real networked database node package
+- [x] `cmd/shardforge-node` — CLI binary for independent node processes
+- [x] `deploy/docker-compose.yml` + `deploy/Dockerfile` — 3-node Docker Compose demo
+- [x] HTTP/JSON API: `GET /healthz`, `GET /status`, `PUT/GET/DELETE /kv/{key}`, `GET /scan`, `POST /flush`, `POST /compact`
+- [x] `node.Client` — HTTP/JSON network client with timeout and error handling
+- [x] `node.Server` — HTTP server wrapping a local Engine; each node has its own `DataDir`
+- [x] 25+ tests: handler tests, client tests, multi-server isolation, restart persistence, race tests
+- [x] 6 benchmarks: handler Put/Get/Status/Scan, Client Put/Get via httptest
+- [x] Makefile targets: `node`, `node-demo`, `node-demo-down`, `bench-node`
+- [x] `bin/shardforge-node` added to `make build`
+- [x] **NOT Raft, NOT consensus, NOT quorum replication, NOT distributed sharding, NOT automatic leader election**
+- [x] **Each node is independent** — no shared state, no cluster coordination, no shard migration
 
 ---
 
@@ -285,25 +339,27 @@ The following are **not** present in the current codebase and are not claimed:
 | Category | Not implemented |
 |----------|----------------|
 | Compaction | Background compaction, automatic thresholds, leveled compaction, size-tiered compaction |
-| Networking | Database-node networking, RPC, distributed deployment, cluster membership |
 | Consensus | Raft, Paxos, full consensus, automatic leader election, fault-tolerant quorum |
-| Distribution | Shard migration, resharding, distributed transactions, vector replication |
+| Distribution | Distributed sharding across nodes, shard migration, resharding, distributed transactions |
+| Replication | Networked replication between nodes, quorum replication, network-based leader election |
 | Vector search | ANN, HNSW, IVF, approximate nearest-neighbour |
 | Monitoring | Production monitoring, real-time alerting, distributed tracing |
 | Dashboard | Networked node discovery, multi-host monitoring, production deployment |
+| Node routing | Automatic request routing to correct shard node, cluster-level load balancing |
 
 ---
 
 ## Build and Run
 
 ```bash
-# Build all three binaries into bin/
+# Build all four binaries into bin/
 make build
 
 # Individual binaries
 go build -o bin/shardforge ./cmd/shardforge
 go build -o bin/shardforge-bench ./cmd/shardforge-bench
 go build -o bin/shardforge-dashboard ./cmd/shardforge-dashboard
+go build -o bin/shardforge-node ./cmd/shardforge-node
 ```
 
 ## Test and Benchmark
@@ -342,13 +398,17 @@ make bench-replica
 make bench-vector
 make bench-shard
 make bench-dashboard
-make bench-report  # generate docs/BENCHMARKS.md (small scale)
-make dashboard     # run shardforge-dashboard --demo
-make smoke         # ./scripts/smoke.sh
-make demo          # ./scripts/demo.sh
-make release-check # ./scripts/release_check.sh
-make clean         # remove bin/
-make help          # list all targets
+make bench-node        # node package Go benchmarks
+make bench-report      # generate docs/BENCHMARKS.md (small scale)
+make dashboard         # run shardforge-dashboard --demo
+make node              # run shardforge-node (node-1, 127.0.0.1:9101)
+make node-demo         # docker compose up --build (3-node demo)
+make node-demo-down    # docker compose down -v
+make smoke             # ./scripts/smoke.sh
+make demo              # ./scripts/demo.sh
+make release-check     # ./scripts/release_check.sh
+make clean             # remove bin/
+make help              # list all targets
 ```
 
 ---

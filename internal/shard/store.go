@@ -101,9 +101,16 @@ type shardHandle struct {
 
 // Store is a sharded key-value store backed by multiple local Engine instances.
 //
-// All public methods are safe for concurrent use. The sharding layer holds
-// a read lock only to check the closed flag and access the immutable shard
-// slice; each Engine handles its own internal synchronisation.
+// All public methods are safe for concurrent use.
+//
+// # Locking model
+//
+// s.mu is a reader-writer lock that guards the closed flag and shard engines.
+// Every public operation that calls a shard Engine holds s.mu.RLock() for the
+// entire duration of the Engine call. Close holds s.mu.Lock() while closing
+// all engines. This prevents Close from running concurrently with any in-flight
+// Engine call: either the operation finishes before Close acquires the write lock,
+// or Close finishes first and the operation sees s.closed == true.
 //
 // Directory layout:
 //
@@ -224,56 +231,58 @@ func Open(opts Options) (*Store, error) {
 
 // Put writes key→value to the shard responsible for key.
 // Empty key returns ErrInvalidKey.
+//
+// s.mu.RLock is held across the underlying Engine.Put call to prevent Close
+// from running concurrently.
 func (s *Store) Put(key, value []byte) error {
 	if len(key) == 0 {
 		return ErrInvalidKey
 	}
-	s.mu.RLock()
-	if s.closed {
-		s.mu.RUnlock()
-		return ErrClosed
-	}
-	eng := s.shards[s.ring.shardIndex(key)].engine
-	s.mu.RUnlock()
-
-	// Defensive copy so the caller may reuse its buffer after Put returns.
+	// Defensive copy before acquiring any lock so the caller may reuse its
+	// buffer freely regardless of lock contention.
 	val := make([]byte, len(value))
 	copy(val, value)
-	return eng.Put(key, val)
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return ErrClosed
+	}
+	return s.shards[s.ring.shardIndex(key)].engine.Put(key, val)
 }
 
 // Delete removes key from the shard responsible for it.
 // Deleting a missing key is a no-op and returns nil.
 // Empty key returns ErrInvalidKey.
+//
+// s.mu.RLock is held across the underlying Engine.Delete call.
 func (s *Store) Delete(key []byte) error {
 	if len(key) == 0 {
 		return ErrInvalidKey
 	}
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.closed {
-		s.mu.RUnlock()
 		return ErrClosed
 	}
-	eng := s.shards[s.ring.shardIndex(key)].engine
-	s.mu.RUnlock()
-	return eng.Delete(key)
+	return s.shards[s.ring.shardIndex(key)].engine.Delete(key)
 }
 
 // Get retrieves the value for key from the shard responsible for it.
 // Returns (nil, false, nil) if the key does not exist.
 // Empty key returns ErrInvalidKey.
+//
+// s.mu.RLock is held across the underlying Engine.Get call.
 func (s *Store) Get(key []byte) ([]byte, bool, error) {
 	if len(key) == 0 {
 		return nil, false, ErrInvalidKey
 	}
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.closed {
-		s.mu.RUnlock()
 		return nil, false, ErrClosed
 	}
-	eng := s.shards[s.ring.shardIndex(key)].engine
-	s.mu.RUnlock()
-	return eng.Get(key)
+	return s.shards[s.ring.shardIndex(key)].engine.Get(key)
 }
 
 // Scan fans out to all shards and returns all live entries where
@@ -281,39 +290,44 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 // If start is nil, scanning begins at the first key.
 // If end is nil, scanning continues to the last key.
 // Duplicate keys (e.g. injected by tests) are resolved by highest Seq.
+//
+// s.mu.RLock is held across all Engine.Scan calls. The lock is released
+// before the in-memory merge and sort.
 func (s *Store) Scan(start, end []byte) ([]Entry, error) {
 	s.mu.RLock()
 	if s.closed {
 		s.mu.RUnlock()
 		return nil, ErrClosed
 	}
-	shards := s.shards // header copy; elements are stable pointers
-	s.mu.RUnlock()
 
-	// Merge results across shards; resolve duplicates by highest Seq.
+	// Fan out to all shard engines while holding the read lock so Close cannot
+	// run concurrently and close engines mid-scan.
+	// engine.Scan returns defensive copies so it is safe to use the entries
+	// after releasing the lock.
+	var allRaw []engine.Entry
+	for _, sh := range s.shards {
+		entries, err := sh.engine.Scan(start, end)
+		if err != nil {
+			s.mu.RUnlock()
+			return nil, fmt.Errorf("shard: scan shard %q: %w", sh.info.Name, err)
+		}
+		allRaw = append(allRaw, entries...)
+	}
+	s.mu.RUnlock() // release before the pure in-memory merge and sort
+
+	// Merge by highest Seq; resolve duplicate keys.
 	type candidate struct {
 		seq   uint64
 		value []byte
 		key   []byte
 	}
-	best := make(map[string]*candidate)
-
-	for _, sh := range shards {
-		entries, err := sh.engine.Scan(start, end)
-		if err != nil {
-			return nil, fmt.Errorf("shard: scan shard %q: %w", sh.info.Name, err)
+	best := make(map[string]*candidate, len(allRaw))
+	for _, e := range allRaw {
+		ks := string(e.Key)
+		if c, ok := best[ks]; ok && e.Seq <= c.seq {
+			continue
 		}
-		for _, e := range entries {
-			ks := string(e.Key)
-			if c, ok := best[ks]; ok && e.Seq <= c.seq {
-				continue
-			}
-			val := make([]byte, len(e.Value))
-			copy(val, e.Value)
-			k := make([]byte, len(e.Key))
-			copy(k, e.Key)
-			best[ks] = &candidate{seq: e.Seq, value: val, key: k}
-		}
+		best[ks] = &candidate{seq: e.Seq, value: e.Value, key: e.Key}
 	}
 
 	result := make([]Entry, 0, len(best))
@@ -333,27 +347,24 @@ func (s *Store) ShardForKey(key []byte) (ShardInfo, error) {
 		return ShardInfo{}, ErrInvalidKey
 	}
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.closed {
-		s.mu.RUnlock()
 		return ShardInfo{}, ErrClosed
 	}
-	info := s.shards[s.ring.shardIndex(key)].info
-	s.mu.RUnlock()
-	return info, nil
+	return s.shards[s.ring.shardIndex(key)].info, nil
 }
 
 // Flush flushes the MemTable of every shard to disk.
-// Returns a wrapped error on first shard failure (other shards continue).
+// Returns a wrapped error on first shard failure.
+//
+// s.mu.RLock is held across all Engine.Flush calls.
 func (s *Store) Flush() error {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.closed {
-		s.mu.RUnlock()
 		return ErrClosed
 	}
-	shards := s.shards
-	s.mu.RUnlock()
-
-	for _, sh := range shards {
+	for _, sh := range s.shards {
 		if err := sh.engine.Flush(); err != nil {
 			return fmt.Errorf("shard: flush shard %d (%s): %w",
 				sh.info.ID, sh.info.Name, err)
@@ -363,17 +374,16 @@ func (s *Store) Flush() error {
 }
 
 // Compact runs full compaction on every shard.
-// Returns a wrapped error on first shard failure (other shards continue).
+// Returns a wrapped error on first shard failure.
+//
+// s.mu.RLock is held across all Engine.Compact calls.
 func (s *Store) Compact() error {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.closed {
-		s.mu.RUnlock()
 		return ErrClosed
 	}
-	shards := s.shards
-	s.mu.RUnlock()
-
-	for _, sh := range shards {
+	for _, sh := range s.shards {
 		if err := sh.engine.Compact(); err != nil {
 			return fmt.Errorf("shard: compact shard %d (%s): %w",
 				sh.info.ID, sh.info.Name, err)
@@ -383,19 +393,19 @@ func (s *Store) Compact() error {
 }
 
 // Stats aggregates statistics across all shards.
-// Stats may be called after Close.
+// Stats may be called after Close; it returns the last observed values.
+//
+// s.mu.RLock is held across all Engine.Stats calls.
 func (s *Store) Stats() Stats {
 	s.mu.RLock()
-	shards := s.shards
-	vnodes := s.opts.VirtualNodes
-	s.mu.RUnlock()
+	defer s.mu.RUnlock()
 
 	st := Stats{
-		ShardCount:   len(shards),
-		VirtualNodes: vnodes,
-		Shards:       make([]ShardStats, 0, len(shards)),
+		ShardCount:   len(s.shards),
+		VirtualNodes: s.opts.VirtualNodes,
+		Shards:       make([]ShardStats, 0, len(s.shards)),
 	}
-	for _, sh := range shards {
+	for _, sh := range s.shards {
 		es := sh.engine.Stats()
 		ss := ShardStats{
 			ID:                  sh.info.ID,
@@ -419,18 +429,18 @@ func (s *Store) Stats() Stats {
 
 // Close closes all shard engines. Close is idempotent; calling it twice
 // returns nil. After Close, operations return ErrClosed.
+//
+// s.mu.Lock is held for the entire duration of closing all engines, so no
+// concurrent operation can call a shard Engine while Close is in progress.
 func (s *Store) Close() error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
-		s.mu.Unlock()
 		return nil
 	}
 	s.closed = true
-	shards := s.shards
-	s.mu.Unlock()
-
 	var firstErr error
-	for _, sh := range shards {
+	for _, sh := range s.shards {
 		if err := sh.engine.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("shard: close shard %d (%s): %w",
 				sh.info.ID, sh.info.Name, err)

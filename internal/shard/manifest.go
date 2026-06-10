@@ -95,6 +95,23 @@ func readManifest(dir string) (*shardingManifest, error) {
 }
 
 // validateManifest checks structural and semantic invariants of the manifest.
+//
+// Checks performed:
+//   - version must equal manifestVersion (1)
+//   - hash algorithm must be "fnv64a"
+//   - shard_count must be > 0
+//   - virtual_nodes must be > 0
+//   - len(shards) must equal shard_count
+//   - each shard ID must be in [0, shard_count)
+//   - no duplicate shard IDs
+//   - all IDs in [0, shard_count) must be present
+//   - no empty shard name
+//   - no duplicate shard name
+//   - no empty shard path
+//   - no absolute shard path
+//   - no path traversal (../)
+//   - path must be clean (filepath.Clean(path) == path)
+//   - no duplicate shard path
 func validateManifest(m *shardingManifest) error {
 	if m.Version != manifestVersion {
 		return fmt.Errorf("%w: unsupported version %d", ErrCorruptManifest, m.Version)
@@ -102,17 +119,45 @@ func validateManifest(m *shardingManifest) error {
 	if m.Hash != hashAlgorithm {
 		return fmt.Errorf("%w: unknown hash algorithm %q", ErrCorruptManifest, m.Hash)
 	}
+	if m.ShardCount <= 0 {
+		return fmt.Errorf("%w: shard_count must be > 0, got %d", ErrCorruptManifest, m.ShardCount)
+	}
+	if m.VirtualNodes <= 0 {
+		return fmt.Errorf("%w: virtual_nodes must be > 0, got %d", ErrCorruptManifest, m.VirtualNodes)
+	}
+	if len(m.Shards) != m.ShardCount {
+		return fmt.Errorf("%w: shards list length %d != shard_count %d",
+			ErrCorruptManifest, len(m.Shards), m.ShardCount)
+	}
+
 	seenIDs := make(map[int]bool, len(m.Shards))
 	seenNames := make(map[string]bool, len(m.Shards))
+	seenPaths := make(map[string]bool, len(m.Shards))
+
 	for _, s := range m.Shards {
+		// ID range check.
+		if s.ID < 0 || s.ID >= m.ShardCount {
+			return fmt.Errorf("%w: shard ID %d out of range [0, %d)",
+				ErrCorruptManifest, s.ID, m.ShardCount)
+		}
 		if seenIDs[s.ID] {
 			return fmt.Errorf("%w: duplicate shard ID %d", ErrCorruptManifest, s.ID)
 		}
 		seenIDs[s.ID] = true
+
+		// Name checks.
+		if s.Name == "" {
+			return fmt.Errorf("%w: shard %d has empty name", ErrCorruptManifest, s.ID)
+		}
 		if seenNames[s.Name] {
 			return fmt.Errorf("%w: duplicate shard name %q", ErrCorruptManifest, s.Name)
 		}
 		seenNames[s.Name] = true
+
+		// Path checks.
+		if s.Path == "" {
+			return fmt.Errorf("%w: shard %d has empty path", ErrCorruptManifest, s.ID)
+		}
 		if filepath.IsAbs(s.Path) {
 			return fmt.Errorf("%w: absolute shard path %q", ErrCorruptManifest, s.Path)
 		}
@@ -120,6 +165,23 @@ func validateManifest(m *shardingManifest) error {
 		if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
 			return fmt.Errorf("%w: path traversal in shard path %q", ErrCorruptManifest, s.Path)
 		}
+		if cleaned != s.Path {
+			return fmt.Errorf("%w: shard path %q is not clean (expected %q)",
+				ErrCorruptManifest, s.Path, cleaned)
+		}
+		if seenPaths[s.Path] {
+			return fmt.Errorf("%w: duplicate shard path %q", ErrCorruptManifest, s.Path)
+		}
+		seenPaths[s.Path] = true
 	}
+
+	// Verify all IDs 0..ShardCount-1 are present (pigeonhole confirms this when
+	// combined with the length check and range check above, but explicit is better).
+	for i := 0; i < m.ShardCount; i++ {
+		if !seenIDs[i] {
+			return fmt.Errorf("%w: missing shard ID %d", ErrCorruptManifest, i)
+		}
+	}
+
 	return nil
 }

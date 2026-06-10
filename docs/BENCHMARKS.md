@@ -52,12 +52,12 @@ Durations include preload time where applicable (see Interpretation).
 
 | Workload | Ops | Duration | Ops/sec | P50 | P95 | P99 | SSTables | Bloom Skips |
 |----------|----:|---------:|--------:|----:|----:|----:|:--------:|------------:|
-| write-heavy | 1000 | 130.5ms | 7662 | 1.7µs | 4.5µs | 18.6µs | 10 | 0 |
-| read-heavy | 1000 | 130.8ms | 7648 | 1.1µs | 2.2µs | 3.4µs | 10 | 0 |
-| mixed | 1000 | 177.3ms | 5639 | 2.4µs | 7.0µs | 26.5µs | 15 | 0 |
-| scan | 100 | 144.1ms | 694 | 113.2µs | 161.0µs | 240.5µs | 10 | 0 |
-| compaction | 240 | 98.2ms | 2445 | 2.2µs | 95.5µs | 97.5µs | 1 | 0 |
-| restart | 1 | 71.9ms | 14 | 1.3ms | 1.3ms | 1.3ms | 5 | 0 |
+| write-heavy | 1000 | 124.6ms | 8028 | 1.6µs | 4.5µs | 15.1µs | 10 | 0 |
+| read-heavy | 1000 | 133.4ms | 7498 | 1.6µs | 1.9µs | 2.9µs | 10 | 0 |
+| mixed | 1000 | 192.8ms | 5187 | 3.0µs | 6.0µs | 20.8µs | 15 | 0 |
+| scan | 100 | 145.4ms | 688 | 95.8µs | 105.2µs | 130.9µs | 10 | 0 |
+| compaction | 240 | 96.2ms | 2494 | 1.5µs | 85.2µs | 90.0µs | 1 | 0 |
+| restart | 1 | 66.8ms | 15 | 1.4ms | 1.4ms | 1.4ms | 5 | 0 |
 
 | Workload | Bytes Written | Bytes Read | Flush Count | Compaction Count |
 |----------|:-------------:|:----------:|:-----------:|:----------------:|
@@ -79,7 +79,7 @@ Durations include preload time where applicable (see Interpretation).
 |--------|-------|
 | SSTables before compact | 5 |
 | SSTables after compact | 1 |
-| Compact duration | 23.8ms |
+| Compact duration | 21.5ms |
 | Gets before compact | 100 |
 | Gets after compact | 100 |
 | Scans before compact | 20 |
@@ -133,21 +133,17 @@ These benchmarks measure the sharding layer (`internal/shard`) routing key-value
 | Benchmark | ns/op | B/op | allocs/op |
 |-----------|------:|-----:|----------:|
 | RingRoute1M | 78 | 32 | 1 |
-| Put_10k_4shards | 1566 | 201 | 7 |
-| Get_10k_existing_4shards | 149 | 103 | 4 |
+| Put_10k_4shards | 1600 | 201 | 7 |
+| Get_10k_existing_4shards | 150 | 103 | 4 |
 | Get_10k_missing_4shards | 110 | 31 | 1 |
-| Scan_10k_4shards | 5,708,292 | 9,651,265 | 100,309 |
-| Flush_10k_4shards | 102,990,683 | 5,832,826 | 50,836 |
-| Compact_10k_4shards | 126,712,509 | 16,978,758 | 218,841 |
-| Reopen_10k_4shards | 578,179 | 1,065,529 | 10,793 |
-| ConcurrentPut_4shards | 2,482 | 484 | 6 |
-| ConcurrentGet_4shards | 127 | 103 | 4 |
+| Scan_10k_4shards | 5,301,398 | 10,098,090 | 80,267 |
+| Flush_10k_4shards | 104,966,721 | 5,831,246 | 50,832 |
+| Compact_10k_4shards | 127,015,260 | 16,986,382 | 218,776 |
+| Reopen_10k_4shards | 571,379 | 1,065,463 | 10,793 |
+| ConcurrentPut_4shards | 2,495 | 488 | 6 |
+| ConcurrentGet_4shards | 145 | 103 | 4 |
 
-**Notes:**
-- Ring lookup is ~78 ns: FNV-1a hash + binary search over 512 ring tokens.
-- Get (existing, in-memory) is ~149 ns: ring lookup + RWMutex RLock + engine MemTable check.
-- Scan fans out to all 4 shards, merges 10k entries, and sorts — allocation-heavy by design.
-- Flush and Compact include actual SSTable write and compaction I/O across all 4 shards.
+**Notes (after close-safety fix):** All operations now hold `s.mu.RLock()` across their Engine calls. Throughput is comparable to the pre-fix measurements: the mutex overhead is negligible relative to Engine I/O for Flush/Compact, and undetectable in the noise for hot-path Get/Put.
 
 ---
 

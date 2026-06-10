@@ -726,8 +726,10 @@ func TestConcurrent_CloseWithPutGet(t *testing.T) {
 		s.Put([]byte(fmt.Sprintf("seed-%03d", i)), []byte("v"))
 	}
 
+	errCh := make(chan error, 300)
 	var wg sync.WaitGroup
-	// Writers.
+
+	// Writers — report any unexpected (non-nil, non-ErrClosed) error.
 	for g := 0; g < 4; g++ {
 		g := g
 		wg.Add(1)
@@ -735,14 +737,13 @@ func TestConcurrent_CloseWithPutGet(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 30; i++ {
 				key := fmt.Sprintf("concurrent-g%d-k%d", g, i)
-				err := s.Put([]byte(key), []byte("v"))
-				if err != nil && !errors.Is(err, ErrClosed) {
-					// unexpected error
+				if err := s.Put([]byte(key), []byte("v")); err != nil && !errors.Is(err, ErrClosed) {
+					errCh <- fmt.Errorf("Put(%q): unexpected error: %w", key, err)
 				}
 			}
 		}()
 	}
-	// Readers.
+	// Readers — report any unexpected error.
 	for g := 0; g < 4; g++ {
 		g := g
 		wg.Add(1)
@@ -750,7 +751,9 @@ func TestConcurrent_CloseWithPutGet(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 30; i++ {
 				key := fmt.Sprintf("seed-%03d", g*5+i%5)
-				s.Get([]byte(key))
+				if _, _, err := s.Get([]byte(key)); err != nil && !errors.Is(err, ErrClosed) {
+					errCh <- fmt.Errorf("Get(%q): unexpected error: %w", key, err)
+				}
 			}
 		}()
 	}
@@ -760,7 +763,12 @@ func TestConcurrent_CloseWithPutGet(t *testing.T) {
 		defer wg.Done()
 		s.Close()
 	}()
+
 	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
 }
 
 // ── Test 33: Stats aggregates shard stats correctly ───────────────────────────
@@ -966,5 +974,303 @@ func TestShardNames_AreDeterministic(t *testing.T) {
 		if names1[i] != names2[i] {
 			t.Errorf("shard names differ at %d: %q vs %q", i, names1[i], names2[i])
 		}
+	}
+}
+
+// ── Close-safety tests (Phase 10 review fix) ─────────────────────────────────
+
+// TestCloseConcurrentWithPutReturnsOnlyNilOrErrClosed verifies that Put racing
+// with Close never returns an unexpected engine-level error: only nil or
+// ErrClosed are acceptable. After Close completes, Put must return ErrClosed.
+func TestCloseConcurrentWithPutReturnsOnlyNilOrErrClosed(t *testing.T) {
+	dir := tempDir(t)
+	s, err := Open(Options{Dir: dir, ShardCount: 4})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	errCh := make(chan error, 500)
+	var wg sync.WaitGroup
+
+	for g := 0; g < 8; g++ {
+		g := g
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				key := fmt.Sprintf("cput-g%d-k%d", g, i)
+				if err := s.Put([]byte(key), []byte("v")); err != nil && !errors.Is(err, ErrClosed) {
+					errCh <- fmt.Errorf("Put(%q): unexpected error: %w", key, err)
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.Close()
+	}()
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+
+	// After Close, Put must return ErrClosed.
+	if err := s.Put([]byte("post-close"), []byte("v")); !errors.Is(err, ErrClosed) {
+		t.Errorf("after Close: Put returned %v, want ErrClosed", err)
+	}
+}
+
+// TestCloseConcurrentWithGetReturnsOnlyNilOrErrClosed verifies that Get racing
+// with Close never returns an unexpected error.
+func TestCloseConcurrentWithGetReturnsOnlyNilOrErrClosed(t *testing.T) {
+	dir := tempDir(t)
+	s, err := Open(Options{Dir: dir, ShardCount: 4})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	// Seed data so Gets find something.
+	for i := 0; i < 40; i++ {
+		s.Put([]byte(fmt.Sprintf("cget-seed-%03d", i)), []byte("v"))
+	}
+
+	errCh := make(chan error, 500)
+	var wg sync.WaitGroup
+
+	for g := 0; g < 8; g++ {
+		g := g
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				key := fmt.Sprintf("cget-seed-%03d", (g*50+i)%40)
+				if _, _, err := s.Get([]byte(key)); err != nil && !errors.Is(err, ErrClosed) {
+					errCh <- fmt.Errorf("Get(%q): unexpected error: %w", key, err)
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.Close()
+	}()
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+
+	// After Close, Get must return ErrClosed.
+	if _, _, err := s.Get([]byte("post-close")); !errors.Is(err, ErrClosed) {
+		t.Errorf("after Close: Get returned %v, want ErrClosed", err)
+	}
+}
+
+// TestCloseConcurrentWithScanReturnsOnlyNilOrErrClosed verifies that Scan racing
+// with Close never returns an unexpected error.
+func TestCloseConcurrentWithScanReturnsOnlyNilOrErrClosed(t *testing.T) {
+	dir := tempDir(t)
+	s, err := Open(Options{Dir: dir, ShardCount: 4})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 40; i++ {
+		s.Put([]byte(fmt.Sprintf("cscan-seed-%03d", i)), []byte("v"))
+	}
+
+	errCh := make(chan error, 200)
+	var wg sync.WaitGroup
+
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 30; i++ {
+				if _, err := s.Scan(nil, nil); err != nil && !errors.Is(err, ErrClosed) {
+					errCh <- fmt.Errorf("Scan: unexpected error: %w", err)
+				}
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.Close()
+	}()
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+
+	// After Close, Scan must return ErrClosed.
+	if _, err := s.Scan(nil, nil); !errors.Is(err, ErrClosed) {
+		t.Errorf("after Close: Scan returned %v, want ErrClosed", err)
+	}
+}
+
+// TestCloseConcurrentWithFlushCompactRaceSafe verifies that Flush and Compact
+// racing with Close never return unexpected errors.
+func TestCloseConcurrentWithFlushCompactRaceSafe(t *testing.T) {
+	dir := tempDir(t)
+	s, err := Open(Options{Dir: dir, ShardCount: 4})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < 40; i++ {
+		s.Put([]byte(fmt.Sprintf("cfc-seed-%03d", i)), []byte("v"))
+	}
+
+	errCh := make(chan error, 100)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			if err := s.Flush(); err != nil && !errors.Is(err, ErrClosed) {
+				errCh <- fmt.Errorf("Flush: unexpected error: %w", err)
+			}
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5; i++ {
+			if err := s.Compact(); err != nil && !errors.Is(err, ErrClosed) {
+				errCh <- fmt.Errorf("Compact: unexpected error: %w", err)
+			}
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.Close()
+	}()
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+}
+
+// ── Manifest hardening tests (Phase 10 review fix) ────────────────────────────
+
+func TestManifest_RejectsZeroShardCount(t *testing.T) {
+	m := &shardingManifest{
+		Version: manifestVersion, ShardCount: 0, VirtualNodes: 128,
+		Hash: hashAlgorithm, ShardPrefix: defaultShardPrefix,
+	}
+	if err := validateManifest(m); !errors.Is(err, ErrCorruptManifest) {
+		t.Fatalf("want ErrCorruptManifest, got %v", err)
+	}
+}
+
+func TestManifest_RejectsZeroVirtualNodes(t *testing.T) {
+	m := &shardingManifest{
+		Version: manifestVersion, ShardCount: 2, VirtualNodes: 0,
+		Hash: hashAlgorithm, ShardPrefix: defaultShardPrefix,
+		Shards: []shardEntry{
+			{ID: 0, Name: "shard-0000", Path: "shards/shard-0000"},
+			{ID: 1, Name: "shard-0001", Path: "shards/shard-0001"},
+		},
+	}
+	if err := validateManifest(m); !errors.Is(err, ErrCorruptManifest) {
+		t.Fatalf("want ErrCorruptManifest, got %v", err)
+	}
+}
+
+func TestManifest_RejectsShardListLengthMismatch(t *testing.T) {
+	m := &shardingManifest{
+		Version: manifestVersion, ShardCount: 3, VirtualNodes: 128,
+		Hash: hashAlgorithm, ShardPrefix: defaultShardPrefix,
+		Shards: []shardEntry{ // only 2, but ShardCount is 3
+			{ID: 0, Name: "shard-0000", Path: "shards/shard-0000"},
+			{ID: 1, Name: "shard-0001", Path: "shards/shard-0001"},
+		},
+	}
+	if err := validateManifest(m); !errors.Is(err, ErrCorruptManifest) {
+		t.Fatalf("want ErrCorruptManifest, got %v", err)
+	}
+}
+
+func TestManifest_RejectsShardIDOutOfRange(t *testing.T) {
+	m := &shardingManifest{
+		Version: manifestVersion, ShardCount: 2, VirtualNodes: 128,
+		Hash: hashAlgorithm, ShardPrefix: defaultShardPrefix,
+		Shards: []shardEntry{
+			{ID: 0, Name: "shard-0000", Path: "shards/shard-0000"},
+			{ID: 5, Name: "shard-0005", Path: "shards/shard-0005"}, // out of [0,2)
+		},
+	}
+	if err := validateManifest(m); !errors.Is(err, ErrCorruptManifest) {
+		t.Fatalf("want ErrCorruptManifest, got %v", err)
+	}
+}
+
+func TestManifest_RejectsMissingShardID(t *testing.T) {
+	m := &shardingManifest{
+		Version: manifestVersion, ShardCount: 2, VirtualNodes: 128,
+		Hash: hashAlgorithm, ShardPrefix: defaultShardPrefix,
+		Shards: []shardEntry{
+			{ID: 0, Name: "shard-0000", Path: "shards/shard-0000"},
+			{ID: 0, Name: "shard-0001", Path: "shards/shard-0001"}, // dup ID 0, ID 1 missing
+		},
+	}
+	if err := validateManifest(m); !errors.Is(err, ErrCorruptManifest) {
+		t.Fatalf("want ErrCorruptManifest, got %v", err)
+	}
+}
+
+func TestManifest_RejectsEmptyShardName(t *testing.T) {
+	m := &shardingManifest{
+		Version: manifestVersion, ShardCount: 1, VirtualNodes: 128,
+		Hash: hashAlgorithm, ShardPrefix: defaultShardPrefix,
+		Shards: []shardEntry{{ID: 0, Name: "", Path: "shards/shard-0000"}},
+	}
+	if err := validateManifest(m); !errors.Is(err, ErrCorruptManifest) {
+		t.Fatalf("want ErrCorruptManifest, got %v", err)
+	}
+}
+
+func TestManifest_RejectsEmptyShardPath(t *testing.T) {
+	m := &shardingManifest{
+		Version: manifestVersion, ShardCount: 1, VirtualNodes: 128,
+		Hash: hashAlgorithm, ShardPrefix: defaultShardPrefix,
+		Shards: []shardEntry{{ID: 0, Name: "shard-0000", Path: ""}},
+	}
+	if err := validateManifest(m); !errors.Is(err, ErrCorruptManifest) {
+		t.Fatalf("want ErrCorruptManifest, got %v", err)
+	}
+}
+
+func TestManifest_RejectsDuplicatePath(t *testing.T) {
+	m := &shardingManifest{
+		Version: manifestVersion, ShardCount: 2, VirtualNodes: 128,
+		Hash: hashAlgorithm, ShardPrefix: defaultShardPrefix,
+		Shards: []shardEntry{
+			{ID: 0, Name: "shard-0000", Path: "shards/same"},
+			{ID: 1, Name: "shard-0001", Path: "shards/same"}, // dup path
+		},
+	}
+	if err := validateManifest(m); !errors.Is(err, ErrCorruptManifest) {
+		t.Fatalf("want ErrCorruptManifest, got %v", err)
+	}
+}
+
+func TestManifest_RejectsUncleanPath(t *testing.T) {
+	m := &shardingManifest{
+		Version: manifestVersion, ShardCount: 1, VirtualNodes: 128,
+		Hash: hashAlgorithm, ShardPrefix: defaultShardPrefix,
+		Shards: []shardEntry{{ID: 0, Name: "shard-0000", Path: "shards//shard-0000"}},
+	}
+	if err := validateManifest(m); !errors.Is(err, ErrCorruptManifest) {
+		t.Fatalf("want ErrCorruptManifest, got %v", err)
 	}
 }

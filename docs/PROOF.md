@@ -2396,4 +2396,90 @@ BenchmarkConcurrentGet_4shards-8          27233973      126.8 ns/op          103
 
 No replication, dashboard, networking, distributed mode, Raft, consensus, leader/follower, shard migration, resharding, rebalancing, distributed transactions, vector sharding, ANN, HNSW, IVF, approximate vector search, background compaction, automatic compaction, leveled compaction, size-tiered compaction, or core Engine behavior changes were implemented in Phase 10.
 
+### Phase 10 — Review Fix: Close-safety TOCTOU and Manifest Hardening
+
+#### Issue Fixed: Close-safety TOCTOU
+
+**Root cause:** The original implementation checked `s.closed` under `RLock`, released the lock, and then called the shard Engine outside the lock. This created a race:
+
+1. `Put` (or `Get`, `Scan`, etc.): acquires `RLock` → checks `s.closed == false` → gets engine handle → **releases `RLock`** → calls `engine.Put`
+2. `Close`: acquires `Lock` → sets `s.closed = true` → **releases `Lock`** → closes all engines
+3. Race: if step 2 runs between the `RUnlock` and `engine.Put` in step 1, `Put` calls a closed engine and returns `engine.ErrClosed` instead of `shard.ErrClosed`.
+
+**Fix: hold lock across engine calls.**
+
+- All public operations (`Put`, `Delete`, `Get`, `Scan`, `Flush`, `Compact`, `Stats`, `ShardForKey`) now hold `s.mu.RLock()` for the **entire** duration of their Engine calls.
+- `Close` holds `s.mu.Lock()` while closing **all** shard engines, not just while setting `s.closed`.
+
+**New locking invariant:**
+
+| Operation | Lock held during Engine call |
+|-----------|------------------------------|
+| `Put`, `Delete`, `Get`, `ShardForKey` | `s.mu.RLock()` via `defer s.mu.RUnlock()` |
+| `Scan` | `s.mu.RLock()` across all `engine.Scan` calls; released before in-memory merge/sort |
+| `Flush`, `Compact`, `Stats` | `s.mu.RLock()` via `defer s.mu.RUnlock()` |
+| `Close` | `s.mu.Lock()` via `defer s.mu.Unlock()` across all engine closes |
+
+This establishes a proper reader-writer relationship at the store level: concurrent reads can proceed simultaneously, and Close waits for all in-flight operations to finish before closing engines.
+
+#### Manifest Hardening Added
+
+`validateManifest` now additionally rejects:
+
+- `shard_count <= 0`
+- `virtual_nodes <= 0`
+- `len(shards) != shard_count`
+- shard ID outside `[0, shard_count)`
+- missing shard ID in `[0, shard_count)` (after pigeonhole checks above)
+- empty shard name
+- empty shard path
+- path not clean (`filepath.Clean(path) != path`)
+- duplicate shard path
+
+#### Tests Added/Updated
+
+**Updated:** `TestConcurrent_CloseWithPutGet` — now collects and reports unexpected errors (non-nil, non-`ErrClosed`) via an error channel; the test fails on any unexpected error.
+
+**New (close-safety):**
+1. `TestCloseConcurrentWithPutReturnsOnlyNilOrErrClosed` — 8 goroutines doing Put in a loop + concurrent Close; fails on any non-nil/non-ErrClosed error; verifies ErrClosed after close.
+2. `TestCloseConcurrentWithGetReturnsOnlyNilOrErrClosed` — seeds data; 8 goroutines doing Get + concurrent Close; same contract.
+3. `TestCloseConcurrentWithScanReturnsOnlyNilOrErrClosed` — 4 goroutines doing Scan + concurrent Close; same contract.
+4. `TestCloseConcurrentWithFlushCompactRaceSafe` — Flush and Compact goroutines + concurrent Close; same contract.
+
+**New (manifest hardening):**
+`TestManifest_RejectsZeroShardCount`, `TestManifest_RejectsZeroVirtualNodes`, `TestManifest_RejectsShardListLengthMismatch`, `TestManifest_RejectsShardIDOutOfRange`, `TestManifest_RejectsMissingShardID`, `TestManifest_RejectsEmptyShardName`, `TestManifest_RejectsEmptyShardPath`, `TestManifest_RejectsDuplicatePath`, `TestManifest_RejectsUncleanPath`.
+
+**Updated total shard test count:** 55 (was 40).
+
+All 55 tests pass with `go test -race -count=1 ./internal/shard/...`.
+
+#### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/shard/...
+go test -bench=. -benchmem -benchtime=3s ./internal/vector/...
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...
+go test -bench=. -benchmem -benchtime=3s ./internal/bench/...
+make test
+make vet
+make build
+make bench-shard
+make bench-vector
+make bench-report
+./bin/shardforge --help
+./bin/shardforge version
+./bin/shardforge-bench --scale small --out /tmp/shardforge-bench.md
+git status --short
+```
+
+All commands passed with zero errors.
+
+#### Scope Boundaries
+
+No replication, networking, distributed mode, Raft, consensus, shard migration, resharding, vector sharding, ANN, HNSW, IVF, background compaction, automatic compaction, or core Engine behavior changes were made in this fix.
+
 *Future phases will append their own sections to this document.*

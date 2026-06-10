@@ -92,3 +92,48 @@ func ExampleLocal3Node() Config {
 		},
 	})
 }
+
+// ExampleReadReplica3Node returns a validated example Config for a 1-primary + 2-follower
+// read-replica setup with nodes on 127.0.0.1:9111–9113.
+// Used for documentation, testing, and the `shardforge-cluster example-read-replica-3node` command.
+//
+// Replication is explicit pull-based: followers call POST /replication/sync to pull entries
+// from the primary. There is no automatic background sync loop, no Raft, no automatic failover.
+func ExampleReadReplica3Node() Config {
+	cfg := DefaultConfig("local-read-replica-3node", []Node{
+		{
+			ID:      "node-primary",
+			BaseURL: "http://127.0.0.1:9111",
+			Addr:    "127.0.0.1:9111",
+			DataDir: "/tmp/shardforge-primary",
+			Replication: Replication{
+				Enabled: true,
+				Role:    "primary",
+			},
+		},
+		{
+			ID:      "node-replica-1",
+			BaseURL: "http://127.0.0.1:9112",
+			Addr:    "127.0.0.1:9112",
+			DataDir: "/tmp/shardforge-replica-1",
+			Replication: Replication{
+				Enabled: true,
+				Role:    "follower",
+				Primary: "node-primary",
+			},
+		},
+		{
+			ID:      "node-replica-2",
+			BaseURL: "http://127.0.0.1:9113",
+			Addr:    "127.0.0.1:9113",
+			DataDir: "/tmp/shardforge-replica-2",
+			Replication: Replication{
+				Enabled: true,
+				Role:    "follower",
+				Primary: "node-primary",
+			},
+		},
+	})
+	cfg.Proxy.Addr = "127.0.0.1:9210"
+	return cfg
+}

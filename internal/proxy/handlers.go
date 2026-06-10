@@ -19,6 +19,8 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/flush-all", s.handleFlushAll)
 	s.mux.HandleFunc("/compact-all", s.handleCompactAll)
 	s.mux.HandleFunc("/nodes/health", s.handleNodesHealth)
+	s.mux.HandleFunc("/replication/status", s.handleReplicationStatus)
+	s.mux.HandleFunc("/replication/sync-node/", s.handleReplicationSyncNode)
 	s.mux.HandleFunc("/", s.handleNotFound)
 }
 
@@ -260,6 +262,65 @@ func (s *Server) handleNodesHealth(w http.ResponseWriter, r *http.Request) {
 		return nodes[i].NodeID < nodes[j].NodeID
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": nodes})
+}
+
+// --- /replication/status ---
+
+// handleReplicationStatus fans out GET /replication/status to all nodes and aggregates results.
+func (s *Server) handleReplicationStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	results := s.gw.ForwardToAll(r.Context(), http.MethodGet, "/replication/status", nil)
+
+	type nodeResult struct {
+		NodeID string `json:"node_id"`
+		OK     bool   `json:"ok"`
+		Body   any    `json:"body,omitempty"`
+		Error  string `json:"error,omitempty"`
+	}
+	nodes := make([]nodeResult, 0, len(results))
+	for id, res := range results {
+		nr := nodeResult{NodeID: id, OK: res.Err == nil}
+		if res.Err != nil {
+			nr.Error = res.Err.Error()
+		} else {
+			nr.Body = res.Body
+		}
+		nodes = append(nodes, nr)
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].NodeID < nodes[j].NodeID })
+	writeJSON(w, http.StatusOK, map[string]any{"nodes": nodes})
+}
+
+// --- /replication/sync-node/{nodeID} ---
+
+// handleReplicationSyncNode forwards POST /replication/sync to the specified node.
+func (s *Server) handleReplicationSyncNode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	nodeID := strings.TrimPrefix(r.URL.Path, "/replication/sync-node/")
+	if nodeID == "" {
+		writeError(w, http.StatusBadRequest, "node ID is required")
+		return
+	}
+
+	body, err := s.gw.ForwardToNode(r.Context(), nodeID, http.MethodPost, "/replication/sync", nil)
+	if err != nil {
+		if errors.Is(err, gateway.ErrUnknownNode) {
+			writeError(w, http.StatusNotFound, "unknown node: "+nodeID)
+			return
+		}
+		writeError(w, http.StatusBadGateway, "sync failed: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // --- catch-all ---

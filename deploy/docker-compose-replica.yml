@@ -1,0 +1,128 @@
+# ShardForgeDB — Docker Compose read-replica demo
+#
+# Starts 1 primary node, 2 follower/replica nodes, and 1 proxy.
+# Replication is explicit pull-based: followers do NOT automatically sync.
+# To sync a follower, call: POST /replication/sync-node/{nodeID} on the proxy,
+# or POST /replication/sync directly on the follower node.
+#
+# This is NOT automatic replication: no Raft, no consensus, no quorum,
+# no leader election, no automatic failover. Replication is a manual admin operation.
+#
+# Usage:
+#   docker compose -f deploy/docker-compose-replica.yml up --build
+#   curl http://localhost:9210/healthz
+#   curl http://localhost:9210/replication/status
+#
+#   # Write to the primary (via the proxy, routed by consistent hash):
+#   curl -X PUT http://localhost:9111/kv/user:1 \
+#        -H "Content-Type: application/json" -d '{"value":"alice"}'
+#
+#   # Trigger sync on replica-1:
+#   curl -X POST http://localhost:9210/replication/sync-node/shardforge-replica-1
+#
+#   # Read from replica-1:
+#   curl http://localhost:9112/kv/user:1
+#
+#   docker compose -f deploy/docker-compose-replica.yml down -v
+
+services:
+  shardforge-primary:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: shardforge-primary
+    command:
+      - --node-id=shardforge-primary
+      - --addr=0.0.0.0:9111
+      - --data-dir=/data
+      - --replication-role=primary
+    ports:
+      - "9111:9111"
+    volumes:
+      - primary-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9111/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  shardforge-replica-1:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: shardforge-replica-1
+    command:
+      - --node-id=shardforge-replica-1
+      - --addr=0.0.0.0:9112
+      - --data-dir=/data
+      - --replication-role=follower
+      - --primary-url=http://shardforge-primary:9111
+    ports:
+      - "9112:9112"
+    volumes:
+      - replica1-data:/data
+    depends_on:
+      - shardforge-primary
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9112/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  shardforge-replica-2:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: shardforge-replica-2
+    command:
+      - --node-id=shardforge-replica-2
+      - --addr=0.0.0.0:9113
+      - --data-dir=/data
+      - --replication-role=follower
+      - --primary-url=http://shardforge-primary:9111
+    ports:
+      - "9113:9113"
+    volumes:
+      - replica2-data:/data
+    depends_on:
+      - shardforge-primary
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9113/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  shardforge-proxy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    entrypoint: ["/usr/local/bin/shardforge-proxy"]
+    container_name: shardforge-replica-proxy
+    command:
+      - --config=/etc/shardforge/cluster.json
+    volumes:
+      - ../configs/docker-read-replica-3node.json:/etc/shardforge/cluster.json:ro
+    ports:
+      - "9210:9210"
+    depends_on:
+      - shardforge-primary
+      - shardforge-replica-1
+      - shardforge-replica-2
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9210/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  primary-data:
+  replica1-data:
+  replica2-data:

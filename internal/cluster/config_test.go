@@ -71,6 +71,33 @@ func TestDefaultConfig_HasCorrectVersion(t *testing.T) {
 	}
 }
 
+func TestExampleReadReplica3Node_ValidatesCleanly(t *testing.T) {
+	cfg := cluster.ExampleReadReplica3Node()
+	if err := cluster.Validate(cfg); err != nil {
+		t.Fatalf("ExampleReadReplica3Node() failed validation: %v", err)
+	}
+}
+
+func TestExampleReadReplica3Node_HasThreeNodes(t *testing.T) {
+	cfg := cluster.ExampleReadReplica3Node()
+	if len(cfg.Nodes) != 3 {
+		t.Fatalf("expected 3 nodes, got %d", len(cfg.Nodes))
+	}
+}
+
+func TestExampleReadReplica3Node_HasOnePrimary(t *testing.T) {
+	cfg := cluster.ExampleReadReplica3Node()
+	var primaries int
+	for _, n := range cfg.Nodes {
+		if n.Replication.Enabled && n.Replication.Role == "primary" {
+			primaries++
+		}
+	}
+	if primaries != 1 {
+		t.Errorf("expected 1 primary, got %d", primaries)
+	}
+}
+
 func TestDefaultConfig_HasCorrectAlgorithm(t *testing.T) {
 	cfg := cluster.DefaultConfig("test", []cluster.Node{
 		{ID: "n1", BaseURL: "http://127.0.0.1:9101"},

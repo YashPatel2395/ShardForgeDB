@@ -187,6 +187,93 @@ func TestValidate_AbsoluteDataDir_Valid(t *testing.T) {
 	}
 }
 
+func TestValidate_Replication_ValidPrimaryFollower(t *testing.T) {
+	cfg := validConfig()
+	cfg.Nodes = []cluster.Node{
+		{ID: "n1", BaseURL: "http://127.0.0.1:9101", Weight: 1,
+			Replication: cluster.Replication{Enabled: true, Role: "primary"}},
+		{ID: "n2", BaseURL: "http://127.0.0.1:9102", Weight: 1,
+			Replication: cluster.Replication{Enabled: true, Role: "follower", Primary: "n1"}},
+	}
+	if err := cluster.Validate(cfg); err != nil {
+		t.Errorf("expected nil for valid primary+follower, got %v", err)
+	}
+}
+
+func TestValidate_Replication_MultiplePrimaries_ReturnsInvalidConfig(t *testing.T) {
+	cfg := validConfig()
+	cfg.Nodes = []cluster.Node{
+		{ID: "n1", BaseURL: "http://127.0.0.1:9101", Weight: 1,
+			Replication: cluster.Replication{Enabled: true, Role: "primary"}},
+		{ID: "n2", BaseURL: "http://127.0.0.1:9102", Weight: 1,
+			Replication: cluster.Replication{Enabled: true, Role: "primary"}},
+	}
+	err := cluster.Validate(cfg)
+	if !errors.Is(err, cluster.ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for multiple primaries, got %v", err)
+	}
+}
+
+func TestValidate_Replication_NoPrimary_ReturnsInvalidConfig(t *testing.T) {
+	cfg := validConfig()
+	cfg.Nodes = []cluster.Node{
+		{ID: "n1", BaseURL: "http://127.0.0.1:9101", Weight: 1,
+			Replication: cluster.Replication{Enabled: true, Role: "follower", Primary: "n2"}},
+	}
+	err := cluster.Validate(cfg)
+	if !errors.Is(err, cluster.ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for no primary, got %v", err)
+	}
+}
+
+func TestValidate_Replication_UnknownPrimary_ReturnsInvalidConfig(t *testing.T) {
+	cfg := validConfig()
+	cfg.Nodes = []cluster.Node{
+		{ID: "n1", BaseURL: "http://127.0.0.1:9101", Weight: 1,
+			Replication: cluster.Replication{Enabled: true, Role: "primary"}},
+		{ID: "n2", BaseURL: "http://127.0.0.1:9102", Weight: 1,
+			Replication: cluster.Replication{Enabled: true, Role: "follower", Primary: "unknown"}},
+	}
+	err := cluster.Validate(cfg)
+	if !errors.Is(err, cluster.ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for unknown primary reference, got %v", err)
+	}
+}
+
+func TestValidate_Replication_FollowerMissingPrimary_ReturnsInvalidConfig(t *testing.T) {
+	cfg := validConfig()
+	cfg.Nodes = []cluster.Node{
+		{ID: "n1", BaseURL: "http://127.0.0.1:9101", Weight: 1,
+			Replication: cluster.Replication{Enabled: true, Role: "primary"}},
+		{ID: "n2", BaseURL: "http://127.0.0.1:9102", Weight: 1,
+			Replication: cluster.Replication{Enabled: true, Role: "follower"}}, // missing Primary field
+	}
+	err := cluster.Validate(cfg)
+	if !errors.Is(err, cluster.ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for follower missing primary field, got %v", err)
+	}
+}
+
+func TestValidate_Replication_InvalidRole_ReturnsInvalidConfig(t *testing.T) {
+	cfg := validConfig()
+	cfg.Nodes = []cluster.Node{
+		{ID: "n1", BaseURL: "http://127.0.0.1:9101", Weight: 1,
+			Replication: cluster.Replication{Enabled: true, Role: "observer"}},
+	}
+	err := cluster.Validate(cfg)
+	if !errors.Is(err, cluster.ErrInvalidConfig) {
+		t.Errorf("expected ErrInvalidConfig for invalid replication role, got %v", err)
+	}
+}
+
+func TestValidate_Replication_Disabled_NoValidation(t *testing.T) {
+	// No replication enabled — should not fail even with zero Replication struct.
+	cfg := validConfig()
+	if err := cluster.Validate(cfg); err != nil {
+		t.Errorf("expected nil for no replication, got %v", err)
+	}
+}
+
 func TestValidate_DoesNotMutateOriginal(t *testing.T) {
 	cfg := validConfig()
 	origName := cfg.Name

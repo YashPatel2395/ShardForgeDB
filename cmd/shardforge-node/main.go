@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/YashPatel2395/ShardForgeDB/internal/node"
+	"github.com/YashPatel2395/ShardForgeDB/internal/replnet"
 )
 
 const disclaimer = `
@@ -35,6 +36,8 @@ func main() {
 	dataDir := fs.String("data-dir", "", "directory for node-local Engine data (required)")
 	walSync := fs.Bool("wal-sync", false, "enable fsync after every WAL append (slower, more durable)")
 	memTableMax := fs.Uint64("memtable-max-bytes", 0, "MemTable flush threshold in bytes (0 = default 64 MiB)")
+	replRole := fs.String("replication-role", "", "replication role: primary, follower, or empty for standalone")
+	primaryURL := fs.String("primary-url", "", "HTTP base URL of the primary node (required when --replication-role=follower)")
 
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, disclaimer)
@@ -43,7 +46,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, `
 Examples:
   shardforge-node --node-id node-1 --addr 127.0.0.1:9101 --data-dir ./data/node-1
-  shardforge-node --node-id node-2 --addr 127.0.0.1:9102 --data-dir ./data/node-2
+  shardforge-node --node-id node-1 --addr 127.0.0.1:9111 --data-dir ./data/primary --replication-role primary
+  shardforge-node --node-id node-2 --addr 127.0.0.1:9112 --data-dir ./data/replica-1 --replication-role follower --primary-url http://127.0.0.1:9111
 `)
 	}
 
@@ -61,12 +65,23 @@ Examples:
 		fs.Usage()
 		os.Exit(1)
 	}
+	if *replRole == "follower" && *primaryURL == "" {
+		fmt.Fprintln(os.Stderr, "error: --primary-url is required when --replication-role=follower")
+		fs.Usage()
+		os.Exit(1)
+	}
 
 	fmt.Print(disclaimer)
-	fmt.Printf("node-id  : %s\n", *nodeID)
-	fmt.Printf("addr     : %s\n", *addr)
-	fmt.Printf("data-dir : %s\n", *dataDir)
-	fmt.Printf("wal-sync : %v\n", *walSync)
+	fmt.Printf("node-id          : %s\n", *nodeID)
+	fmt.Printf("addr             : %s\n", *addr)
+	fmt.Printf("data-dir         : %s\n", *dataDir)
+	fmt.Printf("wal-sync         : %v\n", *walSync)
+	if *replRole != "" {
+		fmt.Printf("replication-role : %s\n", *replRole)
+	}
+	if *primaryURL != "" {
+		fmt.Printf("primary-url      : %s\n", *primaryURL)
+	}
 	fmt.Println()
 
 	srv, err := node.Open(node.Options{
@@ -75,6 +90,10 @@ Examples:
 		DataDir:          *dataDir,
 		WALSyncOnWrite:   *walSync,
 		MemTableMaxBytes: *memTableMax,
+		Replication: node.ReplicationOptions{
+			Role:           replnet.Role(*replRole),
+			PrimaryBaseURL: *primaryURL,
+		},
 	})
 	if err != nil {
 		log.Fatalf("node open: %v", err)
@@ -93,7 +112,8 @@ Examples:
 	}()
 
 	fmt.Printf("[%s] listening on http://%s\n", *nodeID, *addr)
-	fmt.Printf("[%s] endpoints: GET /healthz  GET /status  PUT/GET/DELETE /kv/{key}  GET /scan  POST /flush  POST /compact\n\n", *nodeID)
+	fmt.Printf("[%s] endpoints: GET /healthz  GET /status  PUT/GET/DELETE /kv/{key}  GET /scan  POST /flush  POST /compact\n", *nodeID)
+	fmt.Printf("[%s]            GET /replication/status  GET /replication/log  POST /replication/apply  POST /replication/sync\n\n", *nodeID)
 
 	if err := srv.Start(); err != nil {
 		log.Fatalf("server error: %v", err)

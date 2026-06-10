@@ -8,10 +8,24 @@ package node
 
 import (
 	"time"
+
+	"github.com/YashPatel2395/ShardForgeDB/internal/replnet"
 )
 
 // NodeID identifies a node in the network. It is a human-readable string such as "node-1".
 type NodeID string
+
+// ReplicationOptions configures optional networked replication for a node.
+// Leave zero-valued for standalone mode (no replication).
+type ReplicationOptions struct {
+	// Role is the replication role: replnet.RolePrimary or replnet.RoleFollower.
+	// Empty means standalone (no replication).
+	Role replnet.Role
+
+	// PrimaryBaseURL is the HTTP base URL of the primary node.
+	// Required when Role == replnet.RoleFollower; ignored otherwise.
+	PrimaryBaseURL string
+}
 
 // Options configures a node Server.
 type Options struct {
@@ -33,15 +47,20 @@ type Options struct {
 	// MemTableMaxBytes is the MemTable size threshold that triggers flush.
 	// Zero means the engine default (64 MiB).
 	MemTableMaxBytes uint64
+
+	// Replication configures optional networked replication.
+	// Zero value means standalone mode.
+	Replication ReplicationOptions
 }
 
 // Status is returned by GET /status and the Server.Status() method.
 type Status struct {
-	NodeID    string       `json:"node_id"`
-	Addr      string       `json:"addr"`
-	DataDir   string       `json:"data_dir"`
-	StartedAt time.Time    `json:"started_at"`
-	Engine    EngineStatus `json:"engine"`
+	NodeID      string               `json:"node_id"`
+	Addr        string               `json:"addr"`
+	DataDir     string               `json:"data_dir"`
+	StartedAt   time.Time            `json:"started_at"`
+	Engine      EngineStatus         `json:"engine"`
+	Replication replnet.ReplicaStatus `json:"replication,omitempty"`
 }
 
 // EngineStatus holds a point-in-time snapshot of the local engine counters.

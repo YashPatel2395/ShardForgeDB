@@ -52,6 +52,18 @@ type Proxy struct {
 	Addr string `json:"addr"`
 }
 
+// Replication describes the optional replication role of a node.
+// All fields are omitted when replication is not configured.
+type Replication struct {
+	// Enabled indicates that this node participates in pull-based replication.
+	Enabled bool `json:"enabled"`
+	// Role is the node's replication role: "primary" or "follower".
+	// Empty means standalone (replication disabled).
+	Role string `json:"role,omitempty"`
+	// Primary is the ID of this node's primary (follower nodes only).
+	Primary string `json:"primary,omitempty"`
+}
+
 // Node describes one independent shardforge-node process.
 type Node struct {
 	// ID is a unique human-readable identifier (e.g. "node-1").
@@ -66,6 +78,9 @@ type Node struct {
 	// Weight controls how many virtual ring points this node receives relative to others.
 	// Normalized to 1 when <= 0.
 	Weight int `json:"weight,omitempty"`
+	// Replication describes the optional replication role of this node.
+	// Omitted when replication is not configured.
+	Replication Replication `json:"replication,omitempty"`
 }
 
 // Scope documents what this cluster config does and does not support.

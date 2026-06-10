@@ -3390,3 +3390,91 @@ ok  "configs/docker-3node-with-proxy.json" is valid (version=v1, name="docker-3n
 - No distributed vector search: correct
 - No production cluster manager: correct
 - No core Engine/WAL/MemTable/SSTable/Bloom/Vector/Shard/Replica/Dashboard/Node/Gateway/Proxy behavior changes: correct
+
+---
+
+## Phase 18 — Networked Read Replicas v1 (`internal/replnet`)
+
+### What Was Built
+
+**New package:** `internal/replnet`
+- `errors.go` — `ErrInvalidRole`, `ErrInvalidEntry`, `ErrClosed`
+- `types.go` — `Role` (primary/follower), `Operation` (put/delete), `Entry`, `LogStats`, `ReplicaStatus`
+- `log.go` — `Log`: goroutine-safe append-only in-memory mutation log; `Append`, `EntriesAfter`, `Stats`, `Close`
+- `replicator.go` — `Replicator`: HTTP pull client; `PullEntries(ctx, after, limit)` → calls primary's `GET /replication/log`
+- `log_test.go` — 20 unit tests; `bench_test.go` — 5 benchmarks; `replicator_test.go` — 6 tests
+
+**Updated: `internal/node`**
+- `types.go` — `ReplicationOptions{Role, PrimaryBaseURL}` added to `Options`; `Status.Replication replnet.ReplicaStatus`
+- `server.go` — `replLog *replnet.Log` (primary only), `replicator *replnet.Replicator` (follower only), `lastApplied uint64` (atomic); `ReplicationStatus()`, `ReplicationEntries()`, `ApplyReplicationEntries()`, `SyncFromPrimary()` methods
+- `handlers.go` — follower PUT/DELETE blocked (403); primary PUT/DELETE append to `replLog`; 4 new routes: `GET /replication/status`, `GET /replication/log`, `POST /replication/apply`, `POST /replication/sync`
+- `replication_test.go` — 27 new tests
+
+**Updated: `internal/cluster`**
+- `types.go` — `Replication{Enabled, Role, Primary}` struct added to `Node` (omitempty, backward-compatible)
+- `validate.go` — `validateReplication()`: exactly one primary, followers reference valid primary ID, no multi-primary
+- `config.go` — `ExampleReadReplica3Node()` example config
+- `validate_test.go` — 7 new replication validation tests; `config_test.go` — 3 new tests
+
+**Updated: `internal/proxy`**
+- `handlers.go` — 2 new endpoints: `GET /replication/status` (fan-out), `POST /replication/sync-node/{nodeID}` (forward)
+- `replication_test.go` — 6 new tests
+
+**Updated: `internal/gateway`**
+- `types.go` — `ForwardResult{Body, Err}` type
+- `client.go` — `ForwardToAll(ctx, method, path, body)` and `ForwardToNode(ctx, nodeID, method, path, body)` methods
+
+**Updated: `internal/node/client.go`**
+- `Do(ctx, method, path, body)` — raw JSON forward method returning `map[string]any`
+
+**Updated: `cmd/shardforge-node/main.go`**
+- `--replication-role` flag (primary/follower/empty)
+- `--primary-url` flag (required when role=follower)
+
+**Updated: `cmd/shardforge-cluster/main.go`**
+- `example-read-replica-3node` command
+
+**New configs:**
+- `configs/local-read-replica-3node.json`
+- `configs/docker-read-replica-3node.json`
+
+**New deploy:**
+- `deploy/docker-compose-replica.yml` — shardforge-primary (9111), shardforge-replica-1 (9112), shardforge-replica-2 (9113), shardforge-proxy (9210)
+
+**Makefile additions:**
+- `bench-replnet`, `replica-demo`, `replica-demo-down`, `replica-config-demo`, `replica-status-demo`, `cluster-example-replica`
+
+### Test Evidence
+
+```
+go test -race -count=1 ./...
+ok  github.com/YashPatel2395/ShardForgeDB/internal/replnet    (20 unit + 6 replicator tests)
+ok  github.com/YashPatel2395/ShardForgeDB/internal/node       (27 new replication tests)
+ok  github.com/YashPatel2395/ShardForgeDB/internal/cluster    (7 replication validation tests)
+ok  github.com/YashPatel2395/ShardForgeDB/internal/proxy      (6 new replication admin tests)
+ok  github.com/YashPatel2395/ShardForgeDB/internal/gateway    (ForwardToAll/ForwardToNode tested via proxy)
+... all 24 packages pass
+```
+
+### Key Design Decisions
+
+**In-memory log:** The mutation log (`replnet.Log`) is not persisted. This is intentional for Phase 18. The engine WAL provides durability for the actual key-value data. If the primary restarts, the log is empty and followers must replay from their current state. This is clearly documented and honest.
+
+**Explicit pull-based sync:** There is no background goroutine. Followers sync only when explicitly asked (`POST /replication/sync`). This matches the Phase 18 scope: manual admin operation, not automatic replication.
+
+**Sequence numbers:** The protocol uses monotonic `uint64` sequences. Followers track `lastAppliedSeq` atomically. Already-applied entries are silently skipped (idempotent re-apply). Gaps produce `ErrInvalidEntry` rather than silently applying out-of-order.
+
+**Scope honesty:** `cluster.Scope.NoReplication` remains `true` in all config files. It refers to *automatic background cluster-level replication*, which Phase 18 does not implement. Per-node explicit pull replication is a separate concept and is not contradictory.
+
+### Scope Confirmation (Phase 18)
+
+- Pull-based explicit replication only: correct — no background sync loop
+- In-memory mutation log: correct — not persisted, cleared on primary restart
+- Follower writes rejected (403): correct — PUT/DELETE blocked on follower role
+- No automatic failover: correct — no leader election, no quorum
+- No Raft: correct
+- No consensus: correct
+- No quorum: correct
+- No multi-primary: correct — Validate enforces exactly one primary
+- No strong consistency guarantee: correct — replication lag expected
+- All existing tests unmodified and passing: correct

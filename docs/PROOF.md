@@ -2859,3 +2859,81 @@ git status --short                                                 (clean)
 ### Scope Confirmation
 
 No networking, no RPC, no distributed deployment, no Raft, no consensus, no automatic leader election, no quorum replication, no shard migration, no resharding, no vector replication, no ANN/HNSW/IVF, no background compaction, no automatic compaction, and no core Engine, Shard, Replica, or Vector behavior changes were implemented in Phase 12.
+
+---
+
+## Phase 13 — Final Polish and Release Hardening
+
+### Changes Made
+
+| File | Change |
+|------|--------|
+| `README.md` | Full rewrite: portfolio pitch, quickstart, scope table, demo commands, not-implemented table, accurate Phase 12 test count (52), no stale wording |
+| `docs/DESIGN.md` | Release Scope section, Phase 13 section |
+| `docs/PROOF.md` | This section |
+| `docs/BENCHMARKS.md` | Benchmark Reproducibility section |
+| `docs/RELEASE_CHECKLIST.md` | New — build/test/benchmark/demo/scope/resume checklists |
+| `docs/PROJECT_SUMMARY.md` | New — overview, architecture, phase map, recruiter bullets, "what next" |
+| `scripts/smoke.sh` | New — fast smoke validation script |
+| `scripts/demo.sh` | New — recruiter-friendly demo sequence |
+| `scripts/release_check.sh` | New — full release gate with clean-tree check |
+| `Makefile` | Added `smoke`, `demo`, `release-check` targets |
+
+### Docs Consistency Fixes
+
+- README top-scope block: replaced blanket "no networking" with "no database-node networking, no RPC" to avoid contradiction with Phase 12 local HTTP server.
+- README Phase 12: updated test count 46 → 52 (actual count after cleanup PR).
+- README Phase 10: updated test count 40 → 55 (actual count after review fixes).
+- README Phase 11: updated test count 60 → 66 (actual count after review fixes).
+- Stale "All other components are intended design only" sentence removed in prior PR.
+- Phase 12 entry: updated to ✓ locked; branch reference removed.
+- "Features NOT Yet Implemented" table: removed "Dashboard / monitoring" from the list (it is now implemented as a local HTTP server).
+
+### Release Scripts
+
+```
+scripts/smoke.sh         — go test, go vet, make build, CLI checks; exits 0 or 1
+scripts/demo.sh          — build + version + small bench + dashboard instructions
+scripts/release_check.sh — full gate: tidy, fmt, vet, race tests, all benchmarks, CLI, clean tree
+```
+
+All scripts use `set -euo pipefail` and `cd "$(dirname "$0")/.."` for robustness.
+
+### Validation Commands Run
+
+```bash
+go mod tidy                                                    OK — no changes
+go fmt ./...                                                   OK — no changes
+go vet ./...                                                   OK
+go test -race -count=1 ./...                                   16 packages PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/dashboard/ 8 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/replica/   10 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/shard/     10 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/vector/    10 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/    benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/bench/     benchmarks PASS
+make test                                                      PASS
+make vet                                                       PASS
+make build                                                     PASS (3 binaries)
+make bench-dashboard                                           PASS
+make bench-replica                                             PASS
+make bench-shard                                               PASS
+make bench-vector                                              PASS
+./scripts/smoke.sh                                             OK
+./scripts/demo.sh                                              OK
+./bin/shardforge --help                                        OK
+./bin/shardforge version                                       ShardForgeDB 0.1.0
+./bin/shardforge-bench --scale small --out /tmp/...            OK
+./bin/shardforge-dashboard --help                              OK
+git status --short                                             (clean)
+```
+
+### Known Limitations
+
+- `make bench-report` regenerates `docs/BENCHMARKS.md` and strips manually added Phase 10/11/12 sections. Always run `git restore docs/BENCHMARKS.md` after `make bench-report` if only timing changed.
+- `scripts/release_check.sh` runs all benchmark suites; expect 10–20 minutes on a development machine.
+- `scripts/release_check.sh` does NOT run `make bench-report` to avoid unintended BENCHMARKS.md changes.
+
+### Scope Confirmation
+
+No new database engine features, no database-node networking, no RPC, no distributed deployment, no Raft, no consensus, no automatic leader election, no quorum replication, no shard migration, no resharding, no vector replication, no ANN/HNSW/IVF, no background compaction, no automatic compaction, and no core Engine/Shard/Replica/Vector/WAL/MemTable/SSTable/Bloom/Dashboard behavior changes were implemented in Phase 13.

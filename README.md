@@ -1,37 +1,110 @@
 # ShardForgeDB
 
-An **explainable** distributed database engine for key-value and vector search workloads, written in Go.
+An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer with strict documentation, tests, and benchmarks at every phase.
 
-> **Phase 12 in review.** WAL, MemTable, SSTable, Bloom Filter, single-node Engine, manual full compaction, exact vector search, local key-value sharding, local in-process leader/follower replication simulation, and local observability dashboard with chaos/failure simulation are implemented.
-> No background compaction, no database-node networking, no RPC, no distributed cluster, no Raft, no consensus. The Phase 12 dashboard is a local HTTP server only — it does not implement networking between database nodes.
+> **Phase 13 in review.** All twelve prior phases are implemented and locked.
+> Phase 13 is final polish, release hardening, docs consistency, and scriptability — no new engine features.
+>
+> No background compaction, no database-node networking, no RPC, no distributed cluster, no Raft, no consensus.
+> The Phase 12 dashboard is a **local HTTP server only** — it does not implement networking between database nodes.
 
 ---
 
-## Project Overview
+## Portfolio Pitch
 
-ShardForgeDB is a ground-up database engine built to be transparent about how it works at every layer — from the WAL to the cluster coordinator. The goal is a system where every design decision, trade-off, and benchmark result is documented alongside the code.
+ShardForgeDB is a ground-up Go database engine designed to be fully explainable at every layer — from the write-ahead log to the replication log. Every design decision, trade-off, and benchmark result is documented alongside the code.
 
-## Architecture Goal
+Built to demonstrate:
+
+- **LSM-tree key-value core** — WAL, MemTable, SSTable, Bloom filter, manual full compaction
+- **Exact vector search** — cosine / L2 / dot product, brute-force, Engine-backed persistence
+- **Local key-value sharding** — FNV-1a consistent-hash ring across multiple in-process Engine instances
+- **Local replication simulation** — leader/follower operation log, pause/lag/catch-up controls
+- **Local HTTP dashboard and chaos scenarios** — observable stats, HTML view, deterministic failure scenarios
+- **Strict test/benchmark/docs discipline** — race-safe tests, reproducible benchmarks, honest scope docs
+
+---
+
+## Honesty / Scope
+
+Sharding, replication, and the dashboard are **local in-process simulations** — not distributed systems:
+
+| Feature | What is implemented | What is NOT implemented |
+|---------|--------------------|-----------------------|
+| Sharding | FNV-1a hash ring over local Engine instances, single process | Networked cluster, RPC, shard migration |
+| Replication | Leader/follower log, pause/lag simulation, single process | Raft, consensus, automatic leader election, quorum, fault tolerance |
+| Dashboard | Local HTTP server (`127.0.0.1:8080`), chaos scenarios via replica API | Real distributed monitoring, networked node discovery |
+| Vector search | Exact brute-force k-NN, cosine/L2/dot | ANN, HNSW, IVF, approximate search |
+| Compaction | Manual full compaction (`Compact()`) | Background compaction, automatic thresholds, leveled/size-tiered |
+
+---
+
+## Architecture
 
 ```
 Client
   │
   ▼
 Engine (key-value + vector)
-  ├── WAL      — durable write-ahead log
-  ├── MemTable — in-memory write buffer (skip list)
+  ├── WAL      — durable, CRC-checksummed write-ahead log
+  ├── MemTable — ordered, concurrent in-memory write buffer
   ├── SSTables — sorted, immutable on-disk segments
-  ├── Bloom    — probabilistic membership filters
+  ├── Bloom    — deterministic probabilistic membership filters
   └── Vector   — exact k-nearest-neighbour index (cosine / L2 / dot)
 
-Cluster
-  ├── Sharding     — consistent-hash partitioning
-  └── Replication  — leader/follower replication
+Simulation Layers (all single-process, no networking)
+  ├── Shard    — consistent-hash routing over multiple local Engines
+  ├── Replica  — leader/follower operation log with pause/lag/catch-up
+  └── Dashboard — local HTTP observability + deterministic chaos scenarios
 ```
 
-Implemented components are tracked in the phase list below. Later distributed-system features remain intentionally scoped as local simulations unless explicitly marked otherwise.
+Implemented components are tracked in the phase list below.
 
-## Current Phase
+---
+
+## Quickstart
+
+```bash
+# Build all three binaries
+make build
+
+# Run all tests (race detector on)
+make test
+
+# Run a benchmark report (small scale)
+make bench-report
+
+# Run the local dashboard demo
+./bin/shardforge-dashboard --demo
+
+# Run the local dashboard demo with chaos scenarios
+./bin/shardforge-dashboard --demo --run-chaos
+
+# Fast smoke validation
+./scripts/smoke.sh
+
+# Full release check
+./scripts/release_check.sh
+```
+
+---
+
+## Demo Commands
+
+```bash
+./bin/shardforge --help
+./bin/shardforge version
+
+./bin/shardforge-bench --scale small --out /tmp/shardforge-bench.md
+
+./bin/shardforge-dashboard --demo
+./bin/shardforge-dashboard --demo --run-chaos
+./bin/shardforge-dashboard --addr 127.0.0.1:9090 --demo
+```
+
+---
+
+## Phase Implementation Status
 
 **Phase 1 — Project Foundation** ✓ locked
 
@@ -100,7 +173,7 @@ Implemented components are tracked in the phase list below. Later distributed-sy
 - [x] Crash-safe invariants: orphan files pre-manifest-commit are ignored on restart
 - [x] Concurrent-safe via `sync.RWMutex`; idempotent `Close`
 - [x] 45 tests, 10 benchmarks
-- [x] This is a **single-node** engine only — no compaction, no distribution, no vector search
+- [x] **Single-node engine only** — no compaction, no distributed deployment, no vector search
 
 **Phase 7 — Manual Full Compaction** ✓ locked
 
@@ -146,28 +219,23 @@ Implemented components are tracked in the phase list below. Later distributed-sy
 **Phase 10 — Single-process Key-value Sharding** ✓ locked
 
 - [x] `internal/shard` — deterministic consistent-hash key-value sharding over multiple local engines
-- [x] Multiple local `Engine` instances as shards — **no networking, no RPC, no cluster**
+- [x] Multiple local `Engine` instances as shards — **no database-node networking, no RPC, no cluster**
 - [x] Static shard count; configuration stored in atomic `SHARDING.json` manifest
 - [x] FNV-1a 64-bit consistent hash ring with configurable virtual nodes (default 128)
 - [x] `Open`, `Put`, `Delete`, `Get`, `Scan`, `Flush`, `Compact`, `Stats`, `ShardForKey`, `Close` API
 - [x] Single-key operations route to exactly one shard; empty key returns `ErrInvalidKey`
 - [x] Fan-out `Scan`: all shards queried, results merged and sorted by key; duplicate keys resolved by highest Seq
-- [x] `Flush` and `Compact` applied to every shard; first failure returns wrapped shard error
 - [x] Manifest atomicity: written via temp file + rename; validates version, hash, paths, duplicate IDs/names
 - [x] Reopen safety: manifest values loaded on reopen; mismatched options return `ErrShardMismatch`
 - [x] Concurrent-safe: `sync.RWMutex` guards closed flag; each engine handles its own synchronisation
 - [x] Makefile target: `bench-shard`
 - [x] 55 tests, 10 benchmarks in `internal/shard`
-- [x] **Local single-process sharding only** — no replication, no networking, no distributed cluster, no Raft, no consensus, no shard migration
-
-> No ANN, no HNSW, no IVF, no approximate search. Phase 9 vector search is **exact brute-force only**.
-> No background compaction, no size-tiered compaction, no leveled compaction.
-> No automatic flush. No networking. No distributed deployment. No Raft. No consensus.
+- [x] **Local single-process sharding only** — no replication, no database-node networking, no distributed cluster, no Raft, no consensus, no shard migration
 
 **Phase 11 — Local In-process Leader/Follower Replication Simulation** ✓ locked
 
 - [x] `internal/replica` — local in-process leader/follower replication simulation for key-value operations
-- [x] Multiple local `Engine` instances as replicas — **no networking, no RPC, no distributed deployment**
+- [x] Multiple local `Engine` instances as replicas — **no database-node networking, no RPC, no distributed deployment**
 - [x] Configured leader; followers receive operations via deterministic replication log
 - [x] Append-only binary replication log with CRC-32 per record; durable restart/recovery
 - [x] `Open`, `Put`, `Delete`, `Get`, `Scan`, `ReplicateOnce`, `ReplicateAll`, `Stats`, `Close` API
@@ -179,121 +247,111 @@ Implemented components are tracked in the phase list below. Later distributed-sy
 - [x] Concurrent-safe: `sync.RWMutex` guards closed flag and shared state
 - [x] Makefile target: `bench-replica`
 - [x] 66 tests, 10 benchmarks in `internal/replica`
-- [x] **Local in-process simulation only** — no networking, no RPC, no Raft, no consensus, no automatic leader election, no quorum, no fault-tolerant distributed claims
+- [x] **Local in-process simulation only** — no database-node networking, no RPC, no Raft, no consensus, no automatic leader election, no quorum, no fault-tolerant distributed claims
 
-**Phase 12 — Local Dashboard and Chaos/Failure Simulation** (branch: `phase-12-dashboard-chaos`, in review)
+**Phase 12 — Local Dashboard and Chaos/Failure Simulation** ✓ locked
 
 - [x] `internal/dashboard` — local HTTP observability dashboard and chaos scenario runner
-- [x] Local HTTP server serving HTML dashboard, JSON `/status`, `/healthz`, `/events` endpoints
+- [x] **Local HTTP server** (`127.0.0.1:8080`) — does NOT implement database-node networking or RPC
+- [x] HTML dashboard (`GET /`), JSON status (`GET /status`), healthz (`GET /healthz`), events (`GET /events`)
+- [x] GET-only endpoints; unknown paths → 404; non-GET methods → 405 with `Allow: GET` header
 - [x] `EngineCollector`, `ShardCollector`, `ReplicaCollector`, `MultiCollector`, `ScenarioCollector`
 - [x] Three deterministic local chaos scenarios: follower pause, follower lag, follower catch-up
 - [x] `RunFollowerPauseScenario`, `RunFollowerLagScenario`, `RunFollowerCatchupScenario`
 - [x] Timeline event recording in all scenarios; events exposed through dashboard
-- [x] `cmd/shardforge-dashboard` CLI with `--demo` and `--run-chaos` flags
+- [x] `cmd/shardforge-dashboard` CLI with `--demo`, `--run-chaos`, `--addr` flags
 - [x] HTML rendered via Go standard library `html/template`; no external JS dependencies
-- [x] Footer states: "Local dashboard only — no networking, no Raft, no consensus, no distributed cluster."
-- [x] Makefile targets: `dashboard`, `bench-dashboard`; build target updated to include `bin/shardforge-dashboard`
-- [x] 46 tests, 8 benchmarks in `internal/dashboard`
-- [x] **Local only** — no networking between database nodes, no RPC, no Raft, no consensus, no distributed cluster, no shard migration, no resharding, no vector replication, no ANN/HNSW/IVF
+- [x] Footer: "Local dashboard only — no networking, no Raft, no consensus, no distributed cluster."
+- [x] Makefile targets: `dashboard`, `bench-dashboard`; build produces `bin/shardforge-dashboard`
+- [x] 52 tests, 8 benchmarks in `internal/dashboard`
+- [x] **Local only** — no database-node networking, no RPC, no Raft, no consensus, no distributed cluster
 
-## Planned Phases
+**Phase 13 — Final Polish + Release Hardening** (branch: `phase-13-polish-release`, in review)
 
-| Phase | Focus |
-|-------|-------|
-| 2 | WAL — durable, append-only write log |
-| 3 | MemTable — concurrent in-memory write buffer |
-| 4 | SSTable — sorted, immutable on-disk segments |
-| 5 | Bloom filters — fast negative-key lookups |
-| 6 | Engine — key-value read/write/delete |
-| 7 | Manual full compaction |
-| 8 | Benchmarking and workload evaluation |
-| 9 | Vector search — exact k-NN (cosine / L2 / dot) |
-| 10 | Sharding — consistent-hash partitioning |
-| 11 | Replication — local leader/follower simulation (no Raft, no networking) |
-| 12 | Dashboard, chaos / failure simulation |
+- [x] Docs consistency pass across all phases
+- [x] README: full rewrite with portfolio pitch, quickstart, scope section, demo commands
+- [x] Release scripts: `scripts/smoke.sh`, `scripts/demo.sh`, `scripts/release_check.sh`
+- [x] Release checklist: `docs/RELEASE_CHECKLIST.md`
+- [x] Project summary: `docs/PROJECT_SUMMARY.md`
+- [x] Makefile targets: `smoke`, `demo`, `release-check`
+- [x] **No new engine features** — polish, docs, scripts, and release hardening only
 
-## Features NOT Yet Implemented
+---
 
-The following are **not** present in the current codebase:
+## Not Implemented
 
-- Background compaction (Compact() is manual only)
-- Automatic compaction thresholds
-- Leveled or size-tiered compaction
-- ANN / HNSW / IVF vector search — Phase 9 is **exact brute-force only**, not approximate
-- Real networking or RPC
-- Distributed deployment
-- Raft or full consensus
-- Automatic leader election
-- Fault-tolerant quorum replication
-- Shard migration or resharding
-- Dashboard / monitoring
+The following are **not** present in the current codebase and are not claimed:
 
-## How to Build
+| Category | Not implemented |
+|----------|----------------|
+| Compaction | Background compaction, automatic thresholds, leveled compaction, size-tiered compaction |
+| Networking | Database-node networking, RPC, distributed deployment, cluster membership |
+| Consensus | Raft, Paxos, full consensus, automatic leader election, fault-tolerant quorum |
+| Distribution | Shard migration, resharding, distributed transactions, vector replication |
+| Vector search | ANN, HNSW, IVF, approximate nearest-neighbour |
+| Monitoring | Production monitoring, real-time alerting, distributed tracing |
+| Dashboard | Networked node discovery, multi-host monitoring, production deployment |
+
+---
+
+## Build and Run
 
 ```bash
-make build          # produces bin/shardforge and bin/shardforge-bench
-```
+# Build all three binaries into bin/
+make build
 
-Or directly:
-
-```bash
+# Individual binaries
 go build -o bin/shardforge ./cmd/shardforge
 go build -o bin/shardforge-bench ./cmd/shardforge-bench
+go build -o bin/shardforge-dashboard ./cmd/shardforge-dashboard
 ```
 
-## How to Run
+## Test and Benchmark
 
 ```bash
-./bin/shardforge --help
-./bin/shardforge version
+make test                    # go test -race -count=1 ./...
+make vet                     # go vet ./...
+make bench-report            # generate docs/BENCHMARKS.md (small scale)
+make bench-engine            # engine Go benchmarks
+make bench-replica           # replica Go benchmarks
+make bench-vector            # vector Go benchmarks
+make bench-shard             # shard Go benchmarks
+make bench-dashboard         # dashboard Go benchmarks
 ```
 
-## How to Run Benchmarks
+## Scripts
 
 ```bash
-# Generate Markdown report (small scale, fast)
-make bench-report
+./scripts/smoke.sh           # fast smoke validation
+./scripts/demo.sh            # demo sequence
+./scripts/release_check.sh   # full release gate
+```
 
-# Or directly:
-go run ./cmd/shardforge-bench --scale small --out docs/BENCHMARKS.md
+## All Makefile Targets
 
-# Run a single workload
-go run ./cmd/shardforge-bench --workload write-heavy
-
-# Medium scale (stronger local run)
-go run ./cmd/shardforge-bench --scale medium --out /tmp/bench-medium.md
-
-# Run existing Go package benchmarks
+```bash
+make all           # fmt + vet + build
+make build         # compile bin/shardforge, bin/shardforge-bench, bin/shardforge-dashboard
+make test          # go test -race -count=1 ./...
+make fmt           # format source files
+make vet           # static analysis
+make lint          # run golangci-lint (skipped if not installed)
+make bench         # run all Go benchmarks across all packages
 make bench-engine
+make bench-replica
+make bench-vector
+make bench-shard
+make bench-dashboard
+make bench-report  # generate docs/BENCHMARKS.md (small scale)
+make dashboard     # run shardforge-dashboard --demo
+make smoke         # ./scripts/smoke.sh
+make demo          # ./scripts/demo.sh
+make release-check # ./scripts/release_check.sh
+make clean         # remove bin/
+make help          # list all targets
 ```
 
-## How to Run Tests
-
-```bash
-make test           # go test -race ./...
-```
-
-Or directly:
-
-```bash
-go test -race -count=1 ./...
-```
-
-## Other Makefile Targets
-
-```bash
-make fmt          # format source files
-make vet          # static analysis
-make lint         # run golangci-lint (skipped if not installed)
-make bench        # run all Go benchmarks
-make bench-engine   # run engine Go benchmarks
-make bench-replica  # run replica Go benchmarks
-make bench-vector # run vector Go benchmarks
-make bench-shard  # run shard Go benchmarks
-make bench-report # generate docs/BENCHMARKS.md (small scale)
-make clean        # remove bin/
-make help         # list all targets
-```
+---
 
 ## Requirements
 

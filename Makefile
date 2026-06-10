@@ -8,7 +8,7 @@ DASHBOARD_CMD    := ./cmd/shardforge-dashboard
 GO               := go
 GOFLAGS          :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-report dashboard help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-report dashboard smoke demo release-check help
 
 all: fmt vet build
 
@@ -70,6 +70,18 @@ dashboard:
 ## bench-report: run the workload benchmark suite (small scale) and write docs/BENCHMARKS.md
 bench-report:
 	$(GO) run $(BENCH_CMD) --scale small --out docs/BENCHMARKS.md
+
+## smoke: fast smoke validation (test + vet + build + CLI checks)
+smoke:
+	./scripts/smoke.sh
+
+## demo: recruiter-friendly demo sequence (build + version + bench + dashboard instructions)
+demo:
+	./scripts/demo.sh
+
+## release-check: full release gate (all tests + benchmarks + build + CLI + clean tree)
+release-check:
+	./scripts/release_check.sh
 
 ## clean: remove build artifacts
 clean:

@@ -1210,3 +1210,77 @@ In `--demo` mode the CLI:
 4. Starts the HTTP server and blocks until Ctrl+C.
 
 Uses only Go standard library `flag` package — no external dependencies.
+
+---
+
+## Release Scope
+
+### What Is Stable in This Release
+
+Every phase through Phase 12 is implemented, tested (race-safe), benchmarked, and documented:
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| WAL | Stable | Binary format, CRC, replay, sequence numbers |
+| MemTable | Stable | Sorted concurrent buffer, tombstones |
+| SSTable | Stable | Immutable segments, index, CRC footer, atomic creation |
+| Bloom Filter | Stable | Deterministic FNV-1a double hashing, serializable |
+| Engine | Stable | Full LSM-tree read/write path, WAL replay, manifest |
+| Compaction | Stable | Manual full compaction only |
+| Vector Search | Stable | Exact brute-force k-NN, cosine/L2/dot |
+| Sharding | Stable | FNV-1a consistent-hash, single-process |
+| Replication | Stable | Binary op-log, leader-commit, COMMIT file, pause/lag simulation |
+| Dashboard | Stable | Local HTTP server, HTML+JSON endpoints, chaos scenarios |
+| Scripts | Stable | smoke.sh, demo.sh, release_check.sh |
+
+### What Is Intentionally Not Included
+
+The following are explicitly out of scope and make no claims of implementation:
+
+- **Background/automatic/leveled/size-tiered compaction** — Compact() is manual only.
+- **Database-node networking or RPC** — All components run in a single OS process.
+- **Raft or any consensus protocol** — No distributed log, no leader election, no fault tolerance.
+- **Fault-tolerant quorum replication** — Replication simulation does not survive process death.
+- **Shard migration or resharding** — Shard topology is static at Open() time.
+- **ANN/HNSW/IVF vector search** — Vector search is exact brute-force only.
+- **Production monitoring** — Dashboard is a local simulation tool, not a monitoring system.
+- **Distributed transactions** — No MVCC, no cross-node atomic operations.
+
+### Why Local Simulation Phases Exist
+
+Phases 10 (sharding), 11 (replication), and 12 (dashboard) demonstrate the *mechanics* of distributed database patterns without the complexity of network programming:
+
+- **Sharding** shows consistent-hash routing and multi-engine fan-out correctly.
+- **Replication** shows leader/follower operation propagation, stale read semantics, and commit durability correctly.
+- **Dashboard** shows observable system state and deterministic failure scenario execution correctly.
+
+Each could be extended to a real distributed system by adding an RPC transport layer. That is intentionally left as future work to keep the current scope honest and self-contained.
+
+---
+
+## Phase 13 — Final Polish and Release Hardening
+
+### Goals
+
+- Make the repository clean, accurate, demo-ready, and recruiter-readable.
+- Ensure all documentation is internally consistent across phases 1–12.
+- Add release scripts for fast smoke validation and full release gating.
+- Add a release checklist and project summary for portfolio use.
+- Fix any wording that could mislead about scope (e.g. blanket "no networking" when Phase 12 adds a local HTTP server).
+
+### Changes
+
+- **README.md**: Full rewrite — portfolio pitch, quickstart, demo commands, scope table, not-implemented table.
+- **docs/DESIGN.md**: Release Scope section, Phase 13 section.
+- **docs/PROOF.md**: Phase 13 section.
+- **docs/BENCHMARKS.md**: Benchmark Reproducibility section.
+- **docs/RELEASE_CHECKLIST.md**: Build, test, benchmark, demo, scope honesty, resume/LinkedIn checklists.
+- **docs/PROJECT_SUMMARY.md**: One-paragraph overview, architecture, phase map, recruiter bullets, "what next" section.
+- **scripts/smoke.sh**: Fast smoke validation.
+- **scripts/demo.sh**: Recruiter-friendly demo sequence.
+- **scripts/release_check.sh**: Full release gate with clean tree check.
+- **Makefile**: `smoke`, `demo`, `release-check` targets.
+
+### No Behavior Changes
+
+Phase 13 does not change any Go package behavior. No new packages. No Engine, Shard, Replica, Vector, Dashboard, WAL, MemTable, SSTable, or Bloom changes.

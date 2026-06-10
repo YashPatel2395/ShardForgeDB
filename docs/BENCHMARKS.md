@@ -230,3 +230,38 @@ make bench-engine
 ```
 
 Results will vary by hardware. Fill in the Environment section with your machine details for reproducibility.
+
+---
+
+## Benchmark Reproducibility
+
+All numbers in this document are from a local development machine (Apple M3, darwin/arm64, Go 1.26) running `go test -bench=. -benchmem`.
+
+**These numbers are not universal performance claims.** They will vary by:
+
+- CPU architecture and clock speed
+- Memory bandwidth and cache sizes
+- Storage device (NVMe vs. HDD vs. tmpfs)
+- OS scheduler and background load
+- Go version
+
+To reproduce:
+
+```bash
+# Full release benchmark suite
+./scripts/release_check.sh
+
+# Individual packages
+make bench-engine
+make bench-replica
+make bench-shard
+make bench-vector
+make bench-dashboard
+
+# Workload report
+make bench-report
+```
+
+**Note on COMMIT file writes:** The COMMIT file (written on every leader Put/Delete) uses `os.WriteFile` + `os.Rename` — atomic on POSIX filesystems for same-directory renames. Neither the COMMIT file nor its parent directory is explicitly fsynced. This is reflected in benchmark numbers; there is no "COMMIT fsync" overhead.
+
+**Note on Phase 10/11/12 sections:** The benchmark report generator (`make bench-report`) only covers the engine workload suite. The Phase 10, 11, and 12 sections below are manually maintained from separate `go test -bench` runs and must be re-added if `make bench-report` strips them. Use `git restore docs/BENCHMARKS.md` after `make bench-report` if only timing numbers changed.

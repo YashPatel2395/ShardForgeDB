@@ -14,6 +14,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -37,17 +38,26 @@ func main() {
 	os.Exit(run(os.Args[1:]))
 }
 
+// run parses args and executes the requested command.
+// It delegates to runWithWriters using os.Stdout and os.Stderr.
 func run(args []string) int {
+	return runWithWriters(args, os.Stdout, os.Stderr)
+}
+
+// runWithWriters is the testable core of the CLI.
+// stdout receives normal output; stderr receives errors and usage.
+func runWithWriters(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("shardforge-gateway", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	nodes := fs.String("nodes", "", "comma-separated list of node base URLs (required)\n    e.g. http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103")
 	vn := fs.Int("virtual-nodes", 128, "number of virtual ring points per node")
 	timeoutStr := fs.String("timeout", "5s", "per-request HTTP timeout (e.g. 5s, 1m)")
 
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, disclaimer)
-		fmt.Fprintf(os.Stderr, "\nUsage: shardforge-gateway --nodes <urls> <command> [args]\n\nFlags:\n")
+		fmt.Fprint(stderr, disclaimer)
+		fmt.Fprintf(stderr, "\nUsage: shardforge-gateway --nodes <urls> <command> [args]\n\nFlags:\n")
 		fs.PrintDefaults()
-		fmt.Fprintf(os.Stderr, `
+		fmt.Fprintf(stderr, `
 Commands:
   route   <key>         print the node selected for key (no network call)
   put     <key> <value> write key/value to the routed node
@@ -69,24 +79,26 @@ Examples:
 	}
 
 	if err := fs.Parse(args); err != nil {
+		// flag.ContinueOnError returns ErrHelp for --help; that is non-zero but
+		// the usage was already printed to stderr. Return 1 for any parse error.
 		return 1
 	}
 
 	if *nodes == "" {
-		fmt.Fprintln(os.Stderr, "error: --nodes is required")
+		fmt.Fprintln(stderr, "error: --nodes is required")
 		fs.Usage()
 		return 1
 	}
 
 	timeout, err := time.ParseDuration(*timeoutStr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: invalid --timeout %q: %v\n", *timeoutStr, err)
+		fmt.Fprintf(stderr, "error: invalid --timeout %q: %v\n", *timeoutStr, err)
 		return 1
 	}
 
 	nodeCfgs := buildNodeConfigs(*nodes)
 	if len(nodeCfgs) == 0 {
-		fmt.Fprintln(os.Stderr, "error: --nodes must contain at least one valid URL")
+		fmt.Fprintln(stderr, "error: --nodes must contain at least one valid URL")
 		return 1
 	}
 
@@ -96,14 +108,14 @@ Examples:
 		Timeout:      timeout,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: gateway open: %v\n", err)
+		fmt.Fprintf(stderr, "error: gateway open: %v\n", err)
 		return 1
 	}
 	defer g.Close()
 
 	remaining := fs.Args()
 	if len(remaining) == 0 {
-		fmt.Fprintln(os.Stderr, "error: a command is required (route, put, get, delete, health, flush-all, compact-all)")
+		fmt.Fprintln(stderr, "error: a command is required (route, put, get, delete, health, flush-all, compact-all)")
 		fs.Usage()
 		return 1
 	}
@@ -115,56 +127,56 @@ Examples:
 	switch cmd {
 	case "route":
 		if len(cmdArgs) < 1 {
-			fmt.Fprintln(os.Stderr, "usage: route <key>")
+			fmt.Fprintln(stderr, "usage: route <key>")
 			return 1
 		}
 		rn, err := g.NodeForKey([]byte(cmdArgs[0]))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			fmt.Fprintf(stderr, "error: %v\n", err)
 			return 1
 		}
-		fmt.Printf("key=%q → node_id=%s  base_url=%s\n", cmdArgs[0], rn.ID, rn.BaseURL)
+		fmt.Fprintf(stdout, "key=%q → node_id=%s  base_url=%s\n", cmdArgs[0], rn.ID, rn.BaseURL)
 
 	case "put":
 		if len(cmdArgs) < 2 {
-			fmt.Fprintln(os.Stderr, "usage: put <key> <value>")
+			fmt.Fprintln(stderr, "usage: put <key> <value>")
 			return 1
 		}
 		if err := g.Put(ctx, []byte(cmdArgs[0]), []byte(cmdArgs[1])); err != nil {
-			fmt.Fprintf(os.Stderr, "error: put: %v\n", err)
+			fmt.Fprintf(stderr, "error: put: %v\n", err)
 			return 1
 		}
 		rn, _ := g.NodeForKey([]byte(cmdArgs[0]))
-		fmt.Printf("ok  key=%q stored on node=%s\n", cmdArgs[0], rn.ID)
+		fmt.Fprintf(stdout, "ok  key=%q stored on node=%s\n", cmdArgs[0], rn.ID)
 
 	case "get":
 		if len(cmdArgs) < 1 {
-			fmt.Fprintln(os.Stderr, "usage: get <key>")
+			fmt.Fprintln(stderr, "usage: get <key>")
 			return 1
 		}
 		val, found, err := g.Get(ctx, []byte(cmdArgs[0]))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: get: %v\n", err)
+			fmt.Fprintf(stderr, "error: get: %v\n", err)
 			return 1
 		}
 		if !found {
-			fmt.Printf("not found  key=%q\n", cmdArgs[0])
+			fmt.Fprintf(stdout, "not found  key=%q\n", cmdArgs[0])
 			return 1
 		}
 		rn, _ := g.NodeForKey([]byte(cmdArgs[0]))
-		fmt.Printf("found  key=%q  value=%q  node=%s\n", cmdArgs[0], val, rn.ID)
+		fmt.Fprintf(stdout, "found  key=%q  value=%q  node=%s\n", cmdArgs[0], val, rn.ID)
 
 	case "delete":
 		if len(cmdArgs) < 1 {
-			fmt.Fprintln(os.Stderr, "usage: delete <key>")
+			fmt.Fprintln(stderr, "usage: delete <key>")
 			return 1
 		}
 		if err := g.Delete(ctx, []byte(cmdArgs[0])); err != nil {
-			fmt.Fprintf(os.Stderr, "error: delete: %v\n", err)
+			fmt.Fprintf(stderr, "error: delete: %v\n", err)
 			return 1
 		}
 		rn, _ := g.NodeForKey([]byte(cmdArgs[0]))
-		fmt.Printf("ok  key=%q deleted from node=%s\n", cmdArgs[0], rn.ID)
+		fmt.Fprintf(stdout, "ok  key=%q deleted from node=%s\n", cmdArgs[0], rn.ID)
 
 	case "health":
 		results := g.HealthAll(ctx)
@@ -172,9 +184,9 @@ Examples:
 		for _, nc := range nodeCfgs {
 			err := results[nc.ID]
 			if err == nil {
-				fmt.Printf("ok      %s  %s\n", nc.ID, nc.BaseURL)
+				fmt.Fprintf(stdout, "ok      %s  %s\n", nc.ID, nc.BaseURL)
 			} else {
-				fmt.Printf("ERROR   %s  %s  %v\n", nc.ID, nc.BaseURL, err)
+				fmt.Fprintf(stdout, "ERROR   %s  %s  %v\n", nc.ID, nc.BaseURL, err)
 				exitCode = 1
 			}
 		}
@@ -182,20 +194,20 @@ Examples:
 
 	case "flush-all":
 		if err := g.FlushAll(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "error: flush-all: %v\n", err)
+			fmt.Fprintf(stderr, "error: flush-all: %v\n", err)
 			return 1
 		}
-		fmt.Printf("ok  flushed %d node(s)\n", len(nodeCfgs))
+		fmt.Fprintf(stdout, "ok  flushed %d node(s)\n", len(nodeCfgs))
 
 	case "compact-all":
 		if err := g.CompactAll(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "error: compact-all: %v\n", err)
+			fmt.Fprintf(stderr, "error: compact-all: %v\n", err)
 			return 1
 		}
-		fmt.Printf("ok  compacted %d node(s)\n", len(nodeCfgs))
+		fmt.Fprintf(stdout, "ok  compacted %d node(s)\n", len(nodeCfgs))
 
 	default:
-		fmt.Fprintf(os.Stderr, "error: unknown command %q\n", cmd)
+		fmt.Fprintf(stderr, "error: unknown command %q\n", cmd)
 		fs.Usage()
 		return 1
 	}
@@ -204,17 +216,18 @@ Examples:
 }
 
 // buildNodeConfigs parses a comma-separated list of base URLs into NodeConfig slice.
-// Node IDs are assigned deterministically as node-1, node-2, ...
+// Node IDs are assigned compactly and deterministically as node-1, node-2, ...
+// based on the order of valid (non-empty) URLs, ignoring empty comma entries.
 func buildNodeConfigs(raw string) []gateway.NodeConfig {
 	parts := strings.Split(raw, ",")
 	cfgs := make([]gateway.NodeConfig, 0, len(parts))
-	for i, p := range parts {
+	for _, p := range parts {
 		u := strings.TrimSpace(p)
 		if u == "" {
 			continue
 		}
 		cfgs = append(cfgs, gateway.NodeConfig{
-			ID:      fmt.Sprintf("node-%d", i+1),
+			ID:      fmt.Sprintf("node-%d", len(cfgs)+1),
 			BaseURL: u,
 		})
 	}

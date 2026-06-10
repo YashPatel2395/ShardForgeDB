@@ -1,9 +1,20 @@
 package main
 
 import (
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	return filepath.Join(filepath.Dir(file), "..", "..")
+}
 
 // runCapture calls runWithWriters and returns stdout, stderr, and exit code.
 func runCapture(args []string) (stdout, stderr string, code int) {
@@ -120,5 +131,55 @@ func TestBuildNodeConfigs_TrimSpaces(t *testing.T) {
 	}
 	if cfgs[1].BaseURL != "http://b" {
 		t.Errorf("BaseURL[1] = %q, want http://b", cfgs[1].BaseURL)
+	}
+}
+
+// TestRun_HelpIncludesConfig verifies --help mentions --config flag.
+func TestRun_HelpIncludesConfig(t *testing.T) {
+	_, errOut, _ := runCapture([]string{"--help"})
+	if !strings.Contains(errOut, "--config") {
+		t.Errorf("help output missing --config flag\nstderr: %s", errOut)
+	}
+}
+
+// TestRun_ConfigAndNodes_ReturnsNonZero verifies that providing both --config and
+// --nodes is rejected with a clear error.
+func TestRun_ConfigAndNodes_ReturnsNonZero(t *testing.T) {
+	_, errOut, code := runCapture([]string{
+		"--config", "configs/local-3node-with-proxy.json",
+		"--nodes", "http://127.0.0.1:9101",
+	})
+	if code == 0 {
+		t.Fatal("expected non-zero exit when both --config and --nodes are provided")
+	}
+	if !strings.Contains(errOut, "not both") {
+		t.Errorf("error message should say 'not both': %q", errOut)
+	}
+}
+
+// TestRun_Config_MissingFile_ReturnsNonZero verifies that a missing config file fails.
+func TestRun_Config_MissingFile_ReturnsNonZero(t *testing.T) {
+	_, _, code := runCapture([]string{"--config", "/nonexistent/cluster.json"})
+	if code == 0 {
+		t.Fatal("expected non-zero exit for missing config file")
+	}
+}
+
+// TestRun_Config_ValidatesConfig verifies that --config with a valid file passes
+// config validation (test does not start the long-running server; it uses a
+// deliberately invalid address to get a proxy.Open error, but validation must pass).
+func TestRun_Config_ValidatesConfig(t *testing.T) {
+	path := filepath.Join(repoRoot(t), "configs", "local-3node-with-proxy.json")
+	// We verify that the config file loads without a "load config" error.
+	// The proxy.Open may fail (no real nodes running) — but we can check that
+	// validation error messages are not present when the config is valid.
+	_, errOut, code := runCapture([]string{"--config", path})
+	// We expect non-zero (proxy.Open fails since no nodes are running),
+	// but NOT a "invalid config" / "load config" error.
+	if code == 0 {
+		t.Fatal("expected non-zero exit (no nodes running), got zero")
+	}
+	if strings.Contains(errOut, "invalid config") || strings.Contains(errOut, "load config") {
+		t.Errorf("unexpected config error: %q", errOut)
 	}
 }

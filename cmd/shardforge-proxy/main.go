@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/YashPatel2395/ShardForgeDB/internal/cluster"
 	"github.com/YashPatel2395/ShardForgeDB/internal/gateway"
 	"github.com/YashPatel2395/ShardForgeDB/internal/proxy"
 )
@@ -52,14 +53,15 @@ func runWithWriters(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("shardforge-proxy", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
-	addr := fs.String("addr", "127.0.0.1:9200", "proxy listen address (host:port)")
-	nodes := fs.String("nodes", "", "comma-separated list of node base URLs (required)\n    e.g. http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103")
-	vn := fs.Int("virtual-nodes", 128, "number of virtual ring points per node")
+	configPath := fs.String("config", "", "path to cluster config JSON file (use instead of --nodes)")
+	addr := fs.String("addr", "", "proxy listen address (host:port); overrides config when set")
+	nodes := fs.String("nodes", "", "comma-separated list of node base URLs (use instead of --config)\n    e.g. http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103")
+	vn := fs.Int("virtual-nodes", 0, "number of virtual ring points per node (0 = use config or default 128)")
 	timeoutStr := fs.String("timeout", "5s", "per-request HTTP timeout to backend nodes (e.g. 5s, 1m)")
 
 	fs.Usage = func() {
 		fmt.Fprint(stderr, disclaimer)
-		fmt.Fprintf(stderr, "\nUsage: shardforge-proxy --nodes <urls> [flags]\n\nFlags:\n")
+		fmt.Fprintf(stderr, "\nUsage: shardforge-proxy --nodes <urls> [flags]\n       shardforge-proxy --config <path> [flags]\n\nFlags:\n")
 		fs.PrintDefaults()
 		fmt.Fprintf(stderr, `
 Endpoints:
@@ -74,9 +76,12 @@ Endpoints:
   POST   /compact-all          compact all configured nodes
   GET    /nodes/health         health check all configured nodes
 
-Examples:
+Examples (--nodes):
   shardforge-proxy --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103
-  shardforge-proxy --addr 0.0.0.0:9200 --nodes http://127.0.0.1:9101 --timeout 10s
+
+Examples (--config):
+  shardforge-proxy --config configs/local-3node-with-proxy.json
+  shardforge-proxy --config configs/local-3node-with-proxy.json --addr 0.0.0.0:9200
 `)
 	}
 
@@ -84,8 +89,13 @@ Examples:
 		return 1
 	}
 
-	if *nodes == "" {
-		fmt.Fprintln(stderr, "error: --nodes is required")
+	// Reject using both --config and --nodes to avoid ambiguity.
+	if *configPath != "" && *nodes != "" {
+		fmt.Fprintln(stderr, "error: use either --config or --nodes, not both")
+		return 1
+	}
+	if *configPath == "" && *nodes == "" {
+		fmt.Fprintln(stderr, "error: --nodes or --config is required")
 		fs.Usage()
 		return 1
 	}
@@ -96,28 +106,61 @@ Examples:
 		return 1
 	}
 
-	nodeCfgs := buildNodeConfigs(*nodes)
-	if len(nodeCfgs) == 0 {
-		fmt.Fprintln(stderr, "error: --nodes must contain at least one valid URL")
-		return 1
+	var opts proxy.Options
+
+	if *configPath != "" {
+		cfg, err := cluster.Load(*configPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: load config: %v\n", err)
+			return 1
+		}
+		popts, err := cluster.ProxyOptions(cfg, timeout)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: proxy options: %v\n", err)
+			return 1
+		}
+		opts = popts
+		// --addr overrides config addr when explicitly provided.
+		if *addr != "" {
+			opts.Addr = *addr
+		}
+		// --virtual-nodes overrides config when explicitly provided (non-zero).
+		if *vn > 0 {
+			opts.VirtualNodes = *vn
+		}
+	} else {
+		nodeCfgs := buildNodeConfigs(*nodes)
+		if len(nodeCfgs) == 0 {
+			fmt.Fprintln(stderr, "error: --nodes must contain at least one valid URL")
+			return 1
+		}
+		listenAddr := *addr
+		if listenAddr == "" {
+			listenAddr = "127.0.0.1:9200"
+		}
+		virtualNodes := *vn
+		if virtualNodes <= 0 {
+			virtualNodes = 128
+		}
+		opts = proxy.Options{
+			Addr:         listenAddr,
+			Nodes:        nodeCfgs,
+			VirtualNodes: virtualNodes,
+			Timeout:      timeout,
+		}
 	}
 
-	srv, err := proxy.Open(proxy.Options{
-		Addr:         *addr,
-		Nodes:        nodeCfgs,
-		VirtualNodes: *vn,
-		Timeout:      timeout,
-	})
+	srv, err := proxy.Open(opts)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: proxy open: %v\n", err)
 		return 1
 	}
 
 	fmt.Fprint(stdout, disclaimer)
-	fmt.Fprintf(stdout, "listening on http://%s\n", *addr)
+	fmt.Fprintf(stdout, "listening on http://%s\n", srv.Addr())
 	fmt.Fprintf(stdout, "routing over %d node(s) with %d virtual ring points\n",
-		len(nodeCfgs), *vn)
-	for _, n := range nodeCfgs {
+		len(opts.Nodes), opts.VirtualNodes)
+	for _, n := range opts.Nodes {
 		fmt.Fprintf(stdout, "  %s → %s\n", n.ID, n.BaseURL)
 	}
 	fmt.Fprintln(stdout)

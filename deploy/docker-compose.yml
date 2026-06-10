@@ -5,6 +5,10 @@
 # no shared state, no automatic failover. Each node is an independent networked
 # key-value store. The proxy routes requests to nodes via consistent hashing.
 #
+# The proxy reads its cluster config from configs/docker-3node-with-proxy.json,
+# which is bind-mounted into the container at /etc/shardforge/cluster.json.
+# Node BaseURLs in that config use Docker service DNS names (shardforge-node-{1,2,3}).
+#
 # Usage:
 #   docker compose -f deploy/docker-compose.yml up --build
 #   curl http://localhost:9200/healthz
@@ -87,8 +91,9 @@ services:
     entrypoint: ["/usr/local/bin/shardforge-proxy"]
     container_name: shardforge-proxy
     command:
-      - --addr=0.0.0.0:9200
-      - --nodes=http://shardforge-node-1:9101,http://shardforge-node-2:9102,http://shardforge-node-3:9103
+      - --config=/etc/shardforge/cluster.json
+    volumes:
+      - ../configs/docker-3node-with-proxy.json:/etc/shardforge/cluster.json:ro
     ports:
       - "9200:9200"
     depends_on:

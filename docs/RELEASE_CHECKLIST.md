@@ -215,3 +215,63 @@ git status --short
 - ~~"Proxy retries requests on failure."~~
 - ~~"The system is fault-tolerant."~~
 - ~~"The gateway is a distributed router."~~
+
+---
+
+## Phase 17 — Static Cluster Metadata
+
+### Validation Commands
+
+```bash
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/cluster/...
+make test
+make vet
+make build
+make cluster-validate
+./bin/shardforge-gateway --config configs/local-3node.json route user:1
+./bin/shardforge-cluster validate configs/local-3node.json
+./bin/shardforge-cluster validate configs/local-3node-with-proxy.json
+./bin/shardforge-cluster validate configs/docker-3node-with-proxy.json
+./bin/shardforge-proxy --help
+./bin/shardforge-gateway --help
+./bin/shardforge-cluster --help
+docker compose -f deploy/docker-compose.yml config
+git status --short
+```
+
+- [ ] `make build` produces 7 binaries including `bin/shardforge-cluster`
+- [ ] `./bin/shardforge-cluster validate configs/local-3node.json` exits 0
+- [ ] `./bin/shardforge-cluster validate configs/local-3node-with-proxy.json` exits 0
+- [ ] `./bin/shardforge-cluster validate configs/docker-3node-with-proxy.json` exits 0
+- [ ] `./bin/shardforge-gateway --config configs/local-3node.json route user:1` prints correct node
+- [ ] `./bin/shardforge-proxy --help` mentions `--config`
+- [ ] `./bin/shardforge-gateway --help` mentions `--config`
+- [ ] `go test -race -count=1 ./internal/cluster/...` — all tests PASS
+- [ ] `make bench-cluster` — 4 benchmarks PASS
+
+### Phase 17 Scope Honesty Checklist
+
+- [ ] No claim of dynamic cluster membership
+- [ ] No claim of service discovery
+- [ ] No claim of gossip
+- [ ] No claim of Raft or consensus
+- [ ] No claim of leader election
+- [ ] No claim of replication or failover
+- [ ] Config files include `scope` object with all limitations set to `true`
+- [ ] Scope flags rejected if any are `false` (Validate enforces this)
+
+### Allowed claims (Phase 17)
+
+- "Implemented static cluster metadata and config-driven gateway/proxy startup."
+- "Cluster config is a validated JSON file describing independent nodes, routing settings, and proxy address."
+- "Config-based routing is deterministic and produces the same node assignments as --nodes."
+
+### Forbidden claims (Phase 17)
+
+- ~~"Implemented dynamic cluster membership or service discovery."~~
+- ~~"Nodes coordinate through the config."~~
+- ~~"Config provides automatic node health management."~~

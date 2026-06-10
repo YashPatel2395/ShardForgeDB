@@ -375,3 +375,28 @@ make bench-proxy
 # or
 go test -bench=. -benchmem -benchtime=3s -run='^$' ./internal/proxy/...
 ```
+
+---
+
+## Phase 17 — Static Cluster Metadata (`internal/cluster`)
+
+**Machine:** Apple M3, darwin/arm64, Go 1.26.4
+
+```
+BenchmarkCluster_Parse-8            516888     6962 ns/op   1448 B/op   28 allocs/op
+BenchmarkCluster_Validate-8       33941624      106 ns/op      0 B/op    0 allocs/op
+BenchmarkCluster_GatewayOptions-8 26254626      137 ns/op    128 B/op    1 allocs/op
+BenchmarkCluster_ProxyOptions-8   25481388      138 ns/op    128 B/op    1 allocs/op
+```
+
+Notes:
+- **Parse (~7 µs):** JSON decode + Normalize + Validate for a 3-node config.
+- **Validate (~106 ns):** zero-allocation pure struct validation.
+- **GatewayOptions/ProxyOptions (~138 ns):** validate + copy node slice; 1 allocation.
+
+**To reproduce:**
+```bash
+make bench-cluster
+# or
+go test -bench=. -benchmem -benchtime=3s -run='^$' ./internal/cluster/...
+```

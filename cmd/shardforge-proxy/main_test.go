@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -165,21 +166,23 @@ func TestRun_Config_MissingFile_ReturnsNonZero(t *testing.T) {
 	}
 }
 
-// TestRun_Config_ValidatesConfig verifies that --config with a valid file passes
-// config validation (test does not start the long-running server; it uses a
-// deliberately invalid address to get a proxy.Open error, but validation must pass).
-func TestRun_Config_ValidatesConfig(t *testing.T) {
-	path := filepath.Join(repoRoot(t), "configs", "local-3node-with-proxy.json")
-	// We verify that the config file loads without a "load config" error.
-	// The proxy.Open may fail (no real nodes running) — but we can check that
-	// validation error messages are not present when the config is valid.
-	_, errOut, code := runCapture([]string{"--config", path})
-	// We expect non-zero (proxy.Open fails since no nodes are running),
-	// but NOT a "invalid config" / "load config" error.
-	if code == 0 {
-		t.Fatal("expected non-zero exit (no nodes running), got zero")
+// TestRun_Config_InvalidJSON_ReturnsNonZero verifies that --config with an
+// invalid JSON file returns non-zero with a load error.
+// Note: Do NOT test --config with a valid file in CLI tests — proxy.Open succeeds
+// (ring creation is ring-only, no network calls) and the server blocks indefinitely
+// waiting for a signal. Use internal/cluster/loader_test.go for full proxy integration.
+func TestRun_Config_InvalidJSON_ReturnsNonZero(t *testing.T) {
+	// Write a temp file with invalid JSON.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
 	}
-	if strings.Contains(errOut, "invalid config") || strings.Contains(errOut, "load config") {
-		t.Errorf("unexpected config error: %q", errOut)
+	_, errOut, code := runCapture([]string{"--config", path})
+	if code == 0 {
+		t.Fatal("expected non-zero exit for invalid JSON config")
+	}
+	if !strings.Contains(errOut, "load config") {
+		t.Errorf("expected 'load config' in error: %q", errOut)
 	}
 }

@@ -306,3 +306,43 @@ make bench-node
 # or
 go test -bench=. -benchmem -benchtime=3s ./internal/node/...
 ```
+
+---
+
+## Phase 15 — Gateway Routing Benchmarks
+
+Machine: Apple M3, darwin/arm64, Go 1.21  
+Run: `go test -bench=. -benchmem -benchtime=3s ./internal/gateway/...`
+
+These benchmarks measure the gateway routing layer: ring lookup (pure computation)
+and full gateway operations through real HTTP loopback servers.
+
+### Ring Benchmark (no network)
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| BenchmarkRing_NodeForKey-8 | 22.90 | 0 | 0 |
+
+Ring lookup is 23 ns/op: FNV-1a hash + binary search on 384 points (3 nodes × 128 virtual). Zero allocations.
+
+### Gateway Benchmarks (real HTTP loopback, 3 nodes)
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| BenchmarkGateway_Put-8 | 39,530 | 10,921 | 123 |
+| BenchmarkGateway_Get-8 | 32,347 | 8,712 | 100 |
+| BenchmarkGateway_HealthAll-8 | 95,669 | 25,788 | 278 |
+| BenchmarkGateway_FlushAll-8 | 98,251 | 25,863 | 278 |
+| BenchmarkGateway_CompactAll-8 | 95,929 | 25,862 | 278 |
+
+**Notes:**
+- Put/Get route to one node only. Overhead vs. bare `node.Client` is the ring lookup (~23 ns), negligible.
+- HealthAll/FlushAll/CompactAll fan out to all 3 nodes. Cost ≈ 3× single-node RPC latency (~32 ms total).
+- All gateway benchmarks use real TCP loopback via `node.Server.StartBackground`.
+
+**To reproduce:**
+```bash
+make bench-gateway
+# or
+go test -bench=. -benchmem -benchtime=3s ./internal/gateway/...
+```

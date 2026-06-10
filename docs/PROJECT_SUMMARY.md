@@ -55,6 +55,7 @@ Docker Compose Demo (Phase 14)
 | 12 | `internal/dashboard` + `cmd/shardforge-dashboard` | Local HTTP dashboard, chaos scenarios, collectors | 52 | 8 |
 | 13 | scripts, docs | Polish, release hardening, scripts, release checklist | — | — |
 | 14 | `internal/node` + `cmd/shardforge-node` | Real networked node runtime, HTTP/JSON API, Docker Compose 3-node demo | 36 | 6 |
+| 15 | `internal/gateway` + `cmd/shardforge-gateway` | Client-side consistent-hash routing gateway, FNV-1a ring, weight support | 41 | 6 |
 
 ---
 
@@ -119,7 +120,8 @@ The design documents explicitly state these boundaries at every phase.
 - Built a local leader/follower replication simulation with binary operation log, COMMIT durability file, and follower pause/lag/catch-up controls
 - Built a local HTTP observability dashboard with HTML rendering, JSON status endpoints, and deterministic chaos/failure scenarios
 - Built a real networked node runtime: independent `shardforge-node` processes, HTTP/JSON API, Docker Compose 3-node demo
-- 500+ tests across all packages, race-safe, with reproducible benchmark results documented at every phase
+- Implemented a client-side routing gateway (`shardforge-gateway`) with deterministic consistent-hash routing, virtual nodes, weight support, and per-node health/flush/compact fanout
+- 550+ tests across all packages, race-safe, with reproducible benchmark results documented at every phase
 - Full documentation: DESIGN.md (architecture), PROOF.md (per-phase evidence), BENCHMARKS.md (reproducible numbers)
 
 ---

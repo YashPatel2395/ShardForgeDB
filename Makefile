@@ -2,25 +2,28 @@ BINARY           := shardforge
 BENCH_BINARY     := shardforge-bench
 DASHBOARD_BINARY := shardforge-dashboard
 NODE_BINARY      := shardforge-node
+GATEWAY_BINARY   := shardforge-gateway
 BUILD_DIR        := bin
 CMD              := ./cmd/shardforge
 BENCH_CMD        := ./cmd/shardforge-bench
 DASHBOARD_CMD    := ./cmd/shardforge-dashboard
 NODE_CMD         := ./cmd/shardforge-node
+GATEWAY_CMD      := ./cmd/shardforge-gateway
 GO               := go
 GOFLAGS          :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-report dashboard node node-demo node-demo-down smoke demo release-check help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-report dashboard node node-demo node-demo-down gateway-help gateway-demo smoke demo release-check help
 
 all: fmt vet build
 
-## build: compile shardforge, shardforge-bench, shardforge-dashboard, and shardforge-node into bin/
+## build: compile shardforge, shardforge-bench, shardforge-dashboard, shardforge-node, shardforge-gateway into bin/
 build:
 	@mkdir -p $(BUILD_DIR)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY) $(CMD)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BENCH_BINARY) $(BENCH_CMD)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(DASHBOARD_BINARY) $(DASHBOARD_CMD)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(NODE_BINARY) $(NODE_CMD)
+	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(GATEWAY_BINARY) $(GATEWAY_CMD)
 
 ## test: run all tests with race detection
 test:
@@ -70,6 +73,10 @@ bench-dashboard:
 bench-node:
 	$(GO) test -bench=. -benchmem ./internal/node/...
 
+## bench-gateway: run Go benchmarks for the gateway package only
+bench-gateway:
+	$(GO) test -bench=. -benchmem ./internal/gateway/...
+
 ## dashboard: run the local dashboard in demo mode
 dashboard:
 	$(GO) run $(DASHBOARD_CMD) --demo
@@ -77,6 +84,14 @@ dashboard:
 ## bench-report: run the workload benchmark suite (small scale) and write docs/BENCHMARKS.md
 bench-report:
 	$(GO) run $(BENCH_CMD) --scale small --out docs/BENCHMARKS.md
+
+## gateway-help: print shardforge-gateway help and scope disclaimer
+gateway-help:
+	./bin/shardforge-gateway --help
+
+## gateway-demo: show routing for a demo key against local nodes (requires node-demo running)
+gateway-demo:
+	./bin/shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 route user:1
 
 ## node: run shardforge-node locally (node-1 on 127.0.0.1:9101)
 node:

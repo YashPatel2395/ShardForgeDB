@@ -1383,3 +1383,80 @@ The next natural steps after Phase 14:
 4. **Cluster membership** — node discovery, join/leave protocols, gossip.
 5. **ANN vector index** — HNSW or IVF for approximate nearest-neighbour at scale.
 6. **Background compaction** — size-tiered or leveled, triggered automatically.
+
+---
+
+## Phase 15 — Client-Side Routing Gateway
+
+### Goals
+
+- Implement a client-side routing library (`internal/gateway`) that routes Put/Get/Delete to the correct independent `shardforge-node` using a deterministic consistent-hash ring.
+- Provide a `shardforge-gateway` CLI for direct key-routing, health checking, and admin operations.
+- Remain strictly honest: this is client-side routing only, not a distributed database.
+
+### Gateway Architecture
+
+```
+shardforge-gateway CLI
+  │
+  ▼
+gateway.Gateway (internal/gateway/client.go)
+  ├── hashRing (internal/gateway/ring.go)
+  │     ├── FNV-1a 64-bit hashing of "nodeID:i" for ring points
+  │     ├── Sorted ring points → O(log n) key lookup (binary search)
+  │     ├── Virtual nodes (default 128) + weight scaling
+  │     └── Deterministic: same config → same routing across restarts
+  └── map[nodeID]*node.Client
+        └── HTTP/JSON calls to shardforge-node processes (Phase 14)
+```
+
+### Consistent Hash Ring
+
+- Each node gets `VirtualNodes * max(Weight, 1)` ring points.
+- Ring points are keyed by `"nodeID:i"` and hashed with FNV-1a 64-bit.
+- Points are sorted by hash and stored in a slice for O(log n) lookup.
+- For a key: hash key → binary search for first point ≥ hash → wrap to 0 if past end.
+- Ring is built once at `Open` time and is immutable (no resharding, no membership changes).
+
+### Routing Behavior
+
+| Operation | Behavior |
+|-----------|----------|
+| `Put(key, value)` | Hash key → one node → `node.Client.Put` |
+| `Get(key)` | Hash key → same node → `node.Client.Get` |
+| `Delete(key)` | Hash key → same node → `node.Client.Delete` |
+| `ScanNode(nodeID, start, end)` | One named node only — no global scan |
+| `FlushAll` | Fan out to all nodes (admin operation) |
+| `CompactAll` | Fan out to all nodes (admin operation) |
+| `HealthAll` | Check all nodes, return map[nodeID]error |
+
+### No Retry to Another Node
+
+When the routed node is unavailable, `Put/Get/Delete` return an error immediately. There is **no retry to another node**. Reason: without replication, a key written to node-A cannot be found on node-B. Retrying would silently miss data and give a false "not found" result. Callers must handle node failures explicitly.
+
+### Scope Limitations
+
+- No distributed sharding inside nodes (nodes don't know about routing).
+- No networked replication (nodes don't propagate writes to each other).
+- No automatic failover (no retry, no secondary node).
+- No shard migration or resharding (ring is static).
+- No cluster metadata service (gateway config is caller-provided).
+- No distributed global scan (ScanNode is per-node only).
+- No distributed transactions.
+- No distributed vector search.
+- No Raft, no consensus, no quorum.
+- No automatic leader election.
+
+### CLI Design
+
+`shardforge-gateway` is a one-shot CLI (not a daemon). Each invocation creates a gateway,
+executes one command, and exits. Node IDs are assigned deterministically as `node-1`, `node-2`, ...
+from the `--nodes` URL list order.
+
+### Error Handling
+
+- Empty key → `ErrInvalidKey`.
+- Unknown nodeID in ScanNode → `ErrUnknownNode`.
+- Gateway closed → `ErrClosed` on all operations.
+- Node unreachable → error from `node.Client` propagated directly (no retry).
+- Duplicate node IDs or URLs → `ErrInvalidOptions` at `Open` time.

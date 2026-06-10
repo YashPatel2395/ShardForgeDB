@@ -926,12 +926,13 @@ This design avoids holding a global lock during engine I/O while still protectin
 ```
 <Dir>/
   REPLICATION.json        — atomic manifest (version, replica_count, leader_id, paths)
+  COMMIT                  — last committed LogIndex (atomic write; authoritative on restart)
   replog/
     log.dat               — append-only binary replication log
   replicas/
     replica-0000/         — leader Engine directory (Engine + WAL + SSTables)
     replica-0001/         — follower Engine directory
-      APPLIED             — last applied log index (ASCII decimal, atomically written)
+      APPLIED             — last applied log index (ASCII decimal, best-effort write)
     replica-0002/
       APPLIED
 ```
@@ -1029,12 +1030,16 @@ On `Open` with an existing `REPLICATION.json`:
 2. The replication log is opened and replayed into an in-memory operation cache.
 3. Each replica Engine is opened (WAL replayed internally by the Engine layer).
 4. Per-follower `APPLIED` files are read to restore applied indexes.
-5. `commitIndex` is set to the log's last index.
+5. `commitIndex` is loaded from the durable `COMMIT` file. If `COMMIT` is missing, `commitIndex = 0`. The log may have records beyond `commitIndex`; they are treated as uncommitted and are never replicated to followers.
 6. Followers do not automatically catch up on restart; callers must call `ReplicateAll`.
+
+The `COMMIT` file is the authoritative source for `commitIndex`. It is written atomically (temp+rename) on every successful `Put`/`Delete`, after the leader Engine write succeeds. Using `log.lastIndex()` as a proxy for `commitIndex` is incorrect because the log may have an uncommitted tail record whose leader write failed.
 
 ### Failure Limitations
 
-- If the process crashes after a log record is appended but before the leader Engine write succeeds, the log will have an uncommitted tail record. On restart, `commitIndex` reflects the log's last index (including the uncommitted record). The leader Engine may or may not have the write (depending on WAL replay). This is a known limitation; a production system would use explicit commit markers in the log or a two-phase write.
+- If the process crashes after a log record is appended but before the leader Engine write succeeds, the log will have an uncommitted tail record. On restart, `commitIndex` is loaded from `COMMIT` (which was not updated), so the uncommitted tail record is invisible to followers. The leader Engine may or may not have the write (depending on whether its WAL was flushed before the crash).
+- If `saveCommitIndex` fails (disk full, permission error), `Put`/`Delete` return an error and `commitIndex` is not advanced in memory. The log has an uncommitted tail record that will be permanently ignored after restart.
+- `APPLIED` persistence is best-effort: if the write fails and the process crashes, the follower may re-apply an already-applied operation on restart. The Engine is idempotent for repeated same-key writes (higher Seq wins), so correctness is preserved at the cost of potentially different sequence numbers.
 - If a follower `APPLIED` write fails (best-effort), the follower may re-apply an already-applied operation on restart. The Engine is idempotent for repeated same-key writes at higher sequence numbers, so correctness is preserved but Seq numbers may differ.
 - Pause/lag simulation does not persist across restarts.
 

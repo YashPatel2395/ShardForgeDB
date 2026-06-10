@@ -165,9 +165,13 @@ func Open(opts Options) (*Store, error) {
 		})
 	}
 
-	// The commit index is the last index in the log (leader-commit semantics:
-	// everything in the log is committed).
-	commitIndex := ol.lastIndex()
+	// Load the committed index from the durable COMMIT file. If the file does
+	// not exist (new store or missing), commit index is 0. We intentionally do
+	// NOT fall back to log.lastIndex(): the log may have an uncommitted tail
+	// record whose leader Engine write failed before commitIndex was advanced.
+	// Treating every log record as committed would allow followers to apply
+	// operations the leader never acknowledged, breaking leader-commit semantics.
+	commitIndex := loadCommitIndex(opts.Dir)
 
 	return &Store{
 		opts:        opts,
@@ -206,16 +210,22 @@ func (s *Store) Put(key, value []byte) (LogIndex, error) {
 	// Apply to leader engine.
 	leader := s.replicas[s.leaderID]
 	if err := leader.eng.Put(keyCopy, valCopy); err != nil {
-		// Log is appended but not committed; leave commitIndex unchanged.
-		// The record exists in the log. On restart the log will be replayed
-		// but the leader engine already has the write (or failed). Document:
-		// if the leader engine write fails, we do not advance commitIndex and
-		// the log has an uncommitted tail entry. Future opens will replay that
-		// entry and attempt the leader write again (idempotent for the same key).
+		// Leader engine write failed. The log already has a record at idx but
+		// commitIndex is not advanced. COMMIT is not written. On restart,
+		// Open loads commitIndex from COMMIT (unchanged), so the uncommitted
+		// tail record in the log will remain below commitIndex and will never
+		// be replicated to followers. The log entry is effectively invisible.
 		return 0, fmt.Errorf("replica: leader engine put: %w", err)
 	}
 
-	// Advance leader's applied index and commit index.
+	// Persist the new commit index durably BEFORE advancing in-memory state.
+	// If this write fails, we return an error and leave in-memory commitIndex
+	// unchanged so the invariant "COMMIT == in-memory commitIndex" holds.
+	if err := saveCommitIndex(s.opts.Dir, idx); err != nil {
+		return 0, fmt.Errorf("replica: persist commit index: %w", err)
+	}
+
+	// Advance in-memory state after successful durable commit.
 	leader.appliedIndex = idx
 	saveAppliedIndex(filepath.Join(s.opts.Dir, leader.info.Path), idx)
 	s.commitIndex = idx
@@ -243,7 +253,13 @@ func (s *Store) Delete(key []byte) (LogIndex, error) {
 
 	leader := s.replicas[s.leaderID]
 	if err := leader.eng.Delete(keyCopy); err != nil {
+		// Same as Put: log appended, leader write failed, COMMIT not updated.
+		// Uncommitted tail record will not be replicated after restart.
 		return 0, fmt.Errorf("replica: leader engine delete: %w", err)
+	}
+
+	if err := saveCommitIndex(s.opts.Dir, idx); err != nil {
+		return 0, fmt.Errorf("replica: persist commit index: %w", err)
 	}
 
 	leader.appliedIndex = idx
@@ -609,6 +625,10 @@ func loadAppliedIndex(replicaDir string) LogIndex {
 }
 
 // saveAppliedIndex writes the applied index to <replicaDir>/APPLIED atomically.
+// This is best-effort: failures are silently ignored. If the write fails and
+// the process crashes, the follower may re-apply already-applied operations on
+// restart. The Engine is idempotent for same-key overwrites (higher Seq wins),
+// so correctness is preserved at the cost of potentially different Seq numbers.
 func saveAppliedIndex(replicaDir string, idx LogIndex) {
 	path := filepath.Join(replicaDir, appliedFileName)
 	tmp := path + ".tmp"
@@ -617,4 +637,42 @@ func saveAppliedIndex(replicaDir string, idx LogIndex) {
 		return // best-effort
 	}
 	os.Rename(tmp, path) // best-effort
+}
+
+// loadCommitIndex reads the committed index from <dir>/COMMIT.
+// Returns 0 if the file does not exist, is empty, or cannot be parsed.
+// A missing COMMIT file means no operation has been durably committed yet,
+// regardless of what may be in the replication log.
+func loadCommitIndex(dir string) LogIndex {
+	path := filepath.Join(dir, commitFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	s := strings.TrimSpace(string(data))
+	n, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return LogIndex(n)
+}
+
+// saveCommitIndex writes the committed index to <dir>/COMMIT atomically via a
+// temp file + rename. Unlike saveAppliedIndex, this is NOT best-effort: the
+// caller must check the returned error and abort the write path if it fails.
+// Leaving COMMIT un-updated when a leader write succeeded would mean the
+// committed operation cannot be replicated to followers after a restart.
+func saveCommitIndex(dir string, idx LogIndex) error {
+	path := filepath.Join(dir, commitFileName)
+	tmp := path + ".tmp"
+	data := []byte(strconv.FormatUint(uint64(idx), 10) + "\n")
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		os.Remove(tmp) // best-effort cleanup of the temp file
+		return fmt.Errorf("replica: write COMMIT temp: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("replica: rename COMMIT: %w", err)
+	}
+	return nil
 }

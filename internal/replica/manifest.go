@@ -17,6 +17,10 @@ const (
 	replogFile           = "log.dat"
 	replicasDir          = "replicas"
 	appliedFileName      = "APPLIED"
+	// commitFileName is the durable file that records the last committed log
+	// index. It is written atomically (temp file + rename) on every successful
+	// Put/Delete and loaded on Open. If missing, commitIndex is 0.
+	commitFileName = "COMMIT"
 )
 
 // replicaEntry is one replica record inside the manifest.

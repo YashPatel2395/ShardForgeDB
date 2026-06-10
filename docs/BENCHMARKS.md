@@ -52,12 +52,12 @@ Durations include preload time where applicable (see Interpretation).
 
 | Workload | Ops | Duration | Ops/sec | P50 | P95 | P99 | SSTables | Bloom Skips |
 |----------|----:|---------:|--------:|----:|----:|----:|:--------:|------------:|
-| write-heavy | 1000 | 116.7ms | 8565 | 1.7µs | 4.3µs | 7.2µs | 10 | 0 |
-| read-heavy | 1000 | 125.7ms | 7953 | 1.6µs | 2.0µs | 4.1µs | 10 | 0 |
-| mixed | 1000 | 189.2ms | 5285 | 3.5µs | 6.9µs | 24.1µs | 15 | 0 |
-| scan | 100 | 146.3ms | 684 | 114.9µs | 139.9µs | 280.8µs | 10 | 0 |
-| compaction | 240 | 101.8ms | 2357 | 1.9µs | 96.7µs | 100.2µs | 1 | 0 |
-| restart | 1 | 70.3ms | 14 | 1.5ms | 1.5ms | 1.5ms | 5 | 0 |
+| write-heavy | 1000 | 128.0ms | 7814 | 1.7µs | 4.3µs | 12.5µs | 10 | 0 |
+| read-heavy | 1000 | 127.4ms | 7848 | 1.6µs | 1.8µs | 2.7µs | 10 | 0 |
+| mixed | 1000 | 197.3ms | 5068 | 2.7µs | 5.4µs | 15.8µs | 15 | 0 |
+| scan | 100 | 150.1ms | 666 | 76.8µs | 92.2µs | 140.6µs | 10 | 0 |
+| compaction | 240 | 96.7ms | 2482 | 1.5µs | 75.4µs | 77.5µs | 1 | 0 |
+| restart | 1 | 69.7ms | 14 | 1.3ms | 1.3ms | 1.3ms | 5 | 0 |
 
 | Workload | Bytes Written | Bytes Read | Flush Count | Compaction Count |
 |----------|:-------------:|:----------:|:-----------:|:----------------:|
@@ -79,7 +79,7 @@ Durations include preload time where applicable (see Interpretation).
 |--------|-------|
 | SSTables before compact | 5 |
 | SSTables after compact | 1 |
-| Compact duration | 22.8ms |
+| Compact duration | 20.7ms |
 | Gets before compact | 100 |
 | Gets after compact | 100 |
 | Scans before compact | 20 |
@@ -131,15 +131,15 @@ These benchmarks measure the sharding layer (`internal/shard`) routing key-value
 | Benchmark | ns/op | B/op | allocs/op |
 |-----------|------:|-----:|----------:|
 | RingRoute1M | 83 | 32 | 1 |
-| Put_10k_4shards | 5,824 | 205 | 7 |
-| Get_10k_existing_4shards | 164 | 103 | 4 |
-| Get_10k_missing_4shards | 116 | 31 | 1 |
-| Scan_10k_4shards | 5,772,582 | 10,095,911 | 80,267 |
-| Flush_10k_4shards | 226,421,692 | 5,788,333 | 50,627 |
-| Compact_10k_4shards | 229,559,438 | 16,844,078 | 217,027 |
-| Reopen_10k_4shards | 597,525 | 1,065,521 | 10,793 |
-| ConcurrentPut_4shards | 5,748 | 502 | 6 |
-| ConcurrentGet_4shards | 146 | 103 | 4 |
+| Put_10k_4shards | 5,672 | 205 | 7 |
+| Get_10k_existing_4shards | 170 | 103 | 4 |
+| Get_10k_missing_4shards | 120 | 31 | 1 |
+| Scan_10k_4shards | 5,849,880 | 10,099,122 | 80,267 |
+| Flush_10k_4shards | 225,437,084 | 5,790,347 | 50,629 |
+| Compact_10k_4shards | 211,506,715 | 16,886,024 | 217,442 |
+| Reopen_10k_4shards | 574,882 | 1,065,460 | 10,793 |
+| ConcurrentPut_4shards | 2,438 | 525 | 6 |
+| ConcurrentGet_4shards | 133 | 103 | 4 |
 
 ---
 
@@ -151,17 +151,17 @@ These benchmarks measure the replication simulation layer (`internal/replica`). 
 
 | Benchmark | ns/op | B/op | allocs/op | Notes |
 |-----------|------:|-----:|----------:|-------|
-| Put_10k_LeaderOnly | 146,569 | 1,963 | 22 | WAL + MemTable write + log append |
-| Get_Leader_10k_Existing | 132 | 103 | 4 | MemTable hit |
-| Get_Follower_10k_Existing | 136 | 103 | 4 | MemTable hit after catch-up |
-| Scan_Leader_10k | 3,469,611 | 8,638,428 | 60,121 | Full scan 10k entries |
-| Reopen_10k | 10,200,183 | 7,532,930 | 90,262 | Open all 3 replicas + replay log |
-| ReplicateOnce_SmallBatch | 292,796 | 2,481 | 34 | 1 op × 2 followers |
-| ConcurrentPut | 147,762 | 1,947 | 21 | Goroutine-per-Put, serialised by write lock |
-| ConcurrentReplicateAllWithReads | 117 | 51 | 2 | Reads interleaved with ReplicateAll |
-| LogAppendReplay | 970,448 | 258,834 | 6,022 | 1000 ops append then replay |
+| Put_10k_LeaderOnly | 296,302 | 2,923 | 32 | WAL + MemTable + log append + COMMIT fsync |
+| Get_Leader_10k_Existing | 135 | 103 | 4 | MemTable hit |
+| Get_Follower_10k_Existing | 138 | 103 | 4 | MemTable hit after catch-up |
+| Scan_Leader_10k | 3,451,186 | 8,638,429 | 60,121 | Full scan 10k entries |
+| Reopen_10k | 10,240,000 | 7,533,945 | 90,268 | Open all 3 replicas + replay log |
+| ReplicateOnce_SmallBatch | 312,313 | 2,481 | 34 | 1 op × 2 followers |
+| ConcurrentPut | 294,805 | 2,792 | 31 | Serialised by write lock |
+| ConcurrentReplicateAllWithReads | 119 | 51 | 2 | Reads interleaved with ReplicateAll |
+| LogAppendReplay | 962,533 | 258,834 | 6,022 | 1000 ops append then replay |
 
-**Note:** `Put_10k_LeaderOnly` is slower than the raw engine benchmark because each Put also appends a record to the durable binary replication log (disk I/O). Get and Scan throughput is comparable to the raw engine since they read directly from the Engine layer.
+**Note (review fix):** `Put_10k_LeaderOnly` is ~296µs/op after the commit-index fix (was ~147µs). The additional cost is the atomic COMMIT file write (temp+rename) that now happens on every successful leader commit to guarantee recovery correctness. Get and Scan throughput are unchanged.
 
 ---
 

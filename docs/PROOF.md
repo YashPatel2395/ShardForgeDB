@@ -2619,3 +2619,119 @@ git status --short                                                 (clean after 
 ### Scope Confirmation
 
 No networking, no RPC, no distributed deployment, no Raft, no consensus, no automatic leader election, no fault-tolerant quorum, no shard migration, no resharding, no vector replication, no ANN/HNSW/IVF, no background compaction, no automatic compaction, no core Engine behavior changes were implemented in this phase.
+
+---
+
+## Phase 11 — Review Fix: Commit-Index Recovery Correctness
+
+**Date:** 2026-06-10
+**Branch:** `phase-11-replication`
+
+### The Bug
+
+In the original Phase 11 implementation, `Open()` set the in-memory `commitIndex` using:
+
+```go
+commitIndex := ol.lastIndex()
+```
+
+`ol.lastIndex()` returns the index of the last record written to the replication log — but that record may be **uncommitted**. Specifically:
+
+- `Put`/`Delete` appended to the log first, then applied to the leader Engine.
+- If the leader Engine write failed, the log had a tail record but `commitIndex` was not advanced (correct in-memory behavior).
+- However, on restart, `Open` did not distinguish committed from uncommitted log records: it set `commitIndex = log.lastIndex()`, treating every log record as committed.
+- This allowed `ReplicateAll` to propagate an operation to followers that the leader had never committed, breaking leader-commit semantics.
+
+### The Fix
+
+#### New `COMMIT` file
+
+A durable `COMMIT` file at `<Dir>/COMMIT` stores the last committed log index (ASCII decimal, atomically written via temp+rename). It is the single source of truth for `commitIndex` across restarts.
+
+```
+<Dir>/
+  COMMIT                — last committed LogIndex (atomic write, not best-effort)
+  REPLICATION.json      — existing manifest
+  replog/log.dat        — existing replication log
+  replicas/...
+```
+
+#### `Open` behavior after fix
+
+```go
+commitIndex := loadCommitIndex(opts.Dir)
+```
+
+- If `COMMIT` exists: load the persisted value.
+- If `COMMIT` is missing (new store, or file deleted): `commitIndex = 0`. No log records are treated as committed.
+- The log may contain records beyond `commitIndex`; they are invisible to `ReplicateOnce`/`ReplicateAll` because both only apply `op.Index <= commitIndex`.
+
+#### `Put`/`Delete` write sequence after fix
+
+```
+1. Append to log (durable)
+2. Apply to leader Engine
+   — if fail: return error; log has uncommitted tail; COMMIT unchanged
+3. saveCommitIndex(dir, idx)   ← NEW: atomic COMMIT write; error if fails
+   — if fail: return error; in-memory commitIndex unchanged
+4. Advance in-memory commitIndex and leader appliedIndex
+5. saveAppliedIndex (best-effort)
+```
+
+`saveCommitIndex` is **not** best-effort: it returns an error if the atomic write fails, and the caller does not advance `commitIndex` in memory. This preserves the invariant: `COMMIT on disk == in-memory commitIndex`.
+
+#### Uncommitted log tail behavior
+
+If the process restarts with a log tail record whose index > `COMMIT`:
+
+- `commitIndex` is loaded from `COMMIT` (lower value).
+- `ReplicateOnce`/`ReplicateAll` never apply records beyond `commitIndex`.
+- The uncommitted tail record is permanently invisible to followers.
+- The leader Engine may or may not have the data (depends on whether the Engine write succeeded before the crash). This is a known limitation documented in both DESIGN.md and the code comments.
+
+#### Performance impact
+
+The atomic COMMIT write adds one temp-file-write + rename to every successful `Put`/`Delete`. Benchmark result: `Put_10k_LeaderOnly` increased from ~147µs/op to ~296µs/op. Get, Scan, and ReplicateAll throughput are unchanged.
+
+### Tests Added (review-fix specific)
+
+| Test | What it proves |
+|------|----------------|
+| `TestOpen_LoadsCommitIndexFromCommitFile` | After n Puts, COMMIT=n; reopen gives commitIndex=n |
+| `TestOpen_MissingCommitFileDoesNotTreatLogTailAsCommitted` | Missing COMMIT → commitIndex=0; ReplicateOnce applies 0 ops |
+| `TestUncommittedLogTailNotReplicatedAfterRestart` | Direct log.append + close/reopen: follower never sees the uncommitted record |
+| `TestPutPersistsCommitIndex` | After Put, COMMIT file on disk == returned index |
+| `TestDeletePersistsCommitIndex` | Same for Delete |
+| `TestCommitFileTempCleanup` | No COMMIT.tmp left after successful write |
+
+### Updated Replica Test Count
+
+Original Phase 11: 60 tests. After review fix: **66 tests**.
+
+### Commands Run
+
+```
+go mod tidy                                                        OK
+go fmt ./...                                                       OK
+go vet ./...                                                       OK
+go test -race -count=1 ./...                                       15 packages PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/replica/...   10 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/shard/...     10 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/vector/...    10 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...    13 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/bench/...     5 benchmarks PASS
+make test                                                          PASS
+make vet                                                           PASS
+make build                                                         PASS
+make bench-replica                                                 PASS
+make bench-shard                                                   PASS
+make bench-vector                                                  PASS
+make bench-report                                                  PASS (timing numbers updated)
+./bin/shardforge --help                                            OK
+./bin/shardforge version                                           ShardForgeDB 0.1.0
+git status --short                                                 (clean after commit)
+```
+
+### Scope Confirmation
+
+No networking, no RPC, no distributed deployment, no Raft, no consensus, no automatic leader election, no fault-tolerant quorum, no shard migration, no resharding, no vector replication, no ANN/HNSW/IVF, no background compaction, no automatic compaction, and no core Engine behavior changes were made in this review fix.

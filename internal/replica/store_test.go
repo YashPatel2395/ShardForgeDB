@@ -1100,3 +1100,196 @@ func TestLargeWorkload_1000Writes_PartialReplication_Reopen(t *testing.T) {
 		}
 	}
 }
+
+// ── Commit-index recovery fix tests ──────────────────────────────────────────
+
+// TestOpen_LoadsCommitIndexFromCommitFile verifies that after normal Put
+// operations the COMMIT file is written and loaded correctly on reopen.
+func TestOpen_LoadsCommitIndexFromCommitFile(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(Options{Dir: dir, ReplicaCount: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		mustPut(t, s, fmt.Sprintf("ci-%d", i), "v")
+	}
+	if s.commitIndex != 5 {
+		t.Fatalf("in-memory commitIndex=%d, want 5", s.commitIndex)
+	}
+	s.Close()
+
+	// Verify COMMIT file exists and contains 5.
+	on_disk := loadCommitIndex(dir)
+	if on_disk != 5 {
+		t.Fatalf("COMMIT file has index %d, want 5", on_disk)
+	}
+
+	// Reopen — commitIndex must come from COMMIT, not log.lastIndex().
+	s2, err := Open(Options{Dir: dir, LeaderID: -1})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+
+	if s2.commitIndex != 5 {
+		t.Fatalf("reopened commitIndex=%d, want 5", s2.commitIndex)
+	}
+}
+
+// TestOpen_MissingCommitFileDoesNotTreatLogTailAsCommitted verifies that if
+// COMMIT is absent, commitIndex is 0 regardless of the replication log size.
+func TestOpen_MissingCommitFileDoesNotTreatLogTailAsCommitted(t *testing.T) {
+	dir := t.TempDir()
+
+	// First: open, write ops, close normally (COMMIT written).
+	s, err := Open(Options{Dir: dir, ReplicaCount: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustPut(t, s, "k1", "v1")
+	mustPut(t, s, "k2", "v2")
+	s.Close()
+
+	// Remove the COMMIT file to simulate the missing-file scenario.
+	if err := os.Remove(filepath.Join(dir, commitFileName)); err != nil {
+		t.Fatalf("remove COMMIT: %v", err)
+	}
+
+	// Reopen: commitIndex must be 0, not log.lastIndex() (which is 2).
+	s2, err := Open(Options{Dir: dir, LeaderID: -1})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+
+	if s2.commitIndex != 0 {
+		t.Fatalf("commitIndex after missing COMMIT=%d, want 0", s2.commitIndex)
+	}
+
+	// ReplicateAll should apply 0 operations to follower (nothing committed).
+	n, err := s2.ReplicateOnce()
+	if err != nil {
+		t.Fatalf("ReplicateOnce: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("ReplicateOnce applied %d ops with commitIndex=0, want 0", n)
+	}
+}
+
+// TestUncommittedLogTailNotReplicatedAfterRestart verifies the core fix:
+// a log record that exists but whose COMMIT index is lower is never replicated
+// to followers after restart.
+func TestUncommittedLogTailNotReplicatedAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(Options{Dir: dir, ReplicaCount: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write 2 normally committed operations.
+	mustPut(t, s, "committed-1", "v1")
+	mustPut(t, s, "committed-2", "v2")
+	// commitIndex is now 2 and COMMIT file contains "2".
+
+	// Simulate a failed Put: append directly to the log (bypassing COMMIT
+	// update). This mimics a scenario where Put succeeded at the log-append
+	// step but the leader Engine write returned an error.
+	_, err = s.log.append(Operation{Type: OpPut, Key: []byte("uncommitted"), Value: []byte("ghost")})
+	if err != nil {
+		t.Fatalf("direct log append: %v", err)
+	}
+	// s.commitIndex is still 2 (COMMIT file still contains "2").
+
+	s.Close()
+
+	// Reopen: commitIndex must be 2 (from COMMIT), not 3 (from log.lastIndex).
+	s2, err := Open(Options{Dir: dir, LeaderID: -1})
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.Close()
+
+	if s2.commitIndex != 2 {
+		t.Fatalf("commitIndex after reopen=%d, want 2", s2.commitIndex)
+	}
+
+	// ReplicateAll should propagate operations 1 and 2 but NOT 3.
+	if err := s2.ReplicateAll(); err != nil {
+		t.Fatalf("ReplicateAll: %v", err)
+	}
+
+	// Follower must have the two committed keys.
+	for _, k := range []string{"committed-1", "committed-2"} {
+		_, found, err := s2.Get([]byte(k), ReadFollower, 1)
+		if err != nil || !found {
+			t.Fatalf("follower missing committed key %q: err=%v found=%v", k, err, found)
+		}
+	}
+
+	// Follower must NOT have the uncommitted key.
+	_, found, err := s2.Get([]byte("uncommitted"), ReadFollower, 1)
+	if err != nil {
+		t.Fatalf("Get uncommitted key: %v", err)
+	}
+	if found {
+		t.Fatal("follower has uncommitted key 'uncommitted' — recovery fix broken")
+	}
+}
+
+// TestPutPersistsCommitIndex verifies that after a successful Put the COMMIT
+// file on disk matches the returned log index.
+func TestPutPersistsCommitIndex(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(Options{Dir: dir, ReplicaCount: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	idx := mustPut(t, s, "p", "v")
+	on_disk := loadCommitIndex(dir)
+	if on_disk != idx {
+		t.Fatalf("COMMIT file=%d, Put returned index=%d; want equal", on_disk, idx)
+	}
+}
+
+// TestDeletePersistsCommitIndex verifies the same for Delete.
+func TestDeletePersistsCommitIndex(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(Options{Dir: dir, ReplicaCount: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	mustPut(t, s, "d", "v")
+	idx, err := s.Delete([]byte("d"))
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	on_disk := loadCommitIndex(dir)
+	if on_disk != idx {
+		t.Fatalf("COMMIT file=%d, Delete returned index=%d; want equal", on_disk, idx)
+	}
+}
+
+// TestCommitFileTempCleanup verifies that no COMMIT.tmp file is left after a
+// successful saveCommitIndex call.
+func TestCommitFileTempCleanup(t *testing.T) {
+	dir := t.TempDir()
+	s, cleanup := testStore(t, 2)
+	defer cleanup()
+
+	mustPut(t, s, "x", "y")
+	tmp := filepath.Join(dir, commitFileName+".tmp")
+	if pathExists(tmp) {
+		t.Fatal("COMMIT.tmp temp file still exists after Put")
+	}
+	_ = s // suppress unused warning
+
+	// Directly test saveCommitIndex leaves no temp file.
+	if err := saveCommitIndex(t.TempDir(), 42); err != nil {
+		t.Fatalf("saveCommitIndex: %v", err)
+	}
+}

@@ -52,12 +52,12 @@ Durations include preload time where applicable (see Interpretation).
 
 | Workload | Ops | Duration | Ops/sec | P50 | P95 | P99 | SSTables | Bloom Skips |
 |----------|----:|---------:|--------:|----:|----:|----:|:--------:|------------:|
-| write-heavy | 1000 | 124.6ms | 8028 | 1.6µs | 4.5µs | 15.1µs | 10 | 0 |
-| read-heavy | 1000 | 133.4ms | 7498 | 1.6µs | 1.9µs | 2.9µs | 10 | 0 |
-| mixed | 1000 | 192.8ms | 5187 | 3.0µs | 6.0µs | 20.8µs | 15 | 0 |
-| scan | 100 | 145.4ms | 688 | 95.8µs | 105.2µs | 130.9µs | 10 | 0 |
-| compaction | 240 | 96.2ms | 2494 | 1.5µs | 85.2µs | 90.0µs | 1 | 0 |
-| restart | 1 | 66.8ms | 15 | 1.4ms | 1.4ms | 1.4ms | 5 | 0 |
+| write-heavy | 1000 | 128.0ms | 7814 | 1.7µs | 4.3µs | 12.5µs | 10 | 0 |
+| read-heavy | 1000 | 127.4ms | 7848 | 1.6µs | 1.8µs | 2.7µs | 10 | 0 |
+| mixed | 1000 | 197.3ms | 5068 | 2.7µs | 5.4µs | 15.8µs | 15 | 0 |
+| scan | 100 | 150.1ms | 666 | 76.8µs | 92.2µs | 140.6µs | 10 | 0 |
+| compaction | 240 | 96.7ms | 2482 | 1.5µs | 75.4µs | 77.5µs | 1 | 0 |
+| restart | 1 | 69.7ms | 14 | 1.3ms | 1.3ms | 1.3ms | 5 | 0 |
 
 | Workload | Bytes Written | Bytes Read | Flush Count | Compaction Count |
 |----------|:-------------:|:----------:|:-----------:|:----------------:|
@@ -79,7 +79,7 @@ Durations include preload time where applicable (see Interpretation).
 |--------|-------|
 | SSTables before compact | 5 |
 | SSTables after compact | 1 |
-| Compact duration | 21.5ms |
+| Compact duration | 20.7ms |
 | Gets before compact | 100 |
 | Gets after compact | 100 |
 | Scans before compact | 20 |
@@ -122,28 +122,46 @@ Measures engine reopen latency including WAL replay and SSTable manifest load. O
 
 ---
 
----
-
 ## Phase 10 — Shard Package Benchmarks (Local Single-process)
 
 These benchmarks measure the sharding layer (`internal/shard`) routing key-value operations across multiple local Engine instances. All shards live inside a single OS process — **no networking, no replication**.
 
-**Platform:** Apple M3 · darwin/arm64 · Go 1.21 · `go test -bench=. -benchmem -benchtime=3s`
+**Platform:** Apple M3 · darwin/arm64 · Go 1.26 · `go test -bench=. -benchmem -benchtime=3s`
 
 | Benchmark | ns/op | B/op | allocs/op |
 |-----------|------:|-----:|----------:|
-| RingRoute1M | 78 | 32 | 1 |
-| Put_10k_4shards | 1600 | 201 | 7 |
-| Get_10k_existing_4shards | 150 | 103 | 4 |
-| Get_10k_missing_4shards | 110 | 31 | 1 |
-| Scan_10k_4shards | 5,301,398 | 10,098,090 | 80,267 |
-| Flush_10k_4shards | 104,966,721 | 5,831,246 | 50,832 |
-| Compact_10k_4shards | 127,015,260 | 16,986,382 | 218,776 |
-| Reopen_10k_4shards | 571,379 | 1,065,463 | 10,793 |
-| ConcurrentPut_4shards | 2,495 | 488 | 6 |
-| ConcurrentGet_4shards | 145 | 103 | 4 |
+| RingRoute1M | 83 | 32 | 1 |
+| Put_10k_4shards | 5,672 | 205 | 7 |
+| Get_10k_existing_4shards | 170 | 103 | 4 |
+| Get_10k_missing_4shards | 120 | 31 | 1 |
+| Scan_10k_4shards | 5,849,880 | 10,099,122 | 80,267 |
+| Flush_10k_4shards | 225,437,084 | 5,790,347 | 50,629 |
+| Compact_10k_4shards | 211,506,715 | 16,886,024 | 217,442 |
+| Reopen_10k_4shards | 574,882 | 1,065,460 | 10,793 |
+| ConcurrentPut_4shards | 2,438 | 525 | 6 |
+| ConcurrentGet_4shards | 133 | 103 | 4 |
 
-**Notes (after close-safety fix):** All operations now hold `s.mu.RLock()` across their Engine calls. Throughput is comparable to the pre-fix measurements: the mutex overhead is negligible relative to Engine I/O for Flush/Compact, and undetectable in the noise for hot-path Get/Put.
+---
+
+## Phase 11 — Replica Package Benchmarks (Local In-process Replication Simulation)
+
+These benchmarks measure the replication simulation layer (`internal/replica`). Multiple local Engine instances act as leader and followers inside a single OS process. **No networking, no RPC, no Raft, no consensus.**
+
+**Platform:** Apple M3 · darwin/arm64 · Go 1.26 · `go test -bench=. -benchmem -benchtime=3s`
+
+| Benchmark | ns/op | B/op | allocs/op | Notes |
+|-----------|------:|-----:|----------:|-------|
+| Put_10k_LeaderOnly | 296,302 | 2,923 | 32 | WAL + MemTable + log append + atomic COMMIT write (temp+rename; no fsync) |
+| Get_Leader_10k_Existing | 135 | 103 | 4 | MemTable hit |
+| Get_Follower_10k_Existing | 138 | 103 | 4 | MemTable hit after catch-up |
+| Scan_Leader_10k | 3,451,186 | 8,638,429 | 60,121 | Full scan 10k entries |
+| Reopen_10k | 10,240,000 | 7,533,945 | 90,268 | Open all 3 replicas + replay log |
+| ReplicateOnce_SmallBatch | 312,313 | 2,481 | 34 | 1 op × 2 followers |
+| ConcurrentPut | 294,805 | 2,792 | 31 | Serialised by write lock |
+| ConcurrentReplicateAllWithReads | 119 | 51 | 2 | Reads interleaved with ReplicateAll |
+| LogAppendReplay | 962,533 | 258,834 | 6,022 | 1000 ops append then replay |
+
+**Note (review fix):** `Put_10k_LeaderOnly` is ~296µs/op after the commit-index fix (was ~147µs). The additional cost is the atomic COMMIT file write (temp+rename) that now happens on every successful leader commit to guarantee recovery correctness. Get and Scan throughput are unchanged.
 
 ---
 
@@ -151,8 +169,7 @@ These benchmarks measure the sharding layer (`internal/shard`) routing key-value
 
 - **Manual compaction only.** No background, automatic, leveled, or size-tiered compaction.
 - **Manual flush only.** No automatic MemTable flush.
-- **Local single-process only.** No networking, no cross-process shards, no replication, no distributed mode.
-- **Static shard count.** Cannot be changed after first open; no resharding or rebalancing.
+- **Single process.** No distributed deployment, no real networking.
 - **No block cache.** Every SSTable read goes to disk.
 - **No compression.** On-disk size reflects raw key+value data.
 - **No async writes.** WAL appends are synchronous (fsync off by default).

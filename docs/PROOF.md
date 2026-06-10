@@ -2483,3 +2483,255 @@ All commands passed with zero errors.
 No replication, networking, distributed mode, Raft, consensus, shard migration, resharding, vector sharding, ANN, HNSW, IVF, background compaction, automatic compaction, or core Engine behavior changes were made in this fix.
 
 *Future phases will append their own sections to this document.*
+
+---
+
+## Phase 11 — Leader/Follower Replication Simulation
+
+**Date:** 2026-06-09
+**Branch:** `phase-11-replication`
+**Go version:** go1.26.4 darwin/arm64
+
+### API Implemented
+
+```go
+func Open(opts Options) (*Store, error)
+func (s *Store) Put(key, value []byte) (LogIndex, error)
+func (s *Store) Delete(key []byte) (LogIndex, error)
+func (s *Store) Get(key []byte, mode ReadMode, replicaID int) ([]byte, bool, error)
+func (s *Store) Scan(start, end []byte, mode ReadMode, replicaID int) ([]Entry, error)
+func (s *Store) ReplicateOnce() (int, error)
+func (s *Store) ReplicateAll() error
+func (s *Store) SetFollowerPaused(replicaID int, paused bool) error
+func (s *Store) SetFollowerLag(replicaID int, maxApplyPerCall int) error
+func (s *Store) Flush() error
+func (s *Store) Compact() error
+func (s *Store) Stats() Stats
+func (s *Store) Replicas() []ReplicaInfo
+func (s *Store) Close() error
+```
+
+Types: `Role` (leader/follower), `ReadMode` (leader/follower/any), `LogIndex`, `OperationType` (Put/Delete), `Operation`, `Options`, `ReplicaInfo`, `Entry`, `Stats`, `ReplicaStats`.
+
+Errors: `ErrClosed`, `ErrInvalidOptions`, `ErrInvalidKey`, `ErrInvalidReplica`, `ErrInvalidReadMode`, `ErrNotLeader`, `ErrCorruptManifest`, `ErrReplicaMismatch`.
+
+### Manifest Format
+
+`REPLICATION.json` written atomically (temp file + `os.Rename`). Validates: version==1, replica_count>0, len(replicas)==replica_count, IDs in [0,n), no duplicate IDs/names/paths, no absolute or traversal paths, exactly one leader, leader_id consistent with role. On reopen: ReplicaCount==0 loads from manifest; LeaderID<0 loads from manifest; non-zero/non-negative mismatches return `ErrReplicaMismatch`.
+
+### Replication Log Format
+
+Binary append-only file at `replog/log.dat`:
+- Header: 8-byte magic `"SHARDREP"` + uint16 version (1).
+- Records: uint32 recordLen + uint32 CRC-32/IEEE + uint64 index + uint8 opType + uint32 keyLen + uint32 valLen + key + value.
+- Indexes start at 1, increment by 1. CRC validated on replay. Truncated records return `errLogTruncated`. Bad CRC returns `errLogCorrupt`. Unsupported version returns `errLogVersion`.
+
+### Write / Commit Semantics
+
+- `Put`/`Delete` acquire the store write lock for the full sequence.
+- Append operation to durable log (disk write).
+- Apply to leader Engine (WAL + MemTable).
+- If leader write succeeds: advance leader's `appliedIndex` + `commitIndex`; persist `APPLIED`.
+- If leader write fails: return error; `commitIndex` not advanced; log has an uncommitted tail record (documented limitation).
+- Followers are not touched during Put/Delete.
+
+### Follower Catch-up Rules
+
+- `ReplicateOnce`: acquire write lock; for each non-paused follower behind `commitIndex`, apply up to `maxApplyPerCall` (default unlimited per-call, capped at 1 loop iteration per follower) operations; persist `APPLIED` after each.
+- `ReplicateAll`: loop `ReplicateOnce` until no progress.
+- Paused followers are skipped entirely.
+- Lag-limited followers apply at most `maxApplyPerCall` ops per `ReplicateOnce` call.
+
+### Read Consistency Rules
+
+| Mode | Source | Staleness |
+|------|--------|-----------|
+| ReadLeader | Leader Engine | Never stale |
+| ReadFollower | Specified follower (must not be leader) | Stale until ReplicateAll |
+| ReadAny | replicaID ≥ 0 → that replica; < 0 → leader | Depends on target |
+
+### Tests Added
+
+60 tests in `internal/replica/store_test.go` covering:
+- Open validation (7 tests)
+- Manifest validation (9 tests including version, duplicate ID/name/path, absolute path, traversal, no leader, multiple leaders, missing ID, temp file cleanup)
+- Write operations: Put index 1, no-write-to-follower, ReplicateOnce, ReplicateAll, Delete replication
+- Stale reads: stale before replication, current after ReplicateAll
+- Pause/lag: paused follower skips, unpause catch-up, lag limit per call
+- Commit/applied index tracking
+- Reopen/persistence: leader data, log preserved, no duplicate apply, catch-up after reopen
+- Read modes: ReadLeader, ReadFollower rejects leader ID, ReadFollower rejects invalid ID, ReadAny defaults to leader
+- Scan: sorted entries from leader, stale follower scan
+- Flush/Compact: flush persists all replicas, compact preserves data
+- Close: idempotent, ErrClosed after close
+- Concurrency: concurrent Put+ReplicateAll, concurrent Get/Scan, concurrent Close
+- Log codec: round-trip, bad CRC, truncated record, unsupported version, operationsAfter suffix
+- Edge cases: delete missing key, empty key rejection, deterministic replica names, read mode validation, stats
+
+### Benchmarks Added
+
+10 benchmarks in `internal/replica/store_bench_test.go`:
+
+| Benchmark | ns/op | Notes |
+|-----------|------:|-------|
+| Put_10k_LeaderOnly | 146,569 | WAL + MemTable + log append |
+| ReplicateAll_10k_2Followers | ~3s/iter | Full propagation of 10k ops |
+| Get_Leader_10k_Existing | 132 | MemTable hit |
+| Get_Follower_10k_Existing | 136 | MemTable hit after catch-up |
+| Scan_Leader_10k | 3,469,611 | Full scan 10k keys |
+| Reopen_10k | 10,200,183 | Open 3 replicas + replay log |
+| ReplicateOnce_SmallBatch | 292,796 | 1 op × 2 followers |
+| ConcurrentPut | 147,762 | Serialised by write lock |
+| ConcurrentReplicateAllWithReads | 117 | Reads interleaved with replicate |
+| LogAppendReplay | 970,448 | 1000 ops append then replay |
+
+### Commands Run
+
+```
+go mod tidy                                                        OK
+go fmt ./...                                                       OK
+go vet ./...                                                       OK
+go test -race -count=1 ./...                                       15 packages PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/replica/...   10 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/shard/...     10 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/vector/...    10 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...    13 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/bench/...     5 benchmarks PASS
+make test                                                          PASS
+make vet                                                           PASS
+make build                                                         PASS
+make bench-replica                                                 PASS
+make bench-shard                                                   PASS
+make bench-report                                                  PASS
+./bin/shardforge --help                                            OK
+./bin/shardforge version                                           ShardForgeDB 0.1.0
+git status --short                                                 (clean after commit)
+```
+
+### Known Limitations
+
+- Uncommitted tail record in log if leader Engine write fails after log append.
+- `APPLIED` persistence is best-effort; follower may re-apply an op if `APPLIED` write fails then process crashes.
+- Log grows unboundedly (no compaction).
+- No automatic catch-up on reopen; callers must call `ReplicateAll`.
+- Pause/lag simulation is in-memory only; does not survive restarts.
+
+### Scope Confirmation
+
+No networking, no RPC, no distributed deployment, no Raft, no consensus, no automatic leader election, no fault-tolerant quorum, no shard migration, no resharding, no vector replication, no ANN/HNSW/IVF, no background compaction, no automatic compaction, no core Engine behavior changes were implemented in this phase.
+
+---
+
+## Phase 11 — Review Fix: Commit-Index Recovery Correctness
+
+**Date:** 2026-06-10
+**Branch:** `phase-11-replication`
+
+### The Bug
+
+In the original Phase 11 implementation, `Open()` set the in-memory `commitIndex` using:
+
+```go
+commitIndex := ol.lastIndex()
+```
+
+`ol.lastIndex()` returns the index of the last record written to the replication log — but that record may be **uncommitted**. Specifically:
+
+- `Put`/`Delete` appended to the log first, then applied to the leader Engine.
+- If the leader Engine write failed, the log had a tail record but `commitIndex` was not advanced (correct in-memory behavior).
+- However, on restart, `Open` did not distinguish committed from uncommitted log records: it set `commitIndex = log.lastIndex()`, treating every log record as committed.
+- This allowed `ReplicateAll` to propagate an operation to followers that the leader had never committed, breaking leader-commit semantics.
+
+### The Fix
+
+#### New `COMMIT` file
+
+A durable `COMMIT` file at `<Dir>/COMMIT` stores the last committed log index (ASCII decimal, atomically written via temp+rename). It is the single source of truth for `commitIndex` across restarts.
+
+```
+<Dir>/
+  COMMIT                — last committed LogIndex (atomic write, not best-effort)
+  REPLICATION.json      — existing manifest
+  replog/log.dat        — existing replication log
+  replicas/...
+```
+
+#### `Open` behavior after fix
+
+```go
+commitIndex := loadCommitIndex(opts.Dir)
+```
+
+- If `COMMIT` exists: load the persisted value.
+- If `COMMIT` is missing (new store, or file deleted): `commitIndex = 0`. No log records are treated as committed.
+- The log may contain records beyond `commitIndex`; they are invisible to `ReplicateOnce`/`ReplicateAll` because both only apply `op.Index <= commitIndex`.
+
+#### `Put`/`Delete` write sequence after fix
+
+```
+1. Append to log (durable)
+2. Apply to leader Engine
+   — if fail: return error; log has uncommitted tail; COMMIT unchanged
+3. saveCommitIndex(dir, idx)   ← NEW: atomic COMMIT write; error if fails
+   — if fail: return error; in-memory commitIndex unchanged
+4. Advance in-memory commitIndex and leader appliedIndex
+5. saveAppliedIndex (best-effort)
+```
+
+`saveCommitIndex` is **not** best-effort: it returns an error if the atomic write fails, and the caller does not advance `commitIndex` in memory. This preserves the invariant: `COMMIT on disk == in-memory commitIndex`.
+
+#### Uncommitted log tail behavior
+
+If the process restarts with a log tail record whose index > `COMMIT`:
+
+- `commitIndex` is loaded from `COMMIT` (lower value).
+- `ReplicateOnce`/`ReplicateAll` never apply records beyond `commitIndex`.
+- The uncommitted tail record is permanently invisible to followers.
+- The leader Engine may or may not have the data (depends on whether the Engine write succeeded before the crash). This is a known limitation documented in both DESIGN.md and the code comments.
+
+#### Performance impact
+
+The atomic COMMIT write adds one temp-file-write + rename to every successful `Put`/`Delete`. Benchmark result: `Put_10k_LeaderOnly` increased from ~147µs/op to ~296µs/op. Get, Scan, and ReplicateAll throughput are unchanged.
+
+### Tests Added (review-fix specific)
+
+| Test | What it proves |
+|------|----------------|
+| `TestOpen_LoadsCommitIndexFromCommitFile` | After n Puts, COMMIT=n; reopen gives commitIndex=n |
+| `TestOpen_MissingCommitFileDoesNotTreatLogTailAsCommitted` | Missing COMMIT → commitIndex=0; ReplicateOnce applies 0 ops |
+| `TestUncommittedLogTailNotReplicatedAfterRestart` | Direct log.append + close/reopen: follower never sees the uncommitted record |
+| `TestPutPersistsCommitIndex` | After Put, COMMIT file on disk == returned index |
+| `TestDeletePersistsCommitIndex` | Same for Delete |
+| `TestCommitFileTempCleanup` | No COMMIT.tmp left after successful write |
+
+### Updated Replica Test Count
+
+Original Phase 11: 60 tests. After review fix: **66 tests**.
+
+### Commands Run
+
+```
+go mod tidy                                                        OK
+go fmt ./...                                                       OK
+go vet ./...                                                       OK
+go test -race -count=1 ./...                                       15 packages PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/replica/...   10 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/shard/...     10 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/vector/...    10 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...    13 benchmarks PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/bench/...     5 benchmarks PASS
+make test                                                          PASS
+make vet                                                           PASS
+make build                                                         PASS
+make bench-replica                                                 PASS
+make bench-shard                                                   PASS
+make bench-vector                                                  PASS
+make bench-report                                                  PASS (timing numbers updated)
+./bin/shardforge --help                                            OK
+./bin/shardforge version                                           ShardForgeDB 0.1.0
+git status --short                                                 (clean after commit)
+```
+
+### Scope Confirmation
+
+No networking, no RPC, no distributed deployment, no Raft, no consensus, no automatic leader election, no fault-tolerant quorum, no shard migration, no resharding, no vector replication, no ANN/HNSW/IVF, no background compaction, no automatic compaction, and no core Engine behavior changes were made in this review fix.

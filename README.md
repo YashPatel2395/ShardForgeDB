@@ -2,8 +2,8 @@
 
 An **explainable** distributed database engine for key-value and vector search workloads, written in Go.
 
-> **Phase 10 in review.** WAL, MemTable, SSTable, Bloom Filter, single-node Engine, manual full compaction, exact vector search, and local key-value sharding are implemented.
-> No background compaction, no replication, no networking, no distributed cluster.
+> **Phase 11 in review.** WAL, MemTable, SSTable, Bloom Filter, single-node Engine, manual full compaction, exact vector search, local key-value sharding, and local in-process leader/follower replication simulation are implemented.
+> No background compaction, no networking, no distributed cluster, no Raft, no consensus.
 
 ---
 
@@ -22,7 +22,7 @@ Engine (key-value + vector)
   ├── MemTable — in-memory write buffer (skip list)
   ├── SSTables — sorted, immutable on-disk segments
   ├── Bloom    — probabilistic membership filters
-  └── Vector   — approximate nearest-neighbour index
+  └── Vector   — exact k-nearest-neighbour index (cosine / L2 / dot)
 
 Cluster
   ├── Sharding     — consistent-hash partitioning
@@ -143,7 +143,7 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] 49 tests, 10 benchmarks in `internal/vector`
 - [x] **Single-node only** — no distributed vector search, no sharding, no replication
 
-**Phase 10 — Single-process Key-value Sharding** (branch: `phase-10-sharding`, in review)
+**Phase 10 — Single-process Key-value Sharding** ✓ locked
 
 - [x] `internal/shard` — deterministic consistent-hash key-value sharding over multiple local engines
 - [x] Multiple local `Engine` instances as shards — **no networking, no RPC, no cluster**
@@ -160,9 +160,26 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] 40 tests, 10 benchmarks in `internal/shard`
 - [x] **Local single-process sharding only** — no replication, no networking, no distributed cluster, no Raft, no consensus, no shard migration
 
-> No ANN, no HNSW, no IVF, no approximate search.
+> No ANN, no HNSW, no IVF, no approximate search. Phase 9 vector search is **exact brute-force only**.
 > No background compaction, no size-tiered compaction, no leveled compaction.
-> No automatic flush. No distributed/replicated mode. No replication. No networking.
+> No automatic flush. No networking. No distributed deployment. No Raft. No consensus.
+
+**Phase 11 — Local In-process Leader/Follower Replication Simulation** (branch: `phase-11-replication`, in review)
+
+- [x] `internal/replica` — local in-process leader/follower replication simulation for key-value operations
+- [x] Multiple local `Engine` instances as replicas — **no networking, no RPC, no distributed deployment**
+- [x] Configured leader; followers receive operations via deterministic replication log
+- [x] Append-only binary replication log with CRC-32 per record; durable restart/recovery
+- [x] `Open`, `Put`, `Delete`, `Get`, `Scan`, `ReplicateOnce`, `ReplicateAll`, `Stats`, `Close` API
+- [x] Leader-commit semantics: Put/Delete write to leader, append to log, advance commit index
+- [x] Followers apply via `ReplicateOnce`/`ReplicateAll`; applied index persisted per replica
+- [x] Stale follower reads documented; `ReadLeader`/`ReadFollower`/`ReadAny` modes
+- [x] Pause/lag simulation: `SetFollowerPaused`, `SetFollowerLag` for failure testing
+- [x] `REPLICATION.json` manifest written atomically with full validation
+- [x] Concurrent-safe: `sync.RWMutex` guards closed flag and shared state
+- [x] Makefile target: `bench-replica`
+- [x] 60 tests, 10 benchmarks in `internal/replica`
+- [x] **Local in-process simulation only** — no networking, no RPC, no Raft, no consensus, no automatic leader election, no quorum, no fault-tolerant distributed claims
 
 ## Planned Phases
 
@@ -177,7 +194,7 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 | 8 | Benchmarking and workload evaluation |
 | 9 | Vector search — exact k-NN (cosine / L2 / dot) |
 | 10 | Sharding — consistent-hash partitioning |
-| 11 | Replication — leader/follower; Raft-compatible consensus only after full implementation |
+| 11 | Replication — local leader/follower simulation (no Raft, no networking) |
 | 12 | Dashboard, chaos / failure simulation |
 
 ## Features NOT Yet Implemented
@@ -187,10 +204,13 @@ The following are **not** present in the current codebase:
 - Background compaction (Compact() is manual only)
 - Automatic compaction thresholds
 - Leveled or size-tiered compaction
-- ANN / HNSW / IVF vector search (Phase 9 is exact only)
-- Sharding
-- Replication / consensus
-- Failure simulation
+- ANN / HNSW / IVF vector search — Phase 9 is **exact brute-force only**, not approximate
+- Real networking or RPC
+- Distributed deployment
+- Raft or full consensus
+- Automatic leader election
+- Fault-tolerant quorum replication
+- Shard migration or resharding
 - Dashboard / monitoring
 
 ## How to Build
@@ -251,7 +271,8 @@ make fmt          # format source files
 make vet          # static analysis
 make lint         # run golangci-lint (skipped if not installed)
 make bench        # run all Go benchmarks
-make bench-engine # run engine Go benchmarks
+make bench-engine   # run engine Go benchmarks
+make bench-replica  # run replica Go benchmarks
 make bench-vector # run vector Go benchmarks
 make bench-shard  # run shard Go benchmarks
 make bench-report # generate docs/BENCHMARKS.md (small scale)

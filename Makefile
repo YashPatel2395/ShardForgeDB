@@ -1,20 +1,23 @@
-BINARY       := shardforge
-BENCH_BINARY := shardforge-bench
-BUILD_DIR    := bin
-CMD          := ./cmd/shardforge
-BENCH_CMD    := ./cmd/shardforge-bench
-GO           := go
-GOFLAGS      :=
+BINARY           := shardforge
+BENCH_BINARY     := shardforge-bench
+DASHBOARD_BINARY := shardforge-dashboard
+BUILD_DIR        := bin
+CMD              := ./cmd/shardforge
+BENCH_CMD        := ./cmd/shardforge-bench
+DASHBOARD_CMD    := ./cmd/shardforge-dashboard
+GO               := go
+GOFLAGS          :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-report help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-report dashboard help
 
 all: fmt vet build
 
-## build: compile the shardforge and shardforge-bench binaries into bin/
+## build: compile the shardforge, shardforge-bench, and shardforge-dashboard binaries into bin/
 build:
 	@mkdir -p $(BUILD_DIR)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BINARY) $(CMD)
 	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(BENCH_BINARY) $(BENCH_CMD)
+	$(GO) build $(GOFLAGS) -o $(BUILD_DIR)/$(DASHBOARD_BINARY) $(DASHBOARD_CMD)
 
 ## test: run all tests with race detection
 test:
@@ -55,6 +58,14 @@ bench-shard:
 ## bench-replica: run Go benchmarks for the replica package only
 bench-replica:
 	$(GO) test -bench=. -benchmem ./internal/replica/...
+
+## bench-dashboard: run Go benchmarks for the dashboard package only
+bench-dashboard:
+	$(GO) test -bench=. -benchmem ./internal/dashboard/...
+
+## dashboard: run the local dashboard in demo mode
+dashboard:
+	$(GO) run $(DASHBOARD_CMD) --demo
 
 ## bench-report: run the workload benchmark suite (small scale) and write docs/BENCHMARKS.md
 bench-report:

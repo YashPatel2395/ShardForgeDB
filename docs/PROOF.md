@@ -2735,3 +2735,127 @@ git status --short                                                 (clean after 
 ### Scope Confirmation
 
 No networking, no RPC, no distributed deployment, no Raft, no consensus, no automatic leader election, no fault-tolerant quorum, no shard migration, no resharding, no vector replication, no ANN/HNSW/IVF, no background compaction, no automatic compaction, and no core Engine behavior changes were made in this review fix.
+
+---
+
+## Phase 12 — Local Dashboard and Chaos Simulation
+
+### API Implemented
+
+**Dashboard package** (`internal/dashboard`):
+
+```
+types.go      — ComponentType, HealthStatus, Options, ComponentSnapshot,
+                TimelineEvent, Snapshot, Collector interface,
+                ScenarioStatus, ScenarioStep, ScenarioResult
+collector.go  — NewEngineCollector, NewShardCollector, NewReplicaCollector,
+                NewMultiCollector, NewScenarioCollector
+templates.go  — renderHTML (html/template; no external JS)
+server.go     — NewServer, (*Server).Handler, (*Server).Start, (*Server).Close
+scenario.go   — RunFollowerPauseScenario, RunFollowerLagScenario,
+                RunFollowerCatchupScenario, ReplicaScenarioTarget
+```
+
+### HTTP Endpoints
+
+| Endpoint | Returns |
+|----------|---------|
+| `GET /` | HTML dashboard (component cards + timeline) |
+| `GET /status` | JSON `Snapshot` |
+| `GET /healthz` | JSON `{"status":"ok"}` |
+| `GET /events` | JSON `[]TimelineEvent` |
+| Unknown path | 404 Not Found |
+
+### Collectors
+
+| Collector | Source |
+|-----------|--------|
+| `NewEngineCollector` | `engine.Engine.Stats()` |
+| `NewShardCollector` | `shard.Store.Stats()` |
+| `NewReplicaCollector` | `replica.Store.Stats()` — reports `HealthDegraded` when follower lags |
+| `NewMultiCollector` | Merges components and events from N collectors |
+| `NewScenarioCollector` | Exposes `ScenarioResult.Events` through dashboard |
+
+### Scenarios
+
+| Scenario | Steps | Key verification |
+|----------|-------|-----------------|
+| `RunFollowerPauseScenario` | 7 | Key absent while paused; present after unpause + ReplicateAll |
+| `RunFollowerLagScenario` | 6 | Lag confirmed (AppliedIndex < CommitIndex); all 6 keys after ReplicateAll |
+| `RunFollowerCatchupScenario` | 6 | 4 keys absent while paused; all present after unpause + ReplicateAll |
+
+### Tests Added
+
+| File | Count |
+|------|-------|
+| `internal/dashboard/server_test.go` | 30 tests + 5 benchmarks |
+| `internal/dashboard/scenario_test.go` | 16 tests + 3 benchmarks |
+| **Total** | **46 tests, 8 benchmarks** |
+
+Coverage of all 32 required test categories including: nil collector rejection, default options, all 4 endpoints, all 3 collectors, MultiCollector merge, HTML escaping, footer phrase check, health states, all 3 scenarios passing, bad-input non-panic, events ordered, steps present, concurrent race safety, start/close idempotency.
+
+### Benchmarks Added
+
+```
+BenchmarkSnapshot_EngineCollector
+BenchmarkSnapshot_ReplicaCollector
+BenchmarkSnapshot_MultiCollector
+BenchmarkRenderHTML
+BenchmarkEncodeStatusJSON
+BenchmarkRunFollowerPauseScenario
+BenchmarkRunFollowerLagScenario
+BenchmarkRunFollowerCatchupScenario
+```
+
+### CLI Command
+
+`cmd/shardforge-dashboard/main.go`:
+- `--help` — usage
+- `--demo` — opens temp 3-replica store, seeds 20 keys, starts HTTP server
+- `--run-chaos` — additionally runs all three scenarios before starting server
+- `--addr` — custom listen address
+
+### Makefile Targets Added
+
+```makefile
+dashboard:       go run ./cmd/shardforge-dashboard --demo
+bench-dashboard: go test -bench=. -benchmem ./internal/dashboard/...
+build:           now also builds bin/shardforge-dashboard
+```
+
+### Docs Updated
+
+- `README.md` — Phase 11 marked ✓ locked; Phase 12 added as in review
+- `docs/DESIGN.md` — Phase 12 section added
+- `docs/PROOF.md` — this section
+- `docs/BENCHMARKS.md` — Phase 12 benchmark section added after validation
+
+### Commands Run
+
+```
+go mod tidy                                                        OK
+go fmt ./...                                                       OK
+go vet ./...                                                       OK
+go test -race -count=1 -v ./internal/dashboard/...                46/46 PASS
+go test -race -count=1 ./...                                       16 packages PASS
+go test -bench=. -benchmem -benchtime=3s ./internal/dashboard/... 8 benchmarks PASS
+make test                                                          PASS
+make vet                                                           PASS
+make build                                                         PASS (3 binaries)
+make bench-dashboard                                               PASS
+./bin/shardforge-dashboard --help                                  OK
+git status --short                                                 (clean)
+```
+
+### Known Limitations
+
+- **Local only.** All components run in a single OS process — no networking between nodes.
+- **In-memory simulation.** Pause and lag are in-memory flags; they cannot simulate real network partitions or process crashes.
+- **No leader failure simulation.** Only follower behaviour is exercised.
+- **No log compaction.** The replication log grows unboundedly during scenarios.
+- **No vector replication.** `internal/vector` is not included in collectors or scenarios.
+- **No background compaction.** Engine maintenance is manual only.
+
+### Scope Confirmation
+
+No networking, no RPC, no distributed deployment, no Raft, no consensus, no automatic leader election, no quorum replication, no shard migration, no resharding, no vector replication, no ANN/HNSW/IVF, no background compaction, no automatic compaction, and no core Engine, Shard, Replica, or Vector behavior changes were implemented in Phase 12.

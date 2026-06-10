@@ -165,6 +165,36 @@ These benchmarks measure the replication simulation layer (`internal/replica`). 
 
 ---
 
+## Phase 12 — Dashboard Package Benchmarks (Local In-process Dashboard and Chaos)
+
+These benchmarks measure the local observability dashboard (`internal/dashboard`). All components run inside a single OS process. **No networking, no RPC, no Raft, no consensus, no distributed cluster.**
+
+**Platform:** Apple M3 · darwin/arm64 · Go 1.26 · `go test -bench=. -benchmem ./internal/dashboard/...`
+
+### Collector Benchmarks
+
+| Benchmark | ns/op | B/op | allocs/op | Notes |
+|-----------|------:|-----:|----------:|-------|
+| Snapshot_EngineCollector | 235 | 736 | 6 | Read engine Stats() |
+| Snapshot_ReplicaCollector | 1,377 | 3,113 | 36 | Read 3-replica Stats() |
+| Snapshot_MultiCollector | 830 | 2,584 | 18 | Merge 3 engine collectors |
+| RenderHTML | 13,330 | 10,700 | 184 | html/template execution |
+| EncodeStatusJSON | 2,848 | 8,434 | 47 | /status JSON encoding |
+
+### Chaos Scenario Benchmarks
+
+Each scenario benchmark opens a fresh 3-replica store per iteration (includes Open + scenario execution + Close):
+
+| Benchmark | ns/op | B/op | allocs/op | Notes |
+|-----------|------:|-----:|----------:|-------|
+| RunFollowerPauseScenario | 13,445,540 | 42,307 | 398 | Open + pause/unpause + Close |
+| RunFollowerLagScenario | 19,003,524 | 69,730 | 757 | Open + lag + 6 writes + Close |
+| RunFollowerCatchupScenario | 17,947,683 | 58,799 | 616 | Open + pause + 4 writes + Close |
+
+Scenario throughput is dominated by replica store open/close overhead. Scenario logic itself (SetFollowerPaused, ReplicateAll, Get) is a small fraction of total time.
+
+---
+
 ## Known Limitations
 
 - **Manual compaction only.** No background, automatic, leveled, or size-tiered compaction.

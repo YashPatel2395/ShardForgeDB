@@ -2,7 +2,7 @@
 
 An **explainable** distributed database engine for key-value and vector search workloads, written in Go.
 
-> **Phase 11 in review.** WAL, MemTable, SSTable, Bloom Filter, single-node Engine, manual full compaction, exact vector search, local key-value sharding, and local in-process leader/follower replication simulation are implemented.
+> **Phase 12 in review.** WAL, MemTable, SSTable, Bloom Filter, single-node Engine, manual full compaction, exact vector search, local key-value sharding, local in-process leader/follower replication simulation, and local observability dashboard with chaos/failure simulation are implemented.
 > No background compaction, no networking, no distributed cluster, no Raft, no consensus.
 
 ---
@@ -164,7 +164,7 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 > No background compaction, no size-tiered compaction, no leveled compaction.
 > No automatic flush. No networking. No distributed deployment. No Raft. No consensus.
 
-**Phase 11 — Local In-process Leader/Follower Replication Simulation** (branch: `phase-11-replication`, in review)
+**Phase 11 — Local In-process Leader/Follower Replication Simulation** ✓ locked
 
 - [x] `internal/replica` — local in-process leader/follower replication simulation for key-value operations
 - [x] Multiple local `Engine` instances as replicas — **no networking, no RPC, no distributed deployment**
@@ -180,6 +180,21 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] Makefile target: `bench-replica`
 - [x] 60 tests, 10 benchmarks in `internal/replica`
 - [x] **Local in-process simulation only** — no networking, no RPC, no Raft, no consensus, no automatic leader election, no quorum, no fault-tolerant distributed claims
+
+**Phase 12 — Local Dashboard and Chaos/Failure Simulation** (branch: `phase-12-dashboard-chaos`, in review)
+
+- [x] `internal/dashboard` — local HTTP observability dashboard and chaos scenario runner
+- [x] Local HTTP server serving HTML dashboard, JSON `/status`, `/healthz`, `/events` endpoints
+- [x] `EngineCollector`, `ShardCollector`, `ReplicaCollector`, `MultiCollector`, `ScenarioCollector`
+- [x] Three deterministic local chaos scenarios: follower pause, follower lag, follower catch-up
+- [x] `RunFollowerPauseScenario`, `RunFollowerLagScenario`, `RunFollowerCatchupScenario`
+- [x] Timeline event recording in all scenarios; events exposed through dashboard
+- [x] `cmd/shardforge-dashboard` CLI with `--demo` and `--run-chaos` flags
+- [x] HTML rendered via Go standard library `html/template`; no external JS dependencies
+- [x] Footer states: "Local dashboard only — no networking, no Raft, no consensus, no distributed cluster."
+- [x] Makefile targets: `dashboard`, `bench-dashboard`; build target updated to include `bin/shardforge-dashboard`
+- [x] 46 tests, 8 benchmarks in `internal/dashboard`
+- [x] **Local only** — no networking between database nodes, no RPC, no Raft, no consensus, no distributed cluster, no shard migration, no resharding, no vector replication, no ANN/HNSW/IVF
 
 ## Planned Phases
 

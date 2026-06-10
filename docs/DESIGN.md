@@ -907,4 +907,171 @@ This design avoids holding a global lock during engine I/O while still protectin
 
 ---
 
+---
+
+## Replication Simulation Layer
+
+**Phase 11 — Implemented** in `internal/replica`.
+
+### Goals
+
+1. Prove leader/follower write routing, deterministic operation ordering, and follower catch-up — all within a single process.
+2. Demonstrate read consistency trade-offs (stale follower reads vs. leader reads).
+3. Provide a durable, restart-safe replication log with CRC integrity.
+4. Simulate failure conditions (paused followers, bounded lag) for educational purposes.
+5. **Not** distributed consensus, not Raft, not automatic leader election, not fault-tolerant quorum.
+
+### Directory Layout
+
+```
+<Dir>/
+  REPLICATION.json        — atomic manifest (version, replica_count, leader_id, paths)
+  replog/
+    log.dat               — append-only binary replication log
+  replicas/
+    replica-0000/         — leader Engine directory (Engine + WAL + SSTables)
+    replica-0001/         — follower Engine directory
+      APPLIED             — last applied log index (ASCII decimal, atomically written)
+    replica-0002/
+      APPLIED
+```
+
+### Manifest Format
+
+`REPLICATION.json` is written atomically (temp file + rename):
+
+```json
+{
+  "version": 1,
+  "replica_count": 3,
+  "leader_id": 0,
+  "replica_prefix": "replica",
+  "replicas": [
+    {"id": 0, "role": "leader",   "name": "replica-0000", "path": "replicas/replica-0000"},
+    {"id": 1, "role": "follower", "name": "replica-0001", "path": "replicas/replica-0001"},
+    {"id": 2, "role": "follower", "name": "replica-0002", "path": "replicas/replica-0002"}
+  ]
+}
+```
+
+Validation rules: version==1, replica_count>0, len(replicas)==replica_count, unique IDs in [0,n), unique names, unique relative clean paths (no absolute paths, no path traversal), exactly one leader role, leader_id matches a leader-role replica.
+
+### Replication Log Format
+
+`replog/log.dat` is an append-only binary file:
+
+```
+File header (10 bytes):
+  [magic    8 bytes]  "SHARDREP"
+  [version  uint16]  1 (little-endian)
+
+Per record:
+  [recordLen  uint32]  byte count of: crc32 + index + opType + keyLen + valLen + key + value
+  [crc32      uint32]  CRC-32/IEEE over all bytes after itself in this record
+  [index      uint64]  LogIndex (1-based, monotonically increasing)
+  [opType     uint8]   1=Put, 2=Delete
+  [keyLen     uint32]  byte length of key
+  [valueLen   uint32]  byte length of value
+  [key        bytes]
+  [value      bytes]
+```
+
+Records are validated on replay: bad CRC and truncated records are rejected with distinct errors.
+
+### Commit / Applied Index Semantics
+
+- **CommitIndex:** advances immediately when a leader write succeeds. No follower acknowledgement is required. This is **not** quorum replication.
+- **AppliedIndex (per follower):** advances as each follower processes operations via `ReplicateOnce`/`ReplicateAll`. Persisted to `APPLIED` after each successful application.
+- On restart, the commit index is reconstructed from the log's last index. Per-follower applied indexes are loaded from `APPLIED` files. Followers only apply operations with index > their loaded applied index.
+
+### Write Path
+
+1. Validate key (non-empty).
+2. Acquire store write lock (`s.mu.Lock`).
+3. Append operation to `replog/log.dat` (durable; index = last+1).
+4. Apply to leader Engine (WAL + MemTable write).
+5. If leader write succeeds: advance leader's `appliedIndex` and `commitIndex`; persist leader's `APPLIED`.
+6. If leader write fails: return error; `commitIndex` is not advanced; the log has an uncommitted tail record.
+
+### Replication Path
+
+`ReplicateOnce`:
+1. Acquire store write lock.
+2. For each non-paused follower with `appliedIndex < commitIndex`:
+   - Fetch up to `maxApplyPerCall` operations from the in-memory log cache with index > follower's `appliedIndex`.
+   - Apply each to the follower's Engine.
+   - Update and persist follower's `appliedIndex` after each success.
+3. Return total applications.
+
+`ReplicateAll`: loops `ReplicateOnce` until no progress remains.
+
+### Read Modes
+
+| Mode | Behaviour | Staleness |
+|------|-----------|-----------|
+| `ReadLeader` | Reads from the leader Engine | Never stale |
+| `ReadFollower` | Reads from the specified follower; replicaID must not be the leader | Stale until ReplicateAll |
+| `ReadAny` | Reads from replicaID if ≥ 0, otherwise from leader | Depends on target |
+
+Follower reads reflect only operations applied up to that follower's `appliedIndex`. They may miss keys or return outdated values. This is documented and expected behaviour, not a bug.
+
+### Pause / Lag Simulation
+
+- `SetFollowerPaused(id, true)` — follower is skipped during `ReplicateOnce`/`ReplicateAll`. Simulates a stopped node.
+- `SetFollowerPaused(id, false)` — resume; next `ReplicateAll` catches up.
+- `SetFollowerLag(id, n)` — follower applies at most `n` operations per `ReplicateOnce` call. Simulates a slow node.
+- These controls are **in-memory only** and are not persisted. They reset on reopen.
+
+### Restart Behavior
+
+On `Open` with an existing `REPLICATION.json`:
+1. Manifest is loaded and validated.
+2. The replication log is opened and replayed into an in-memory operation cache.
+3. Each replica Engine is opened (WAL replayed internally by the Engine layer).
+4. Per-follower `APPLIED` files are read to restore applied indexes.
+5. `commitIndex` is set to the log's last index.
+6. Followers do not automatically catch up on restart; callers must call `ReplicateAll`.
+
+### Failure Limitations
+
+- If the process crashes after a log record is appended but before the leader Engine write succeeds, the log will have an uncommitted tail record. On restart, `commitIndex` reflects the log's last index (including the uncommitted record). The leader Engine may or may not have the write (depending on WAL replay). This is a known limitation; a production system would use explicit commit markers in the log or a two-phase write.
+- If a follower `APPLIED` write fails (best-effort), the follower may re-apply an already-applied operation on restart. The Engine is idempotent for repeated same-key writes at higher sequence numbers, so correctness is preserved but Seq numbers may differ.
+- Pause/lag simulation does not persist across restarts.
+
+### Why This Is Not Raft / Distributed Consensus
+
+| Property | This Phase | Raft |
+|----------|-----------|------|
+| Transport | None (in-process function calls) | Network RPC |
+| Leader election | Manual configuration; fixed | Randomised timeout election |
+| Commit rule | Single leader write (no quorum) | Majority acknowledgement |
+| Log compaction | Not implemented | Snapshotting |
+| Membership changes | Not implemented | Joint consensus / single-server |
+| Fault tolerance | None (leader death = halt) | Majority alive = liveness |
+| Linearisability | Leader reads only | All reads with lease or read index |
+
+This phase is an **educational simulation** demonstrating the mechanics of operation propagation in a leader/follower model. It should not be used for production durability or availability.
+
+### Concurrency
+
+`Store` uses a single `sync.RWMutex`:
+
+- `Put`/`Delete` acquire the full write lock (`Lock`) for the entire append-apply-commit sequence.
+- `ReplicateOnce`/`ReplicateAll` acquire the full write lock to prevent races between `appliedIndex` updates in different goroutines.
+- `Get`/`Scan`/`Stats`/`Replicas` acquire the read lock.
+- `Close` acquires the write lock, sets `closed = true`, closes all engines and the log.
+
+### Limitations
+
+- **In-process only.** No networking, no RPC.
+- **No automatic leader election.** Leader is fixed at `Open` time.
+- **No Raft, no consensus.** Commit does not require follower acknowledgement.
+- **No log compaction.** The replication log grows unboundedly.
+- **No snapshotting.** Followers catch up by replaying the full log from index 0.
+- **No vector replication.** `internal/vector` is not replicated.
+- **No distributed transactions.** Operations are not atomic across replicas in a distributed sense.
+- **Manual flush/compact only.** No background maintenance.
+
+---
+
 *This document will be updated as each phase is implemented and design decisions are validated.*

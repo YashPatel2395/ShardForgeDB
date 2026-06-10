@@ -2,7 +2,7 @@
 
 ## Overview
 
-ShardForgeDB is a ground-up Go database engine built layer-by-layer to be fully explainable at every level of the stack. Every design decision, data structure, trade-off, and benchmark result is documented alongside the code. The project is structured as a sequence of fourteen numbered phases, each building on the previous and producing its own tests, benchmarks, and documentation.
+ShardForgeDB is a ground-up Go database engine built layer-by-layer to be fully explainable at every level of the stack. Every design decision, data structure, trade-off, and benchmark result is documented alongside the code. The project is structured as a sequence of sixteen numbered phases, each building on the previous and producing its own tests, benchmarks, and documentation.
 
 The goal is not to compete with production databases. The goal is to demonstrate deep understanding of database internals — how LSM trees actually work, what makes replication hard, why compaction matters, how to design a real networked node transport — through working code that is honest about what it is and what it is not.
 
@@ -11,10 +11,14 @@ The goal is not to compete with production databases. The goal is to demonstrate
 ## Architecture Summary
 
 ```
-HTTP Client / shardforge-node CLI (Phase 14)
-  │ real HTTP/JSON over TCP
+HTTP Client
+  │ HTTP/JSON
   ▼
-Node Server (internal/node)
+shardforge-proxy (internal/proxy, port 9200)   ← Phase 16
+  │ client-side consistent-hash routing
+  │ uses internal/gateway
+  ▼
+shardforge-node-{1,2,3} (internal/node, ports 9101–9103)  ← Phase 14
   │
   ▼
 Engine (key-value + vector)
@@ -29,10 +33,11 @@ Simulation Layers (single-process, no networking between database nodes)
   ├── Replica   — binary operation log, leader-commit semantics, follower pause/lag controls
   └── Dashboard — local HTTP observability, HTML + JSON endpoints, chaos scenario runner
 
-Docker Compose Demo (Phase 14)
+Docker Compose Demo (Phase 16)
   ├── shardforge-node-1 — independent node, port 9101, /data/node-1
   ├── shardforge-node-2 — independent node, port 9102, /data/node-2
-  └── shardforge-node-3 — independent node, port 9103, /data/node-3
+  ├── shardforge-node-3 — independent node, port 9103, /data/node-3
+  └── shardforge-proxy  — stateless routing proxy, port 9200
 ```
 
 ---
@@ -56,6 +61,7 @@ Docker Compose Demo (Phase 14)
 | 13 | scripts, docs | Polish, release hardening, scripts, release checklist | — | — |
 | 14 | `internal/node` + `cmd/shardforge-node` | Real networked node runtime, HTTP/JSON API, Docker Compose 3-node demo | 36 | 6 |
 | 15 | `internal/gateway` + `cmd/shardforge-gateway` | Client-side consistent-hash routing gateway, FNV-1a ring, weight support | 41 | 6 |
+| 16 | `internal/proxy` + `cmd/shardforge-proxy` | Stateless HTTP routing proxy, 10 endpoints, scope flags, Docker Compose integration | 45 | 7 |
 
 ---
 
@@ -84,6 +90,9 @@ Representative benchmark results (Apple M3):
 | Node Handler Get (HTTP, in-process) | ~1.5µs/op |
 | Node Client Put (real HTTP loopback) | ~41µs/op |
 | Node Client Get (real HTTP loopback) | ~33µs/op |
+| Proxy Route (ring only, no backend call) | ~29µs/op |
+| Proxy Put (proxy→node TCP loopback) | ~74µs/op |
+| Proxy Get (proxy→node TCP loopback) | ~65µs/op |
 
 ---
 
@@ -96,13 +105,14 @@ ShardForgeDB is honest about what it is and is not:
 - An exact vector search engine (brute-force cosine / L2 / dot product)
 - A local simulation of sharding, replication, and a chaos-testing dashboard
 - A real networked node runtime with HTTP/JSON API and Docker Compose multi-node demo
+- A stateless HTTP routing proxy that routes requests to independent nodes via consistent hashing
 - A portfolio project designed to demonstrate deep database internals knowledge
 
 **What it is not:**
 - A production database
-- A distributed system (Phase 14 nodes are independent, not coordinated)
+- A distributed system (nodes are independent, not coordinated)
 - A Raft or Paxos implementation
-- A fault-tolerant replicated cluster
+- A fault-tolerant replicated cluster (proxy has no failover)
 - An approximate nearest-neighbour (ANN) vector database
 - A system with automatic background compaction
 - A production monitoring platform
@@ -121,7 +131,8 @@ The design documents explicitly state these boundaries at every phase.
 - Built a local HTTP observability dashboard with HTML rendering, JSON status endpoints, and deterministic chaos/failure scenarios
 - Built a real networked node runtime: independent `shardforge-node` processes, HTTP/JSON API, Docker Compose 3-node demo
 - Implemented a client-side routing gateway (`shardforge-gateway`) with deterministic consistent-hash routing, virtual nodes, weight support, and per-node health/flush/compact fanout
-- 550+ tests across all packages, race-safe, with reproducible benchmark results documented at every phase
+- Implemented a stateless HTTP routing proxy (`shardforge-proxy`) that exposes one HTTP/JSON API and routes requests to independent nodes; includes scope flags, no-failover proof, and Docker Compose integration
+- 600+ tests across all packages, race-safe, with reproducible benchmark results documented at every phase
 - Full documentation: DESIGN.md (architecture), PROOF.md (per-phase evidence), BENCHMARKS.md (reproducible numbers)
 
 ---
@@ -130,13 +141,13 @@ The design documents explicitly state these boundaries at every phase.
 
 If this were a real production system, the logical next steps would be:
 
-1. **Shard router** — a routing layer that maps keys to the correct node via consistent hashing over real HTTP
-2. **Networked replication** — a leader node that replicates writes to follower nodes over the network
-3. **Raft consensus** — leader election, log replication, cluster membership changes
-4. **Cluster membership** — node discovery, join/leave protocols, gossip
-5. **ANN vector index** — HNSW or IVF for approximate nearest-neighbour at scale
-6. **Background compaction** — automatic size-tiered or leveled compaction triggered by SSTable count
-7. **Block cache** — in-memory LRU cache for hot SSTable blocks
-8. **Snapshot and log compaction** — Raft snapshot protocol to bound log growth
-9. **Multi-version concurrency control (MVCC)** — snapshot-isolated reads
-10. **Distributed tracing and metrics** — OpenTelemetry integration
+1. **Networked replication** — a leader node that replicates writes to follower nodes over the network
+2. **Raft consensus** — leader election, log replication, cluster membership changes
+3. **Cluster membership** — node discovery, join/leave protocols, gossip
+4. **ANN vector index** — HNSW or IVF for approximate nearest-neighbour at scale
+5. **Background compaction** — automatic size-tiered or leveled compaction triggered by SSTable count
+6. **Block cache** — in-memory LRU cache for hot SSTable blocks
+7. **Snapshot and log compaction** — Raft snapshot protocol to bound log growth
+8. **Multi-version concurrency control (MVCC)** — snapshot-isolated reads
+9. **Distributed tracing and metrics** — OpenTelemetry integration
+10. **Proxy horizontal scaling** — multiple proxy instances with shared ring configuration

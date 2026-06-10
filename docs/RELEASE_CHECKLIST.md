@@ -179,4 +179,39 @@ This checklist must pass before any release or portfolio submission.
 - ~~"Implemented distributed sharding."~~
 - ~~"Implemented automatic failover."~~
 - ~~"Nodes coordinate through the gateway."~~
+
+---
+
+## Phase 16 — Stateless Gateway Proxy Server
+
+### Validation Commands
+
+```bash
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 ./...
+go test -bench=. -benchmem -benchtime=3s -run='^$' ./internal/proxy/...
+make test
+make vet
+make build
+make bench-proxy
+./bin/shardforge-proxy --help
+docker compose -f deploy/docker-compose.yml config
+git status --short
+```
+
+### Allowed claims (Phase 16)
+
+- "Implemented a stateless HTTP gateway proxy that routes requests to independent nodes using consistent hashing."
+- "Proxy exposes 10 HTTP/JSON endpoints including /healthz, /status, /route/{key}, /kv/{key}, /scan-node/{nodeID}, /flush-all, /compact-all, /nodes/health."
+- "Proxy explicitly documents no-failover, no-replication, no-Raft scope in /status response and startup banner."
+- "Docker Compose demo includes proxy + 3 independent nodes."
+
+### Forbidden claims (Phase 16)
+
+- ~~"Implemented automatic failover or distributed fault tolerance."~~
+- ~~"Proxy replicates data across nodes."~~
+- ~~"Proxy retries requests on failure."~~
+- ~~"The system is fault-tolerant."~~
 - ~~"The gateway is a distributed router."~~

@@ -2,12 +2,13 @@
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer with strict documentation, tests, and benchmarks at every phase.
 
-> **Phase 15 in review.** All fourteen prior phases are implemented and locked.
-> Phase 15 adds a client-side routing gateway: deterministic consistent-hash routing of Put/Get/Delete to independent nodes.
+> **Phase 16 in review.** All fifteen prior phases are implemented and locked.
+> Phase 16 adds a stateless HTTP gateway proxy (`shardforge-proxy`) that wraps the Phase 15
+> `internal/gateway` routing layer in a long-running HTTP server.
 >
-> This is client-side routing only. Nodes do NOT coordinate. No Raft. No consensus.
-> No quorum replication. No automatic leader election. No failover. No shard migration.
-> Retrying to a different node is unsafe without replication.
+> This is a stateless routing proxy only. No Raft. No consensus. No replication.
+> No automatic failover. No retry to another node. If the routed node is unavailable,
+> the operation fails immediately — no other node is tried.
 
 ---
 
@@ -24,6 +25,7 @@ Built to demonstrate:
 - **Local HTTP dashboard and chaos scenarios** — observable stats, HTML view, deterministic failure scenarios
 - **Real networked node runtime** — independent `shardforge-node` processes, HTTP/JSON API, Docker Compose 3-node demo
 - **Client-side routing gateway** — deterministic consistent-hash routing to independent nodes via `shardforge-gateway`
+- **Stateless HTTP gateway proxy** — `shardforge-proxy` wraps the gateway ring in a long-running HTTP/JSON server (10 endpoints, no failover, no retry)
 - **Strict test/benchmark/docs discipline** — race-safe tests, reproducible benchmarks, honest scope docs
 
 ---
@@ -41,20 +43,21 @@ Sharding, replication, and the dashboard are **local in-process simulations** �
 | Compaction | Manual full compaction (`Compact()`) | Background compaction, automatic thresholds, leveled/size-tiered |
 | Node runtime | Real independent `shardforge-node` processes, HTTP/JSON API, Docker Compose demo | Distributed sharding across nodes, networked replication, Raft, consensus |
 | Gateway | Client-side consistent-hash routing (`shardforge-gateway`), deterministic key→node mapping | Server-side routing, cluster metadata service, automatic failover, resharding |
+| Proxy | Stateless HTTP proxy (`shardforge-proxy`), routes requests to nodes via gateway ring, 10 endpoints | Fault-tolerant proxy, retry on failure, replication, distributed state |
 
 ---
 
 ## Architecture
 
 ```
-shardforge-gateway CLI (Phase 15)
-  │ consistent-hash routing — client-side only, no coordination
+HTTP Client
+  │ HTTP/JSON
   ▼
-HTTP Client / shardforge-node CLI
-  │ HTTP/JSON (real network transport, Phase 14)
+shardforge-proxy (internal/proxy, port 9200)   ← Phase 16 — stateless routing proxy
+  │ consistent-hash routing via internal/gateway
   ▼
-Node Server (internal/node)
-  │
+shardforge-node-{1,2,3} (internal/node, ports 9101–9103)  ← Phase 14
+  │ HTTP/JSON (real network transport)
   ▼
 Engine (key-value + vector)
   ├── WAL      — durable, CRC-checksummed write-ahead log
@@ -68,12 +71,13 @@ Simulation Layers (all single-process, no networking between database nodes)
   ├── Replica  — leader/follower operation log with pause/lag/catch-up
   └── Dashboard — local HTTP observability + deterministic chaos scenarios
 
-Docker Compose Demo (Phase 14)
+Docker Compose Demo (Phase 16)
   ├── shardforge-node-1 (port 9101, /data/node-1)
   ├── shardforge-node-2 (port 9102, /data/node-2)
-  └── shardforge-node-3 (port 9103, /data/node-3)
-  — 3 independent nodes, each with its own Engine directory
-  — NOT distributed sharding, NOT Raft, NOT consensus
+  ├── shardforge-node-3 (port 9103, /data/node-3)
+  └── shardforge-proxy  (port 9200)
+  — 3 independent nodes + 1 stateless proxy
+  — NOT distributed sharding, NOT Raft, NOT consensus, NOT automatic failover
 ```
 
 Implemented components are tracked in the phase list below.
@@ -83,7 +87,7 @@ Implemented components are tracked in the phase list below.
 ## Quickstart
 
 ```bash
-# Build all four binaries (includes shardforge-node)
+# Build all six binaries (includes shardforge-node, shardforge-gateway, shardforge-proxy)
 make build
 
 # Run all tests (race detector on)
@@ -104,7 +108,14 @@ make bench-report
 # Route a key with the gateway (show which node wins)
 ./bin/shardforge-gateway --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103 route user:1
 
-# Start 3-node Docker Compose demo
+# Start proxy (routes to nodes already running on 9101-9103)
+./bin/shardforge-proxy --nodes http://127.0.0.1:9101,http://127.0.0.1:9102,http://127.0.0.1:9103
+
+# Proxy quickstart: curl to proxy for Put/Get
+curl -X PUT http://127.0.0.1:9200/kv/user:1 -H "Content-Type: application/json" -d '{"value":"alice"}'
+curl http://127.0.0.1:9200/kv/user:1
+
+# Start 3-node + proxy Docker Compose demo
 make node-demo
 
 # Fast smoke validation
@@ -344,7 +355,7 @@ make node-demo-down
 - [x] **NOT Raft, NOT consensus, NOT quorum replication, NOT distributed sharding, NOT automatic leader election**
 - [x] **Each node is independent** — no shared state, no cluster coordination, no shard migration
 
-**Phase 15 — Client-Side Routing Gateway** (branch: `phase-15-client-routing-gateway`, in review)
+**Phase 15 — Client-Side Routing Gateway** ✓ locked
 
 - [x] `internal/gateway` — deterministic consistent-hash routing gateway library
 - [x] `cmd/shardforge-gateway` — CLI for routing-aware Put/Get/Delete/Health/Flush/Compact
@@ -359,6 +370,20 @@ make node-demo-down
 - [x] **Client-side routing only** — nodes do NOT coordinate, replicate, or share state
 - [x] **No Raft, no consensus, no quorum, no automatic leader election, no failover, no shard migration**
 - [x] **No retry to another node** — explicitly unsafe without replication
+
+**Phase 16 — Stateless Gateway Proxy Server** ✓ locked
+
+- [x] `internal/proxy` — stateless HTTP routing proxy wrapping `internal/gateway.Gateway`
+- [x] `cmd/shardforge-proxy` — long-running proxy server CLI binary
+- [x] 10 HTTP/JSON endpoints: `/healthz`, `/status`, `/route/{key}`, `/kv/{key}` (PUT/GET/DELETE), `/scan-node/{nodeID}`, `/flush-all`, `/compact-all`, `/nodes/health`
+- [x] `proxy.Status` with `Scope` struct — self-documents no-Raft, no-consensus, no-replication, no-failover
+- [x] If routed node is unavailable → 502/503 immediately; **no retry to another node**
+- [x] 45 tests, 7 benchmarks in `internal/proxy` + `cmd/shardforge-proxy`
+- [x] Makefile targets: `bench-proxy`, `proxy`, `proxy-help`, `proxy-route-demo`
+- [x] `bin/shardforge-proxy` added to `make build` (now 6 binaries)
+- [x] Docker Compose updated: `shardforge-proxy` on port 9200 alongside 3 independent nodes
+- [x] **Stateless routing only** — proxy holds no data; can be restarted at any time
+- [x] **No Raft, no consensus, no replication, no failover, no retry**
 
 ---
 
@@ -382,7 +407,7 @@ The following are **not** present in the current codebase and are not claimed:
 ## Build and Run
 
 ```bash
-# Build all five binaries into bin/
+# Build all six binaries into bin/
 make build
 
 # Individual binaries
@@ -391,6 +416,7 @@ go build -o bin/shardforge-bench ./cmd/shardforge-bench
 go build -o bin/shardforge-dashboard ./cmd/shardforge-dashboard
 go build -o bin/shardforge-node ./cmd/shardforge-node
 go build -o bin/shardforge-gateway ./cmd/shardforge-gateway
+go build -o bin/shardforge-proxy ./cmd/shardforge-proxy
 ```
 
 ## Test and Benchmark
@@ -404,6 +430,9 @@ make bench-replica           # replica Go benchmarks
 make bench-vector            # vector Go benchmarks
 make bench-shard             # shard Go benchmarks
 make bench-dashboard         # dashboard Go benchmarks
+make bench-node              # node package Go benchmarks
+make bench-gateway           # gateway package Go benchmarks
+make bench-proxy             # proxy package Go benchmarks
 ```
 
 ## Scripts
@@ -418,7 +447,7 @@ make bench-dashboard         # dashboard Go benchmarks
 
 ```bash
 make all           # fmt + vet + build
-make build         # compile bin/shardforge, bin/shardforge-bench, bin/shardforge-dashboard
+make build         # compile all 6 binaries into bin/
 make test          # go test -race -count=1 ./...
 make fmt           # format source files
 make vet           # static analysis
@@ -438,6 +467,10 @@ make node-demo         # docker compose up --build (3-node demo)
 make node-demo-down    # docker compose down -v
 make gateway-help      # print shardforge-gateway --help
 make gateway-demo      # show route demo (requires node-demo running)
+make proxy             # run shardforge-proxy (requires nodes running)
+make proxy-help        # print shardforge-proxy --help
+make proxy-route-demo  # show proxy route endpoint demo
+make bench-proxy       # proxy package Go benchmarks
 make smoke             # ./scripts/smoke.sh
 make demo              # ./scripts/demo.sh
 make release-check     # ./scripts/release_check.sh

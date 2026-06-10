@@ -346,3 +346,32 @@ make bench-gateway
 # or
 go test -bench=. -benchmem -benchtime=3s ./internal/gateway/...
 ```
+
+---
+
+## Phase 16 — Gateway Proxy Server (`internal/proxy`)
+
+**Machine:** Apple M3, darwin/arm64, Go 1.26.4
+
+```
+BenchmarkProxy_Route-8         116691    29342 ns/op    6062 B/op      70 allocs/op
+BenchmarkProxy_Put-8            48792    74416 ns/op   20824 B/op     238 allocs/op
+BenchmarkProxy_Get-8            55782    64914 ns/op   15875 B/op     188 allocs/op
+BenchmarkProxy_Status-8        118112    30831 ns/op    6269 B/op      74 allocs/op
+BenchmarkProxy_NodesHealth-8    28322   127771 ns/op   33031 B/op     358 allocs/op
+BenchmarkProxy_FlushAll-8       26460   125524 ns/op   33021 B/op     358 allocs/op
+BenchmarkProxy_CompactAll-8     29347   125802 ns/op   33037 B/op     358 allocs/op
+```
+
+Notes:
+- **Route (~30 µs):** pure ring computation, no backend call. Extra latency vs raw ring (~23 ns) is HTTP overhead through the proxy.
+- **Put/Get (~65–75 µs):** full proxy→node TCP loopback round-trip. Comparable to direct `node.Client` put/get (~40 µs) plus proxy handler overhead.
+- **NodesHealth/FlushAll/CompactAll (~128 µs):** fan out to 3 nodes; cost ≈ 3× single-node RPC latency.
+- Benchmarks use HTTP keep-alive (custom `http.Transport`) to ensure TCP connections are reused and do not exhaust ephemeral ports under high throughput.
+
+**To reproduce:**
+```bash
+make bench-proxy
+# or
+go test -bench=. -benchmem -benchtime=3s -run='^$' ./internal/proxy/...
+```

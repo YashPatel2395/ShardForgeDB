@@ -1459,4 +1459,92 @@ from the `--nodes` URL list order.
 - Unknown nodeID in ScanNode → `ErrUnknownNode`.
 - Gateway closed → `ErrClosed` on all operations.
 - Node unreachable → error from `node.Client` propagated directly (no retry).
+
+---
+
+## Phase 16 — Stateless Gateway Proxy Server (`internal/proxy`)
+
+**Status:** Implemented. See `internal/proxy` and `cmd/shardforge-proxy`.
+
+### Purpose
+
+Phase 15 added the `internal/gateway` package as a library and a one-shot `shardforge-gateway`
+CLI. Phase 16 wraps that library in a **long-running HTTP proxy server** so clients can send
+HTTP/JSON requests to a single endpoint without embedding the gateway logic or running a
+separate CLI process per request.
+
+### Architecture
+
+```
+HTTP Client
+  │  HTTP/JSON
+  ▼
+shardforge-proxy (internal/proxy.Server, port 9200)
+  │  uses internal/gateway.Gateway
+  │  consistent-hash ring, FNV-1a 64-bit
+  ▼
+shardforge-node-{1,2,3} (internal/node.Server, ports 9101–9103)
+  │
+  ▼
+Engine (WAL + MemTable + SSTable + Bloom)
+```
+
+### Request Flow
+
+1. HTTP client sends `PUT /kv/user:1` to the proxy (port 9200).
+2. Proxy extracts key `user:1` from the URL path.
+3. `internal/gateway.Gateway.Put` computes `FNV-1a(user:1)`, binary-searches the ring, selects `node-2`.
+4. Proxy calls `node.Client.Put(ctx, key, value)` → HTTP PUT to `http://node-2:9101/kv/user:1`.
+5. Node stores the key in its local Engine (WAL + MemTable).
+6. Response propagates back: node → proxy → client.
+
+The proxy is **stateless** — it holds no data and can be restarted at any time. It caches the ring configuration in memory but that is reconstructed from `--nodes` flags on startup.
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/healthz` | Proxy liveness (does not check backend nodes) |
+| GET | `/status` | Proxy addr, started_at, gateway stats, scope flags |
+| GET | `/route/{key}` | Ring lookup — returns node_id + base_url, no network call |
+| PUT | `/kv/{key}` | Write key/value to routed node |
+| GET | `/kv/{key}` | Read key from routed node |
+| DELETE | `/kv/{key}` | Delete key from routed node |
+| GET | `/scan-node/{nodeID}` | Per-node scan (start/end query params) |
+| POST | `/flush-all` | Flush all configured nodes |
+| POST | `/compact-all` | Compact all configured nodes |
+| GET | `/nodes/health` | Health check all configured nodes |
+
+### No Failover — Safety Property
+
+The proxy does **not** retry to another node if the routed node is unavailable. This is a safety property, not an oversight:
+
+- Without replication, `user:1` written to `node-2` does not exist on `node-1` or `node-3`.
+- Retrying to `node-1` would silently return "not found" after a write that the client believes succeeded.
+- The proxy returns 502/503 immediately, making the failure explicit and detectable.
+
+### `/scan-node/{nodeID}` — Per-Node Scan
+
+The scan endpoint scans exactly one named node. There is no global distributed scan because there
+is no replication — keys are partitioned across nodes by the ring. A global scan would require
+querying all nodes and merging, which is not implemented (and would be inconsistent without
+coordinated snapshots).
+
+### `/nodes/health` — Diagnostic Only
+
+`GET /nodes/health` returns one health entry per configured node. A 200 HTTP response is always
+returned, even if some nodes are down, because this endpoint is diagnostic. Callers check the
+per-node `ok` field to determine individual node health.
+
+### Scope Honesty
+
+- Stateless client-side routing only.
+- No data stored in the proxy.
+- No Raft, no consensus, no quorum replication.
+- No automatic failover or retry to another node.
+- No distributed sharding inside nodes.
+- No networked replication between nodes.
+- No shard migration or resharding.
+- No distributed vector search.
+- If the routed node is unavailable, the operation fails clearly (502/503).
 - Duplicate node IDs or URLs → `ErrInvalidOptions` at `Open` time.

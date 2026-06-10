@@ -1,15 +1,18 @@
-# ShardForgeDB — Docker Compose multi-node demo
+# ShardForgeDB — Docker Compose multi-node demo with routing proxy
 #
-# Starts 3 independent shardforge-node processes, each with its own data directory.
+# Starts 3 independent shardforge-node processes and 1 shardforge-proxy.
 # This is NOT a distributed cluster: no Raft, no consensus, no quorum replication,
 # no shared state, no automatic failover. Each node is an independent networked
-# key-value store. This is the networked node runtime foundation.
+# key-value store. The proxy routes requests to nodes via consistent hashing.
 #
 # Usage:
 #   docker compose -f deploy/docker-compose.yml up --build
-#   curl http://localhost:9101/healthz
-#   curl http://localhost:9102/healthz
-#   curl http://localhost:9103/healthz
+#   curl http://localhost:9200/healthz
+#   curl http://localhost:9200/status
+#   curl http://localhost:9200/route/user:1
+#   curl -X PUT http://localhost:9200/kv/user:1 -H "Content-Type: application/json" -d '{"value":"alice"}'
+#   curl http://localhost:9200/kv/user:1
+#   curl http://localhost:9200/nodes/health
 #   docker compose -f deploy/docker-compose.yml down -v
 
 services:
@@ -74,6 +77,30 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+    restart: unless-stopped
+
+  shardforge-proxy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    # Override the default node entrypoint with the proxy binary.
+    entrypoint: ["/usr/local/bin/shardforge-proxy"]
+    container_name: shardforge-proxy
+    command:
+      - --addr=0.0.0.0:9200
+      - --nodes=http://shardforge-node-1:9101,http://shardforge-node-2:9102,http://shardforge-node-3:9103
+    ports:
+      - "9200:9200"
+    depends_on:
+      - shardforge-node-1
+      - shardforge-node-2
+      - shardforge-node-3
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9200/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
     restart: unless-stopped
 
 volumes:

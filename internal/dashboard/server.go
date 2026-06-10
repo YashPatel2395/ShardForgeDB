@@ -104,6 +104,11 @@ func (s *Server) buildHandler() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		snap := s.collector.Snapshot()
 		html, err := renderHTML(snap)
 		if err != nil {
@@ -117,17 +122,32 @@ func (s *Server) buildHandler() http.Handler {
 
 	// GET /status — JSON Snapshot
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		snap := s.collector.Snapshot()
 		writeJSON(w, http.StatusOK, snap)
 	})
 
 	// GET /healthz — JSON {"status":"ok"}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
 	// GET /events — JSON array of TimelineEvents
 	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		snap := s.collector.Snapshot()
 		events := snap.Events
 		if events == nil {

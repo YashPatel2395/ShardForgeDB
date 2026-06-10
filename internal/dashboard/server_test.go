@@ -230,6 +230,79 @@ func TestHandler_Unknown_404(t *testing.T) {
 	}
 }
 
+// postBody issues a POST request to the handler.
+func postBody(t *testing.T, h http.Handler, path string) int {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	return w.Result().StatusCode
+}
+
+// Test: POST / returns 405.
+func TestHandler_Root_POST_405(t *testing.T) {
+	col := &staticCollector{snap: staticSnap("t", "c", ComponentEngine)}
+	srv := newTestServer(t, col)
+	if code := postBody(t, srv.Handler(), "/"); code != http.StatusMethodNotAllowed {
+		t.Errorf("POST / status = %d, want 405", code)
+	}
+}
+
+// Test: POST /status returns 405.
+func TestHandler_Status_POST_405(t *testing.T) {
+	col := &staticCollector{snap: staticSnap("t", "c", ComponentEngine)}
+	srv := newTestServer(t, col)
+	if code := postBody(t, srv.Handler(), "/status"); code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /status status = %d, want 405", code)
+	}
+}
+
+// Test: POST /healthz returns 405.
+func TestHandler_Healthz_POST_405(t *testing.T) {
+	col := &staticCollector{snap: staticSnap("t", "c", ComponentEngine)}
+	srv := newTestServer(t, col)
+	if code := postBody(t, srv.Handler(), "/healthz"); code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /healthz status = %d, want 405", code)
+	}
+}
+
+// Test: POST /events returns 405.
+func TestHandler_Events_POST_405(t *testing.T) {
+	col := &staticCollector{snap: staticSnap("t", "c", ComponentEngine)}
+	srv := newTestServer(t, col)
+	if code := postBody(t, srv.Handler(), "/events"); code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /events status = %d, want 405", code)
+	}
+}
+
+// Test: GET /unknown still returns 404 (not 405).
+func TestHandler_GetUnknown_404(t *testing.T) {
+	col := &staticCollector{snap: staticSnap("t", "c", ComponentEngine)}
+	srv := newTestServer(t, col)
+	code, _ := getBody(t, srv.Handler(), "/unknown-path")
+	if code != http.StatusNotFound {
+		t.Errorf("GET /unknown status = %d, want 404", code)
+	}
+}
+
+// Test: 405 response includes Allow: GET header.
+func TestHandler_405_AllowHeader(t *testing.T) {
+	col := &staticCollector{snap: staticSnap("t", "c", ComponentEngine)}
+	srv := newTestServer(t, col)
+	for _, path := range []string{"/", "/status", "/healthz", "/events"} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+		res := w.Result()
+		if res.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("POST %s status = %d, want 405", path, res.StatusCode)
+		}
+		if allow := res.Header.Get("Allow"); allow != http.MethodGet {
+			t.Errorf("POST %s Allow header = %q, want GET", path, allow)
+		}
+	}
+}
+
 // ── Collector tests ───────────────────────────────────────────────────────────
 
 // Test 8: EngineCollector returns engine stats.

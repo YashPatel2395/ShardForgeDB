@@ -3,7 +3,7 @@
 An **explainable** distributed database engine for key-value and vector search workloads, written in Go.
 
 > **Phase 12 in review.** WAL, MemTable, SSTable, Bloom Filter, single-node Engine, manual full compaction, exact vector search, local key-value sharding, local in-process leader/follower replication simulation, and local observability dashboard with chaos/failure simulation are implemented.
-> No background compaction, no networking, no distributed cluster, no Raft, no consensus.
+> No background compaction, no database-node networking, no RPC, no distributed cluster, no Raft, no consensus. The Phase 12 dashboard is a local HTTP server only — it does not implement networking between database nodes.
 
 ---
 
@@ -29,7 +29,7 @@ Cluster
   └── Replication  — leader/follower replication
 ```
 
-WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable`), Bloom Filter (`internal/bloom`), the single-node Engine (`internal/engine`), and manual full compaction are implemented as of Phase 7. All other components are intended design only — not yet implemented.
+Implemented components are tracked in the phase list below. Later distributed-system features remain intentionally scoped as local simulations unless explicitly marked otherwise.
 
 ## Current Phase
 
@@ -157,7 +157,7 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] Reopen safety: manifest values loaded on reopen; mismatched options return `ErrShardMismatch`
 - [x] Concurrent-safe: `sync.RWMutex` guards closed flag; each engine handles its own synchronisation
 - [x] Makefile target: `bench-shard`
-- [x] 40 tests, 10 benchmarks in `internal/shard`
+- [x] 55 tests, 10 benchmarks in `internal/shard`
 - [x] **Local single-process sharding only** — no replication, no networking, no distributed cluster, no Raft, no consensus, no shard migration
 
 > No ANN, no HNSW, no IVF, no approximate search. Phase 9 vector search is **exact brute-force only**.
@@ -178,7 +178,7 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] `REPLICATION.json` manifest written atomically with full validation
 - [x] Concurrent-safe: `sync.RWMutex` guards closed flag and shared state
 - [x] Makefile target: `bench-replica`
-- [x] 60 tests, 10 benchmarks in `internal/replica`
+- [x] 66 tests, 10 benchmarks in `internal/replica`
 - [x] **Local in-process simulation only** — no networking, no RPC, no Raft, no consensus, no automatic leader election, no quorum, no fault-tolerant distributed claims
 
 **Phase 12 — Local Dashboard and Chaos/Failure Simulation** (branch: `phase-12-dashboard-chaos`, in review)

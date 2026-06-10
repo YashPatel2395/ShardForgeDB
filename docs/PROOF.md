@@ -2275,4 +2275,211 @@ BenchmarkConcurrentUpsert-8         886413      20605 ns/op      4101 B/op     1
 
 No ANN, HNSW, IVF, approximate search, sharding, replication, dashboard, networking, distributed mode, Raft, background compaction, automatic compaction, leveled compaction, or core engine behavior changes were made in this fix.
 
+---
+
+## Phase 10 — Single-process Key-value Sharding
+
+### API Implemented
+
+```go
+package shard
+
+func Open(opts Options) (*Store, error)
+func (s *Store) Put(key, value []byte) error
+func (s *Store) Delete(key []byte) error
+func (s *Store) Get(key []byte) ([]byte, bool, error)
+func (s *Store) Scan(start, end []byte) ([]Entry, error)
+func (s *Store) Flush() error
+func (s *Store) Compact() error
+func (s *Store) Stats() Stats
+func (s *Store) ShardForKey(key []byte) (ShardInfo, error)
+func (s *Store) Close() error
+```
+
+Sentinel errors: `ErrClosed`, `ErrInvalidOptions`, `ErrInvalidKey`, `ErrCorruptManifest`, `ErrShardMismatch`.
+
+### Manifest Format and Atomicity
+
+`SHARDING.json` is written via temp-file + `os.Rename` (atomic on POSIX). After `Open` completes, no `.tmp` file remains (verified by `TestManifest_WriteIsAtomic`).
+
+Example manifest:
+
+```json
+{
+  "version":       1,
+  "shard_count":   4,
+  "virtual_nodes": 128,
+  "hash":          "fnv64a",
+  "shard_prefix":  "shard",
+  "shards": [
+    {"id": 0, "name": "shard-0000", "path": "shards/shard-0000"},
+    {"id": 1, "name": "shard-0001", "path": "shards/shard-0001"},
+    {"id": 2, "name": "shard-0002", "path": "shards/shard-0002"},
+    {"id": 3, "name": "shard-0003", "path": "shards/shard-0003"}
+  ]
+}
+```
+
+Validated on read and write: version (must be 1), hash (must be "fnv64a"), no absolute paths, no path traversal, no duplicate IDs/names.
+
+### Consistent Hash Algorithm
+
+- Hash function: **FNV-1a 64-bit** (`hash/fnv.New64a`)
+- Token label: `"shard-XXXX#vnode-XXXX"` (zero-padded 4-digit decimal)
+- Ring size: `ShardCount × VirtualNodes` tokens
+- Sort: ascending by hash; ties broken by (shardID, vnodeIndex)
+- Routing: `fnv1a64(key)` → binary search for first token with `hash ≥ keyHash` → wrap to token 0
+
+The ring is rebuilt identically from manifest parameters on every open.
+
+### Routing Rules
+
+| Operation     | Target                        |
+|---------------|-------------------------------|
+| `Put`         | Exactly one shard (hash route)|
+| `Delete`      | Exactly one shard (hash route)|
+| `Get`         | Exactly one shard (hash route)|
+| `ShardForKey` | Exactly one shard (hash route)|
+| `Scan`        | All shards (fan-out)          |
+| `Flush`       | All shards                    |
+| `Compact`     | All shards                    |
+
+Empty key returns `ErrInvalidKey` before ring lookup.
+
+### Scan Fan-out Rules
+
+1. Call `engine.Scan(start, end)` on every shard.
+2. Merge results; for duplicate keys keep the entry with highest `Seq`.
+3. Sort final slice by key ascending.
+4. Return tombstone-free output.
+
+### Persistence and Recovery
+
+- First open: write `SHARDING.json`, create `shards/shard-XXXX/` dirs, open engines.
+- Reopen: read `SHARDING.json`, open each engine from stored path.
+- Mismatched `ShardCount` or `VirtualNodes` → `ErrShardMismatch`.
+- Each shard engine replays its own WAL independently on open.
+
+### Tests Added
+
+40 tests in `internal/shard/store_test.go` (all pass with `go test -race -count=1`):
+
+Options validation, manifest atomicity and corruption, hash ring determinism, stable routing across reopen, multi-shard distribution, ShardForKey empty-key rejection, Put/Get/Delete semantics, Scan fan-out and deduplication, Flush/Compact with reopen, Close idempotency and post-close errors, concurrent race safety, Stats aggregation, large 5000-key workload, shard name determinism.
+
+### Benchmark Results (shard package, Apple M3)
+
+Local single-process sharding benchmarks. Measurements include lock acquisition, ring lookup, engine delegation, and defensive copying.
+
+```
+BenchmarkRing_Route1M-8                   44197855       78.24 ns/op         32 B/op    1 allocs/op
+BenchmarkPut_10k_4shards-8                 2276066     1566   ns/op          201 B/op    7 allocs/op
+BenchmarkGet_10k_existing_4shards-8       24104815      148.6 ns/op          103 B/op    4 allocs/op
+BenchmarkGet_10k_missing_4shards-8        32376187      110.0 ns/op           31 B/op    1 allocs/op
+BenchmarkScan_10k_4shards-8                    631    5708292 ns/op      9651265 B/op  100309 allocs/op
+BenchmarkFlush_10k_4shards-8                    33  102990683 ns/op      5832826 B/op   50836 allocs/op
+BenchmarkCompact_10k_4shards-8                  31  126712509 ns/op     16978758 B/op  218841 allocs/op
+BenchmarkReopen_10k_4shards-8                 6186     578179 ns/op      1065529 B/op   10793 allocs/op
+BenchmarkConcurrentPut_4shards-8           1408251     2482   ns/op          484 B/op    6 allocs/op
+BenchmarkConcurrentGet_4shards-8          27233973      126.8 ns/op          103 B/op    4 allocs/op
+```
+
+### Known Limitations
+
+- Static shard count: fixed at creation; resharding not implemented.
+- FNV-1a with 128 vnodes can produce uneven ring coverage; use more vnodes for better balance.
+- No shard migration, resharding, or rebalancing.
+- No distributed transactions; multi-key ops not atomic across shards.
+- Scan is O(keys × shards): always fans out to all shards.
+- `internal/vector` is not sharded.
+
+### Confirmation: Scope Boundaries
+
+No replication, dashboard, networking, distributed mode, Raft, consensus, leader/follower, shard migration, resharding, rebalancing, distributed transactions, vector sharding, ANN, HNSW, IVF, approximate vector search, background compaction, automatic compaction, leveled compaction, size-tiered compaction, or core Engine behavior changes were implemented in Phase 10.
+
+### Phase 10 — Review Fix: Close-safety TOCTOU and Manifest Hardening
+
+#### Issue Fixed: Close-safety TOCTOU
+
+**Root cause:** The original implementation checked `s.closed` under `RLock`, released the lock, and then called the shard Engine outside the lock. This created a race:
+
+1. `Put` (or `Get`, `Scan`, etc.): acquires `RLock` → checks `s.closed == false` → gets engine handle → **releases `RLock`** → calls `engine.Put`
+2. `Close`: acquires `Lock` → sets `s.closed = true` → **releases `Lock`** → closes all engines
+3. Race: if step 2 runs between the `RUnlock` and `engine.Put` in step 1, `Put` calls a closed engine and returns `engine.ErrClosed` instead of `shard.ErrClosed`.
+
+**Fix: hold lock across engine calls.**
+
+- All public operations (`Put`, `Delete`, `Get`, `Scan`, `Flush`, `Compact`, `Stats`, `ShardForKey`) now hold `s.mu.RLock()` for the **entire** duration of their Engine calls.
+- `Close` holds `s.mu.Lock()` while closing **all** shard engines, not just while setting `s.closed`.
+
+**New locking invariant:**
+
+| Operation | Lock held during Engine call |
+|-----------|------------------------------|
+| `Put`, `Delete`, `Get`, `ShardForKey` | `s.mu.RLock()` via `defer s.mu.RUnlock()` |
+| `Scan` | `s.mu.RLock()` across all `engine.Scan` calls; released before in-memory merge/sort |
+| `Flush`, `Compact`, `Stats` | `s.mu.RLock()` via `defer s.mu.RUnlock()` |
+| `Close` | `s.mu.Lock()` via `defer s.mu.Unlock()` across all engine closes |
+
+This establishes a proper reader-writer relationship at the store level: concurrent reads can proceed simultaneously, and Close waits for all in-flight operations to finish before closing engines.
+
+#### Manifest Hardening Added
+
+`validateManifest` now additionally rejects:
+
+- `shard_count <= 0`
+- `virtual_nodes <= 0`
+- `len(shards) != shard_count`
+- shard ID outside `[0, shard_count)`
+- missing shard ID in `[0, shard_count)` (after pigeonhole checks above)
+- empty shard name
+- empty shard path
+- path not clean (`filepath.Clean(path) != path`)
+- duplicate shard path
+
+#### Tests Added/Updated
+
+**Updated:** `TestConcurrent_CloseWithPutGet` — now collects and reports unexpected errors (non-nil, non-`ErrClosed`) via an error channel; the test fails on any unexpected error.
+
+**New (close-safety):**
+1. `TestCloseConcurrentWithPutReturnsOnlyNilOrErrClosed` — 8 goroutines doing Put in a loop + concurrent Close; fails on any non-nil/non-ErrClosed error; verifies ErrClosed after close.
+2. `TestCloseConcurrentWithGetReturnsOnlyNilOrErrClosed` — seeds data; 8 goroutines doing Get + concurrent Close; same contract.
+3. `TestCloseConcurrentWithScanReturnsOnlyNilOrErrClosed` — 4 goroutines doing Scan + concurrent Close; same contract.
+4. `TestCloseConcurrentWithFlushCompactRaceSafe` — Flush and Compact goroutines + concurrent Close; same contract.
+
+**New (manifest hardening):**
+`TestManifest_RejectsZeroShardCount`, `TestManifest_RejectsZeroVirtualNodes`, `TestManifest_RejectsShardListLengthMismatch`, `TestManifest_RejectsShardIDOutOfRange`, `TestManifest_RejectsMissingShardID`, `TestManifest_RejectsEmptyShardName`, `TestManifest_RejectsEmptyShardPath`, `TestManifest_RejectsDuplicatePath`, `TestManifest_RejectsUncleanPath`.
+
+**Updated total shard test count:** 55 (was 40).
+
+All 55 tests pass with `go test -race -count=1 ./internal/shard/...`.
+
+#### Commands Run
+
+```
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 ./...
+go test -bench=. -benchmem -benchtime=3s ./internal/shard/...
+go test -bench=. -benchmem -benchtime=3s ./internal/vector/...
+go test -bench=. -benchmem -benchtime=3s ./internal/engine/...
+go test -bench=. -benchmem -benchtime=3s ./internal/bench/...
+make test
+make vet
+make build
+make bench-shard
+make bench-vector
+make bench-report
+./bin/shardforge --help
+./bin/shardforge version
+./bin/shardforge-bench --scale small --out /tmp/shardforge-bench.md
+git status --short
+```
+
+All commands passed with zero errors.
+
+#### Scope Boundaries
+
+No replication, networking, distributed mode, Raft, consensus, shard migration, resharding, vector sharding, ANN, HNSW, IVF, background compaction, automatic compaction, or core Engine behavior changes were made in this fix.
+
 *Future phases will append their own sections to this document.*

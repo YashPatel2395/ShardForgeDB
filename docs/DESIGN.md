@@ -759,4 +759,152 @@ Time complexity: O(n·d). All stored vectors must fit in memory.
 
 ---
 
+## Sharding Layer
+
+### Phase 10 — Single-process Key-value Sharding
+
+**Implemented** in `internal/shard`.
+
+This phase adds a sharding layer that routes key-value operations across multiple local `Engine` instances using deterministic consistent hashing. It is **not** a distributed system: all shards live inside a single OS process, there is no networking, no RPC, no replication, and no consensus.
+
+#### Goals
+
+- Deterministic, stable key routing across process restarts.
+- Shard-local persistence via independent `Engine` instances.
+- Fan-out range scans that merge results from all shards.
+- Shard-level flush and compaction.
+- Clean restart and recovery via an atomic manifest.
+
+#### Directory Layout
+
+```
+<Dir>/
+  SHARDING.json        — sharding manifest (written atomically)
+  shards/
+    shard-0000/        — Engine directory for shard 0
+    shard-0001/        — Engine directory for shard 1
+    shard-0002/        — Engine directory for shard 2
+    ...
+```
+
+Each shard directory is a fully independent `engine.Engine` instance with its own WAL, MemTable, SSTables, Bloom sidecars, and `MANIFEST.json`.
+
+#### Manifest Format
+
+`SHARDING.json` is written atomically (temp file + `rename`):
+
+```json
+{
+  "version":       1,
+  "shard_count":   4,
+  "virtual_nodes": 128,
+  "hash":          "fnv64a",
+  "shard_prefix":  "shard",
+  "shards": [
+    {"id": 0, "name": "shard-0000", "path": "shards/shard-0000"},
+    {"id": 1, "name": "shard-0001", "path": "shards/shard-0001"},
+    {"id": 2, "name": "shard-0002", "path": "shards/shard-0002"},
+    {"id": 3, "name": "shard-0003", "path": "shards/shard-0003"}
+  ]
+}
+```
+
+Manifest validation rejects:
+
+- Unsupported version number.
+- Unknown hash algorithm.
+- Absolute shard paths.
+- Path traversal (`../`).
+- Duplicate shard IDs.
+- Duplicate shard names.
+
+On reopen, if the caller passes non-zero `ShardCount` or `VirtualNodes` that differ from the manifest, `Open` returns `ErrShardMismatch` immediately.
+
+#### Hash Ring Algorithm
+
+The ring uses **FNV-1a 64-bit** hashing. For each shard `i` and virtual node `v`:
+
+```
+token_label = "shard-XXXX#vnode-XXXX"    (zero-padded 4-digit decimal)
+token_hash  = fnv1a64(token_label)
+```
+
+All `ShardCount × VirtualNodes` tokens are sorted ascending by hash value. Ties are broken deterministically by (shardID, vnodeIndex).
+
+Key routing:
+
+1. Compute `h = fnv1a64(key)`.
+2. Binary-search the sorted token array for the first token with `hash >= h`.
+3. If none found, wrap to token 0.
+4. Return the shard ID of the found token.
+
+This is standard consistent hashing. The same key always routes to the same shard given identical ring parameters, making routing stable across process restarts.
+
+#### Operation Routing
+
+| Operation    | Routing |
+|-------------|---------|
+| `Put`        | Single shard determined by key hash |
+| `Delete`     | Single shard determined by key hash |
+| `Get`        | Single shard determined by key hash |
+| `ShardForKey`| Single shard determined by key hash |
+| `Scan`       | Fan-out to all shards (see below) |
+| `Flush`      | Applied to every shard sequentially |
+| `Compact`    | Applied to every shard sequentially |
+
+Empty keys are rejected immediately with `ErrInvalidKey` before ring lookup.
+
+#### Scan Fan-out
+
+Consistent hashing destroys key locality: adjacent keys may live on different shards. Therefore `Scan(start, end)` must fan out:
+
+1. Call `engine.Scan(start, end)` on every shard.
+2. Merge all results into a `map[string]*candidate`, keeping only the entry with the highest `Seq` per key.
+3. Collect surviving entries and sort by key ascending.
+4. Return deterministic, tombstone-free output.
+
+The deduplication step handles the edge case where the same key is present in multiple shard engines (e.g., injected by tests or hypothetical migration scenarios).
+
+#### Stats Aggregation
+
+`Stats()` calls `engine.Stats()` on every shard and aggregates:
+
+- `TotalMemTableEntries` — sum across all shards.
+- `TotalMemTableApproxBytes` — sum across all shards.
+- `TotalSSTableCount` — sum across all shards.
+- `TotalFlushCount` — sum across all shards.
+- `TotalCompactionCount` — sum across all shards.
+- `Shards []ShardStats` — one entry per shard with per-shard counters.
+
+`Stats()` is allowed after `Close` (documented; engines return their last known state).
+
+#### Failure Behavior
+
+- `Flush` and `Compact`: iterate all shards; return a wrapped error (shard ID + name) on first failure.
+- `Close`: iterate all shards; return first close error. Remaining shards are still closed (best-effort).
+- `Open` with failed engine: close all already-opened engines and return the error.
+
+#### Concurrency
+
+`Store` uses a single `sync.RWMutex`:
+
+- Public write methods acquire `RLock`, check `closed`, get the target engine, release `RLock`, then call the engine method outside the lock.
+- `Close` acquires the full `Lock`, sets `closed = true`, releases, then closes all engines.
+- Each `Engine` already handles its own internal synchronisation.
+
+This design avoids holding a global lock during engine I/O while still protecting against use-after-close races in the sequential (non-racing) case.
+
+#### Limitations
+
+- **Static shard count.** The number of shards is fixed at creation time. Resharding is not implemented.
+- **No shard migration.** Keys cannot be moved between shards.
+- **No rebalancing.** If ring coverage is uneven (FNV-1a with few virtual nodes is not perfectly uniform), load imbalance is possible.
+- **No replication.** Each shard has a single local copy. No leader/follower, no Raft.
+- **No networking.** All shards are in-process; no RPC or cluster membership.
+- **No distributed transactions.** Operations are not atomic across shards.
+- **No vector sharding.** The `internal/vector` package is not sharded.
+- **No background compaction.** `Compact()` is manual only.
+
+---
+
 *This document will be updated as each phase is implemented and design decisions are validated.*

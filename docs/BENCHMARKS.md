@@ -400,3 +400,29 @@ make bench-cluster
 # or
 go test -bench=. -benchmem -benchtime=3s -run='^$' ./internal/cluster/...
 ```
+
+---
+
+## Phase 19 — Ops Package Benchmarks
+
+**Machine:** Apple M3, darwin/arm64, Go 1.26.4
+
+```
+BenchmarkOps_RouteKey-8                          80344 iter    43975 ns/op   45264 B/op    794 allocs/op
+BenchmarkOps_SimulateFailure_100Keys-8             484 iter  7446026 ns/op 7042754 B/op 133024 allocs/op
+BenchmarkOps_PlanManualRebalance_100Keys-8       45248 iter    80206 ns/op   76516 B/op   1332 allocs/op
+BenchmarkOps_CheckClusterHealth_HealthyNodes-8   38815 iter    92532 ns/op   25878 B/op    278 allocs/op
+```
+
+Notes:
+- **RouteKey (~44 µs):** Creates a gateway ring per call (opens + closes gateway). In production use, route lookups are cached in the gateway ring.
+- **SimulateFailure_100Keys (~7.4 ms):** Creates 2 gateway rings (current + available) × 100 keys each. Dominated by gateway ring construction (one per call).
+- **PlanManualRebalance_100Keys (~80 µs):** Creates 2 gateway rings × 100 routing lookups. Fast because ring construction is amortized.
+- **CheckClusterHealth_HealthyNodes (~93 µs):** 3 local httptest servers; sequential health checks. Real network latency would dominate in production.
+
+**To reproduce:**
+```bash
+make bench-ops
+# or
+go test -bench=. -benchmem -benchtime=3s -run='^$' ./internal/ops/...
+```

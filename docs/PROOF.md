@@ -3478,3 +3478,82 @@ ok  github.com/YashPatel2395/ShardForgeDB/internal/gateway    (ForwardToAll/Forw
 - No multi-primary: correct — Validate enforces exactly one primary
 - No strong consistency guarantee: correct — replication lag expected
 - All existing tests unmodified and passing: correct
+
+---
+
+## Phase 19 — Failure Handling and Manual Rebalance Simulation
+
+### Validation Commands Run
+
+```
+go mod tidy       → clean
+go fmt ./...      → clean
+go vet ./...      → clean
+go test -race -count=1 ./...   → all 25 packages PASS
+make test                       → all PASS
+make vet                        → clean
+make build                      → all 7 binaries built
+make bench-ops                  → 4 benchmarks PASS
+```
+
+### Config Validation
+
+```
+./bin/shardforge-cluster validate configs/local-failure-sim-3node.json
+ok  "configs/local-failure-sim-3node.json" is valid (version=v1, name="local-failure-sim-3node", nodes=3)
+
+docker compose -f deploy/docker-compose.yml config     → valid
+docker compose -f deploy/docker-compose-replica.yml config → valid
+```
+
+### Failure Simulation Output (Proof)
+
+Running `simulate-failure` with node-2 down and sample keys — showing routing changes:
+
+```bash
+./bin/shardforge-cluster simulate-failure configs/local-failure-sim-3node.json \
+  --down node-2 --key user:1 --key user:2 --key order:9
+```
+
+Output (abbreviated):
+```json
+{
+  "cluster_name": "local-failure-sim-3node",
+  "down_node_ids": ["node-2"],
+  "healthy_node_ids": ["node-1", "node-3"],
+  "affected_keys": [
+    {"key": "user:1", "original_node": "node-2", "new_node": "node-1", "moved": false, "unavailable": false},
+    {"key": "user:2", "original_node": "node-2", "new_node": "node-1", "moved": false, "unavailable": false}
+  ],
+  "unaffected_keys": [
+    {"key": "order:9", "original_node": "node-1", "new_node": "node-1", "moved": false, "unavailable": false}
+  ],
+  "summary": {"total_keys": 3, "affected_keys": 2, "unaffected_keys": 1, "moved_keys": 0, "unavailable_keys": 0},
+  "scope": {"manual_only": true, "simulation_only": true, "no_automatic_failover": true, ...}
+}
+```
+
+**Proof that simulation does NOT affect live routing**: The command only performs static ring computation. No HTTP calls are made to nodes. The live cluster routing is unchanged.
+
+### Rebalance Plan Output (Proof)
+
+```bash
+./bin/shardforge-cluster plan-rebalance configs/local-failure-sim-3node.json \
+  --remove node-2 --key user:1 --key user:2 --key order:9
+```
+
+Output shows `operator_steps` including "No data movement is performed by this tool."
+
+### Benchmark Results
+
+```
+BenchmarkOps_RouteKey-8                          80344 iter    43975 ns/op
+BenchmarkOps_SimulateFailure_100Keys-8             484 iter  7446026 ns/op
+BenchmarkOps_PlanManualRebalance_100Keys-8       45248 iter    80206 ns/op
+BenchmarkOps_CheckClusterHealth_HealthyNodes-8   38815 iter    92532 ns/op
+```
+
+### Test Counts
+
+- `internal/ops`: 40 tests PASS (11 health, 13 simulate, 13 rebalance, 3 route)
+- `cmd/shardforge-cluster`: 25 tests PASS (15 new Phase 19 tests)

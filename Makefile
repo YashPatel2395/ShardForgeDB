@@ -16,7 +16,7 @@ CLUSTER_CMD      := ./cmd/shardforge-cluster
 GO               := go
 GOFLAGS          :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-replnet bench-report dashboard node node-demo node-demo-down replica-demo replica-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example replica-config-demo replica-status-demo smoke demo release-check help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-replnet bench-ops bench-report dashboard node node-demo node-demo-down replica-demo replica-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example replica-config-demo replica-status-demo ops-health-demo ops-simulate-failure-demo ops-rebalance-plan-demo smoke demo release-check help
 
 all: fmt vet build
 
@@ -95,6 +95,10 @@ bench-cluster:
 bench-replnet:
 	$(GO) test -bench=. -benchmem ./internal/replnet/...
 
+## bench-ops: run Go benchmarks for the ops package only
+bench-ops:
+	$(GO) test -bench=. -benchmem ./internal/ops/...
+
 ## dashboard: run the local dashboard in demo mode
 dashboard:
 	$(GO) run $(DASHBOARD_CMD) --demo
@@ -170,6 +174,18 @@ replica-config-demo:
 ## replica-status-demo: show replication status from all nodes via the proxy (requires replica-demo running)
 replica-status-demo:
 	curl -s http://127.0.0.1:9210/replication/status
+
+## ops-health-demo: check health of all nodes in the failure-sim config (reports unhealthy if nodes not running)
+ops-health-demo:
+	./bin/shardforge-cluster health configs/local-failure-sim-3node.json
+
+## ops-simulate-failure-demo: simulate node-2 failure impact on sample keys
+ops-simulate-failure-demo:
+	./bin/shardforge-cluster simulate-failure configs/local-failure-sim-3node.json --down node-2 --key user:1 --key user:2 --key order:9
+
+## ops-rebalance-plan-demo: plan manual rebalance after removing node-2
+ops-rebalance-plan-demo:
+	./bin/shardforge-cluster plan-rebalance configs/local-failure-sim-3node.json --remove node-2 --key user:1 --key user:2 --key order:9
 
 ## smoke: fast smoke validation (test + vet + build + CLI checks)
 smoke:

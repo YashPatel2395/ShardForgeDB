@@ -1707,3 +1707,151 @@ Proxy (port 9210)
 - Replication log is in-memory. It is cleared on primary restart.
 - Followers are read-only for client operations but can have their engine written via `/replication/apply`.
 - The cluster config `scope.no_replication: true` is preserved — it refers to *automatic* background replication at the cluster layer, which this phase does not implement.
+
+---
+
+## Phase 19 — Failure Handling and Manual Rebalance Simulation
+
+### Purpose
+
+Phase 19 adds an **operations and simulation layer** (`internal/ops`) to help operators answer:
+
+- Which configured nodes are healthy?
+- What happens to routing if a node is considered down?
+- Which sample keys would move if a node is removed or added?
+- What manual steps would an operator take to recover or rebalance?
+
+This is a **simulation and planning layer only**. No automatic failover. No automatic rebalancing. No data movement. No shard migration. Manual operator action required for all real cluster changes.
+
+### Package: `internal/ops`
+
+Pure, stateless functions. No background goroutines. No persistent state. No mutations of live configs.
+
+**Key types:**
+- `OpsScope` — 8 flags all true: `ManualOnly`, `SimulationOnly`, `NoAutomaticFailover`, `NoAutomaticRebalancing`, `NoShardMigration`, `NoDataMovement`, `NoConsensus`, `NoRaft`
+- `NodeHealth` — per-node health result: state (healthy/unhealthy/unknown), HTTP status, latency, error string
+- `ClusterHealth` — aggregated health result with summary and scope
+- `FailureSimulationResult` — routing impact with affected/unaffected key lists
+- `RebalancePlan` — key movement plan with operator steps and scope
+
+**Key functions:**
+- `DefaultOpsScope()` — all flags true
+- `CheckClusterHealth(ctx, cfg, timeout)` — HTTP `/healthz` checks, sorted by node ID
+- `RouteKey(cfg, key)` — pure consistent-hash routing (no network)
+- `RouteKeyWithAvailableNodes(cfg, key, availableIDs)` — route on filtered node subset
+- `SimulateFailure(cfg, req)` — routing impact of specified failures (no live calls)
+- `PlanManualRebalance(cfg, removed, added, keys)` — key movement plan (no data movement)
+
+### Routing Reuse
+
+`RouteKey` uses `cluster.GatewayOptions` → `gateway.Open` → `gateway.NodeForKey`. No hashing logic is duplicated. The consistent-hash ring is the same FNV-1a ring used by the proxy and gateway.
+
+`RouteKeyWithAvailableNodes` builds a filtered `gateway.Options` directly from the subset of nodes, bypassing `cluster.Validate` to allow partial node sets.
+
+### Health Check Architecture
+
+```
+CheckClusterHealth(ctx, cfg, timeout)
+  │ for each node in cfg.Nodes (parallel-capable, currently sequential)
+  ├── GET {baseURL}/healthz
+  ├── measure latency
+  ├── check HTTP 2xx
+  ├── decode JSON {"status":"ok"}
+  └── mark healthy/unhealthy/unknown
+  │
+  Sort by node ID (deterministic output)
+  Return ClusterHealth with summary + OpsScope
+```
+
+Never panics. Never retries. Never mutates config. Exits 0 even if all nodes unhealthy.
+
+### Failure Simulation Flow
+
+```
+SimulateFailure(cfg, {downNodeIDs, sampleKeys})
+  │
+  ├── Validate: all downNodeIDs exist in cfg → ErrUnknownNode if not
+  ├── Validate: sampleKeys non-empty → ErrInvalidSimulation if empty
+  ├── Compute healthyIDs = cfg.Nodes \ downNodeIDs
+  │
+  for each key in sampleKeys:
+  ├── origNode = RouteKey(cfg, key)
+  ├── if allDown: mark unavailable
+  ├── else: newNode = RouteKeyWithAvailableNodes(cfg, key, healthyIDs)
+  ├── affected if origNode ∈ downSet or newNode ≠ origNode
+  └── moved if !downSet[origNode] && newNode ≠ origNode
+  │
+  Return FailureSimulationResult with affected/unaffected lists + OpsScope
+```
+
+### Rebalance Plan Flow
+
+```
+PlanManualRebalance(cfg, removedNodeIDs, addedNodes, sampleKeys)
+  │
+  ├── Validate: all removedNodeIDs exist → ErrUnknownNode
+  ├── Validate: sampleKeys non-empty → ErrInvalidSimulation
+  ├── plannedNodes = (cfg.Nodes \ removed) + added
+  ├── if len(plannedNodes) == 0 → ErrNoHealthyNodes
+  │
+  Build currentGW from cfg.Nodes
+  Build plannedGW from plannedNodes
+  │
+  for each key in sampleKeys:
+  ├── fromNode = currentGW.NodeForKey(key)
+  ├── toNode = plannedGW.NodeForKey(key)
+  └── moved = fromNode ≠ toNode
+  │
+  Return RebalancePlan with key movements + operator steps + OpsScope
+  NOTE: No data movement. No file writes. Pure computation.
+```
+
+### Operator Steps (Hardcoded)
+
+The rebalance plan always includes these honest steps:
+
+1. Review node health
+2. Stop sending writes to removed node manually
+3. Start replacement node manually if needed
+4. Update the static config file manually
+5. Restart proxy/gateway with updated config
+6. Manually sync read replicas if applicable
+7. Verify key routing and application correctness
+8. NOTE: No data movement is performed by this tool
+
+### CLI Commands Added
+
+```bash
+shardforge-cluster health <config>
+  # Diagnostic only. Exits 0 even if nodes unhealthy.
+
+shardforge-cluster simulate-failure <config> --down <nodeID> --key <key>
+  # Simulation only. No live calls. Exits non-zero for unknown node or no keys.
+
+shardforge-cluster plan-rebalance <config> --remove <nodeID> --key <key>
+  # Planning only. No data movement. No file writes. Exits non-zero for unknown node or no keys.
+```
+
+### Scope Confirmation (Phase 19)
+
+- Simulation and planning only: correct
+- Manual operator action required: correct
+- No automatic failover: correct
+- No automatic rebalancing: correct
+- No automatic retry to another node: correct
+- No data movement: correct
+- No shard migration: correct
+- No resharding: correct
+- No dynamic membership: correct
+- No service discovery: correct
+- No gossip: correct
+- No Raft: correct
+- No consensus: correct
+- No quorum: correct
+- No leader election: correct
+- No multi-primary writes: correct
+- No conflict resolution: correct
+- No distributed transactions: correct
+- No distributed vector search: correct
+- No production fault tolerance: correct
+- No core Engine/WAL/MemTable/SSTable/Bloom/Vector/Shard/Replica/Dashboard changes: correct

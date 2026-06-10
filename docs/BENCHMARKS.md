@@ -52,12 +52,12 @@ Durations include preload time where applicable (see Interpretation).
 
 | Workload | Ops | Duration | Ops/sec | P50 | P95 | P99 | SSTables | Bloom Skips |
 |----------|----:|---------:|--------:|----:|----:|----:|:--------:|------------:|
-| write-heavy | 1000 | 133.7ms | 7481 | 1.5µs | 4.2µs | 19.0µs | 10 | 0 |
-| read-heavy | 1000 | 126.3ms | 7916 | 1.4µs | 1.8µs | 2.4µs | 10 | 0 |
-| mixed | 1000 | 198.0ms | 5050 | 3.0µs | 5.7µs | 27.8µs | 15 | 0 |
-| scan | 100 | 150.5ms | 665 | 85.5µs | 109.8µs | 222.3µs | 10 | 0 |
-| compaction | 240 | 105.3ms | 2279 | 1.7µs | 87.6µs | 91.1µs | 1 | 0 |
-| restart | 1 | 69.9ms | 14 | 1.2ms | 1.2ms | 1.2ms | 5 | 0 |
+| write-heavy | 1000 | 130.5ms | 7662 | 1.7µs | 4.5µs | 18.6µs | 10 | 0 |
+| read-heavy | 1000 | 130.8ms | 7648 | 1.1µs | 2.2µs | 3.4µs | 10 | 0 |
+| mixed | 1000 | 177.3ms | 5639 | 2.4µs | 7.0µs | 26.5µs | 15 | 0 |
+| scan | 100 | 144.1ms | 694 | 113.2µs | 161.0µs | 240.5µs | 10 | 0 |
+| compaction | 240 | 98.2ms | 2445 | 2.2µs | 95.5µs | 97.5µs | 1 | 0 |
+| restart | 1 | 71.9ms | 14 | 1.3ms | 1.3ms | 1.3ms | 5 | 0 |
 
 | Workload | Bytes Written | Bytes Read | Flush Count | Compaction Count |
 |----------|:-------------:|:----------:|:-----------:|:----------------:|
@@ -79,7 +79,7 @@ Durations include preload time where applicable (see Interpretation).
 |--------|-------|
 | SSTables before compact | 5 |
 | SSTables after compact | 1 |
-| Compact duration | 24.3ms |
+| Compact duration | 23.8ms |
 | Gets before compact | 100 |
 | Gets after compact | 100 |
 | Scans before compact | 20 |
@@ -122,11 +122,41 @@ Measures engine reopen latency including WAL replay and SSTable manifest load. O
 
 ---
 
+---
+
+## Phase 10 — Shard Package Benchmarks (Local Single-process)
+
+These benchmarks measure the sharding layer (`internal/shard`) routing key-value operations across multiple local Engine instances. All shards live inside a single OS process — **no networking, no replication**.
+
+**Platform:** Apple M3 · darwin/arm64 · Go 1.21 · `go test -bench=. -benchmem -benchtime=3s`
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| RingRoute1M | 78 | 32 | 1 |
+| Put_10k_4shards | 1566 | 201 | 7 |
+| Get_10k_existing_4shards | 149 | 103 | 4 |
+| Get_10k_missing_4shards | 110 | 31 | 1 |
+| Scan_10k_4shards | 5,708,292 | 9,651,265 | 100,309 |
+| Flush_10k_4shards | 102,990,683 | 5,832,826 | 50,836 |
+| Compact_10k_4shards | 126,712,509 | 16,978,758 | 218,841 |
+| Reopen_10k_4shards | 578,179 | 1,065,529 | 10,793 |
+| ConcurrentPut_4shards | 2,482 | 484 | 6 |
+| ConcurrentGet_4shards | 127 | 103 | 4 |
+
+**Notes:**
+- Ring lookup is ~78 ns: FNV-1a hash + binary search over 512 ring tokens.
+- Get (existing, in-memory) is ~149 ns: ring lookup + RWMutex RLock + engine MemTable check.
+- Scan fans out to all 4 shards, merges 10k entries, and sorts — allocation-heavy by design.
+- Flush and Compact include actual SSTable write and compaction I/O across all 4 shards.
+
+---
+
 ## Known Limitations
 
 - **Manual compaction only.** No background, automatic, leveled, or size-tiered compaction.
 - **Manual flush only.** No automatic MemTable flush.
-- **Single node.** No sharding, replication, or distributed mode.
+- **Local single-process only.** No networking, no cross-process shards, no replication, no distributed mode.
+- **Static shard count.** Cannot be changed after first open; no resharding or rebalancing.
 - **No block cache.** Every SSTable read goes to disk.
 - **No compression.** On-disk size reflects raw key+value data.
 - **No async writes.** WAL appends are synchronous (fsync off by default).

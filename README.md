@@ -2,8 +2,8 @@
 
 An **explainable** distributed database engine for key-value and vector search workloads, written in Go.
 
-> **Phase 7 in review.** WAL, MemTable, SSTable, Bloom Filter, single-node Engine, and manual full compaction are implemented.
-> No background compaction, no distributed mode, no vector search.
+> **Phase 10 in review.** WAL, MemTable, SSTable, Bloom Filter, single-node Engine, manual full compaction, exact vector search, and local key-value sharding are implemented.
+> No background compaction, no replication, no networking, no distributed cluster.
 
 ---
 
@@ -128,7 +128,7 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] 34 tests in `internal/bench/bench_test.go`
 - [x] **No new database feature logic** — measurement and documentation only
 
-**Phase 9 — Single-node Exact Vector Search** (branch: `phase-9-vector-search`, in review)
+**Phase 9 — Single-node Exact Vector Search** ✓ locked
 
 - [x] `internal/vector` — persistent exact k-nearest-neighbour vector store
 - [x] Engine-backed persistence (reuses single-node LSM engine from Phase 6)
@@ -140,12 +140,29 @@ WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable
 - [x] Namespace isolation: multiple stores can coexist in the same engine directory
 - [x] Concurrent-safe via `sync.RWMutex`
 - [x] Makefile target: `bench-vector`
-- [x] 44 tests, 10 benchmarks in `internal/vector`
+- [x] 49 tests, 10 benchmarks in `internal/vector`
 - [x] **Single-node only** — no distributed vector search, no sharding, no replication
+
+**Phase 10 — Single-process Key-value Sharding** (branch: `phase-10-sharding`, in review)
+
+- [x] `internal/shard` — deterministic consistent-hash key-value sharding over multiple local engines
+- [x] Multiple local `Engine` instances as shards — **no networking, no RPC, no cluster**
+- [x] Static shard count; configuration stored in atomic `SHARDING.json` manifest
+- [x] FNV-1a 64-bit consistent hash ring with configurable virtual nodes (default 128)
+- [x] `Open`, `Put`, `Delete`, `Get`, `Scan`, `Flush`, `Compact`, `Stats`, `ShardForKey`, `Close` API
+- [x] Single-key operations route to exactly one shard; empty key returns `ErrInvalidKey`
+- [x] Fan-out `Scan`: all shards queried, results merged and sorted by key; duplicate keys resolved by highest Seq
+- [x] `Flush` and `Compact` applied to every shard; first failure returns wrapped shard error
+- [x] Manifest atomicity: written via temp file + rename; validates version, hash, paths, duplicate IDs/names
+- [x] Reopen safety: manifest values loaded on reopen; mismatched options return `ErrShardMismatch`
+- [x] Concurrent-safe: `sync.RWMutex` guards closed flag; each engine handles its own synchronisation
+- [x] Makefile target: `bench-shard`
+- [x] 40 tests, 10 benchmarks in `internal/shard`
+- [x] **Local single-process sharding only** — no replication, no networking, no distributed cluster, no Raft, no consensus, no shard migration
 
 > No ANN, no HNSW, no IVF, no approximate search.
 > No background compaction, no size-tiered compaction, no leveled compaction.
-> No automatic flush. No distributed/sharded/replicated mode.
+> No automatic flush. No distributed/replicated mode. No replication. No networking.
 
 ## Planned Phases
 
@@ -236,6 +253,7 @@ make lint         # run golangci-lint (skipped if not installed)
 make bench        # run all Go benchmarks
 make bench-engine # run engine Go benchmarks
 make bench-vector # run vector Go benchmarks
+make bench-shard  # run shard Go benchmarks
 make bench-report # generate docs/BENCHMARKS.md (small scale)
 make clean        # remove bin/
 make help         # list all targets

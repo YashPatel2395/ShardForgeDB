@@ -662,6 +662,14 @@ func loadCommitIndex(dir string) LogIndex {
 // caller must check the returned error and abort the write path if it fails.
 // Leaving COMMIT un-updated when a leader write succeeded would mean the
 // committed operation cannot be replicated to followers after a restart.
+//
+// Durability note: this uses os.WriteFile + os.Rename, which is atomic on
+// POSIX filesystems for same-directory renames. Neither the COMMIT file nor
+// its parent directory is explicitly fsynced. This is adequate for the local
+// in-process simulation (process crash = temp disappears; OS will flush before
+// returning disk space). It is NOT production-grade power-loss durability.
+// A production system would fsync the file and the parent directory after the
+// rename to guarantee visibility after a power-loss event.
 func saveCommitIndex(dir string, idx LogIndex) error {
 	path := filepath.Join(dir, commitFileName)
 	tmp := path + ".tmp"

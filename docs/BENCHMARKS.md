@@ -151,7 +151,7 @@ These benchmarks measure the replication simulation layer (`internal/replica`). 
 
 | Benchmark | ns/op | B/op | allocs/op | Notes |
 |-----------|------:|-----:|----------:|-------|
-| Put_10k_LeaderOnly | 296,302 | 2,923 | 32 | WAL + MemTable + log append + COMMIT fsync |
+| Put_10k_LeaderOnly | 296,302 | 2,923 | 32 | WAL + MemTable + log append + atomic COMMIT write (temp+rename; no fsync) |
 | Get_Leader_10k_Existing | 135 | 103 | 4 | MemTable hit |
 | Get_Follower_10k_Existing | 138 | 103 | 4 | MemTable hit after catch-up |
 | Scan_Leader_10k | 3,451,186 | 8,638,429 | 60,121 | Full scan 10k entries |

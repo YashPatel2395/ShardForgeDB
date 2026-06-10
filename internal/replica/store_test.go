@@ -1275,21 +1275,31 @@ func TestDeletePersistsCommitIndex(t *testing.T) {
 }
 
 // TestCommitFileTempCleanup verifies that no COMMIT.tmp file is left after a
-// successful saveCommitIndex call.
+// successful Put or saveCommitIndex call.
 func TestCommitFileTempCleanup(t *testing.T) {
+	// Use one explicit directory so we can check the correct path.
 	dir := t.TempDir()
-	s, cleanup := testStore(t, 2)
-	defer cleanup()
+	s, err := Open(Options{Dir: dir, ReplicaCount: 2})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
 
 	mustPut(t, s, "x", "y")
+
+	// The COMMIT.tmp file must not exist after a successful Put.
 	tmp := filepath.Join(dir, commitFileName+".tmp")
 	if pathExists(tmp) {
-		t.Fatal("COMMIT.tmp temp file still exists after Put")
+		t.Fatal("COMMIT.tmp temp file still exists in store dir after Put")
 	}
-	_ = s // suppress unused warning
 
-	// Directly test saveCommitIndex leaves no temp file.
-	if err := saveCommitIndex(t.TempDir(), 42); err != nil {
+	// Directly test saveCommitIndex: no temp file left in target dir.
+	dir2 := t.TempDir()
+	if err := saveCommitIndex(dir2, 42); err != nil {
 		t.Fatalf("saveCommitIndex: %v", err)
+	}
+	tmp2 := filepath.Join(dir2, commitFileName+".tmp")
+	if pathExists(tmp2) {
+		t.Fatal("COMMIT.tmp temp file still exists after saveCommitIndex")
 	}
 }

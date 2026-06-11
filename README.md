@@ -1,13 +1,11 @@
-# ShardForgeDB — Explainable Go Database Engine with Networked Node Runtime
+# ShardForgeDB — Explainable Go Database Engine
 
-An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer with strict documentation, tests, and benchmarks at every phase.
+An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer toward a real distributed system. Every phase is strictly documented, tested, and benchmarked. Every claim is audited.
 
-> **Phase 19 in review.** Phases 1–18 are implemented and locked.
-> Phase 19 adds failure visibility and manual rebalance simulation (`internal/ops`):
-> health checks, failure simulation, manual rebalance planning, 3 new CLI commands.
+> **Phase 21 — Truth Lock + Trace Foundation.** Phases 1–19 complete and locked.
+> Phase 21 adds: `docs/CLAIMS.md` (safe/unsafe/future claims audit), `docs/ROADMAP_DISTRIBUTED.md` (Phases 15–27 toward real distributed features), `internal/trace` (trace types for future operation tracing), `docs/TRACE_DESIGN.md`, and fixes all stale documentation.
 >
-> This is **simulation and planning only**. No automatic failover. No automatic rebalancing.
-> No data movement. No shard migration. Manual operator action required for all real changes.
+> **Final target:** ShardForgeDB — a real explainable distributed database engine for key-value and vector search workloads. See `docs/ROADMAP_DISTRIBUTED.md`.
 
 ---
 
@@ -462,22 +460,33 @@ make node-demo-down
 ./bin/shardforge-cluster plan-rebalance configs/local-failure-sim-3node.json --remove node-2 --key user:1 --key user:2
 ```
 
+**Phase 21 — Truth Lock + Trace Foundation** ✓ locked
+
+- [x] `docs/CLAIMS.md` — three-section claims audit: Safe (proven by code), Unsafe (must never claim), Future (requires future phases)
+- [x] `docs/ROADMAP_DISTRIBUTED.md` — Phases 15–27 defining the path to real distributed features
+- [x] `internal/trace` — trace types: `Trace`, `TraceStep`, `OperationType`, `Component`, `StepType`, `Status`
+- [x] `docs/TRACE_DESIGN.md` — trace philosophy, types, Phase 15 integration plan
+- [x] Fixed stale statements in `docs/DESIGN.md` (ANN/HNSW claimed; levelled compaction claimed; WAL "not yet wired")
+- [x] Added summary table to `docs/PROOF.md`
+- [x] 25+ tests in `internal/trace`
+- [x] **Types only** — trace wiring into engine is Phase 15
+
 ---
 
 ## Not Implemented
 
-The following are **not** present in the current codebase and are not claimed:
+The following are **not** present in the current codebase and must not be claimed. See `docs/CLAIMS.md` for the full audit and `docs/ROADMAP_DISTRIBUTED.md` for the phases that will implement them.
 
 | Category | Not implemented |
 |----------|----------------|
 | Compaction | Background compaction, automatic thresholds, leveled compaction, size-tiered compaction |
 | Consensus | Raft, Paxos, full consensus, automatic leader election, fault-tolerant quorum |
 | Distribution | Distributed sharding across nodes, shard migration, resharding, distributed transactions |
-| Replication | Automatic background replication, quorum replication, network-based leader election, strong consistency guarantee |
+| Replication | Automatic background replication, quorum replication, strong consistency guarantee |
 | Vector search | ANN, HNSW, IVF, approximate nearest-neighbour |
-| Monitoring | Production monitoring, real-time alerting, distributed tracing |
-| Dashboard | Networked node discovery, multi-host monitoring, production deployment |
-| Node routing | Automatic request routing to correct shard node, cluster-level load balancing |
+| Monitoring | Production monitoring, real-time alerting, distributed operation traces |
+| Dashboard | Networked node discovery, multi-host monitoring |
+| Node routing | Automatic failover, retry on node failure |
 
 ---
 

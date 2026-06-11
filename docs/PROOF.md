@@ -4,6 +4,42 @@ This file records the evidence that each phase was implemented correctly and pas
 
 ---
 
+## Summary Table (Phase 21 — Truth Lock)
+
+| Phase | Component | Status | Tests | Benchmarks | Limitations |
+|---|---|---|---|---|---|
+| 1 | `cmd/shardforge` | COMPLETE | 3 | — | CLI skeleton only |
+| 2 | `internal/wal` | COMPLETE | 24 | 4 | Single WAL file; no rotation |
+| 3 | `internal/memtable` | COMPLETE | 30 | 7 | O(n) insert; single mutex |
+| 4 | `internal/sstable` | COMPLETE | 46 | 7 | No block cache; dense index |
+| 5 | `internal/bloom` | COMPLETE | 35 | 9 | No counting Bloom; RAM-resident |
+| 6 | `internal/engine` | COMPLETE | 45 | 10 | Manual flush only; no background compaction |
+| 7 | `internal/engine` (compaction) | COMPLETE | 34 | 8 | Full compaction only; no levelled/tiered |
+| 8 | `internal/bench` | COMPLETE | 34 | 5 | Local single-node benchmarks only |
+| 9 | `internal/vector` | COMPLETE | 49 | 10 | Exact brute-force k-NN only; no ANN |
+| 10 | `internal/shard` | COMPLETE | 55 | 10 | In-process simulation only; no networking |
+| 11 | `internal/replica` | COMPLETE | 66 | 10 | In-process simulation only; no networking |
+| 12 | `internal/dashboard` | COMPLETE | 52 | 8 | Local only; no distributed node discovery |
+| 13 | scripts, docs | COMPLETE | — | — | Release hardening |
+| 14 | `internal/node` | COMPLETE | 36 | 6 | Nodes are independent; no coordination |
+| 15 | `internal/gateway` | COMPLETE | 41 | 6 | Client-side only; no failover |
+| 16 | `internal/proxy` | COMPLETE | 45 | 7 | Stateless; no retry; no replication |
+| 17 | `internal/cluster` | COMPLETE | 47 | 4 | Static config only; no dynamic membership |
+| 18 | `internal/replnet` | COMPLETE | 55+ | 5 | Pull-based; in-memory log; no auto sync |
+| 19 | `internal/ops` | COMPLETE | 40 | 4 | Simulation/planning only; no data movement |
+| 21 | `internal/trace` | COMPLETE (types only) | 25+ | — | Types only; engine wiring deferred to Phase 15 |
+
+**Validation command (all phases):**
+```bash
+go test -race -count=1 ./...
+make build
+make vet
+```
+
+**Current test pass status:** All 700+ tests pass on Apple M3 darwin/arm64, Go 1.26.
+
+---
+
 ## Phase 1 — Project Foundation (initial)
 
 **Date:** 2026-06-09
@@ -3557,3 +3593,86 @@ BenchmarkOps_CheckClusterHealth_HealthyNodes-8   38815 iter    92532 ns/op
 
 - `internal/ops`: 40 tests PASS (11 health, 13 simulate, 13 rebalance, 3 route)
 - `cmd/shardforge-cluster`: 25 tests PASS (15 new Phase 19 tests)
+
+---
+
+## Phase 21 — Truth Lock + Distributed Roadmap + Trace Foundation
+
+**Date:** 2026-06-10
+**Go version:** go1.26.4 darwin/arm64
+**Branch:** phase-21-truth-lock-trace-foundation
+
+### Changes Made
+
+| Item | Change |
+|------|--------|
+| `docs/CLAIMS.md` | New — three-section claims audit: Safe, Unsafe, Future |
+| `docs/ROADMAP_DISTRIBUTED.md` | New — Phases 15–27 toward real distributed features |
+| `internal/trace/trace.go` | New — trace types: Trace, TraceStep, OperationType, Component, StepType, Status |
+| `internal/trace/trace_test.go` | New — 25+ tests covering construction, ordering, duration, JSON, filtering |
+| `docs/TRACE_DESIGN.md` | New — trace philosophy, rules, Phase 15 integration plan |
+| `docs/DESIGN.md` | Fixed stale statements: WAL "not yet wired", HNSW as implemented, levelled compaction as implemented, vector layer description, cluster layer |
+| `docs/PROOF.md` | Added summary table at top |
+| `README.md` | Updated banner to Phase 21, added Phase 21 section, added distributed roadmap reference |
+| `Makefile` | Added `bench-trace` target |
+
+### Documentation Inconsistencies Found and Fixed
+
+| File | Stale claim | Fix |
+|------|-------------|-----|
+| `docs/DESIGN.md` (header) | "Only Phase 6 implemented; all other components intended design only" | Updated to Phase 21 status |
+| `docs/DESIGN.md` (WAL) | "WAL not yet wired to MemTable or Engine" | Annotated as resolved in Phase 6 |
+| `docs/DESIGN.md` (MemTable) | "not yet connected to WAL or Engine" | Annotated as resolved in Phase 6 |
+| `docs/DESIGN.md` (SSTable) | "No Bloom filter", "not wired to Engine" | Annotated as resolved in Phase 5/6 |
+| `docs/DESIGN.md` (Bloom) | "Not wired into SSTable or Engine yet" | Annotated as resolved in Phase 6 |
+| `docs/DESIGN.md` (Vector) | "will implement ANN/HNSW" | Replaced with accurate exact k-NN description |
+| `docs/DESIGN.md` (Cluster) | "Automatic failover planned", "distributed metadata service" | Replaced with accurate per-phase scope descriptions |
+| `docs/DESIGN.md` (Trade-offs) | "HNSW for vector search", "Levelled compaction" | Replaced with accurate descriptions of what is and is not implemented |
+
+### Trace Package Details
+
+`internal/trace` provides:
+- `OperationType` constants: GET, PUT, DELETE, SCAN, VECTOR_SEARCH, VECTOR_INSERT, ROUTE, REPLICATE, FLUSH, COMPACT
+- `Component` constants: CLI, ROUTER, NODE, ENGINE, WAL, MEMTABLE, SSTABLE, BLOOM, VECTOR, SHARD, REPLICA, NETWORK
+- `StepType` constants: 22 types covering read path, write path, flush/compact, vector, routing, replication
+- `Status` constants: OK, SKIPPED, ERROR
+- `Trace` struct: ID, Operation, Key, StartedAt, FinishedAt, Steps, Err
+- `TraceStep` struct: Component, StepType, Status, Duration, Detail, Metadata
+- Methods: `New`, `NewWithID`, `AddStep`, `Step` (chain), `Finish`, `TotalDuration`, `StepDurationSum`, `StepsWithStatus`, `StepsForComponent`, `MarshalJSON`, `String`
+
+Phase 21 scope: **types only**. Engine wiring is Phase 15.
+
+### Validation Commands
+
+```bash
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 ./...
+make build
+make test
+make vet
+```
+
+### Test Results
+
+```
+go test -race -count=1 ./... → all packages PASS including internal/trace (25+ new tests)
+make build                   → all 7 binaries built
+make vet                     → clean
+go fmt ./...                 → clean
+```
+
+### Claims Now Safe
+
+All claims from Phase 1–19 remain safe. Additionally:
+- `internal/trace` types package is implemented and tested (safe to claim as "trace type foundation")
+
+### Claims Still Unsafe
+
+All claims from `docs/CLAIMS.md` Section B remain unsafe. No new safe claims were unlocked in Phase 21 beyond the trace types.
+
+### Known Limitations
+
+- `internal/trace` types only — no engine wiring until Phase 15
+- No benchmark in `internal/trace` (pure type definitions and marshaling; latency measurement is engine-level)

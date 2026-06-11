@@ -34,6 +34,7 @@ Database internals are NOT implemented yet.`,
 
 	root.AddCommand(newVersionCmd())
 	root.AddCommand(newExplainCmd())
+	root.AddCommand(newExplainNodeCmd())
 	return root
 }
 

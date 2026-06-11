@@ -1,6 +1,6 @@
 # ShardForgeDB — Trace Design
 
-**Phase 22 — Runtime Operation Trace Mode** (updated; Phase 21 established types)
+**Phase 23 — Networked Node Trace API** (updated; Phase 22 wired engine traces; Phase 21 established types)
 
 ---
 
@@ -53,13 +53,22 @@ internal/vector/
 ├── explain.go     — ExplainUpsert, ExplainSearch, ExplainDelete (Phase 22)
 └── explain_test.go — vector trace tests (Phase 22)
 
+internal/node/
+├── handlers.go    — POST /explain/put, GET /explain/get, DELETE /explain/delete, GET /explain/scan (Phase 23)
+├── client.go      — ExplainPut, ExplainGet, ExplainDelete, ExplainScan (Phase 23)
+├── types.go       — ExplainPutResponse, ExplainGetResponse, ExplainDeleteResponse, ExplainScanResponse (Phase 23)
+└── node_explain_test.go — HTTP handler + client tests (Phase 23)
+
 cmd/shardforge/
-└── explain.go     — "shardforge explain get/put/delete" CLI (Phase 22)
+├── explain.go     — "shardforge explain get/put/delete" CLI (Phase 22)
+└── explain_node.go — "shardforge explain-node get/put/delete/scan" CLI (Phase 23)
 ```
 
 **Phase 21 scope:** Types only. `internal/trace` is a pure type definition package.
 
 **Phase 22 scope (COMPLETE):** Engine and vector explain APIs wired to real execution paths. CLI explain commands. JSON output. No engine behaviour changed.
+
+**Phase 23 scope (COMPLETE):** HTTP explain endpoints on node server. `node.Client` explain methods. `shardforge explain-node` CLI calls node over HTTP. `os.Stat` pre-check removed from `openEngineForExplain`. Single-node HTTP only; no cross-node trace propagation.
 
 ---
 

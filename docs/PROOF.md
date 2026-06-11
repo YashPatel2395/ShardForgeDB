@@ -4,7 +4,7 @@ This file records the evidence that each phase was implemented correctly and pas
 
 ---
 
-## Summary Table (Phase 22 — Runtime Operation Trace Mode)
+## Summary Table (Phase 23 — Networked Node Trace API + Node Runtime Hardening)
 
 | Phase | Component | Status | Tests | Benchmarks | Limitations |
 |---|---|---|---|---|---|
@@ -29,6 +29,7 @@ This file records the evidence that each phase was implemented correctly and pas
 | 19 | `internal/ops` | COMPLETE | 40 | 4 | Simulation/planning only; no data movement |
 | 21 | `internal/trace` | COMPLETE (types only) | 22 | — | Types only; engine wiring deferred to Phase 15 |
 | 22 | `engine/explain`, `vector/explain`, CLI | COMPLETE | 40 new (905 total) | — | Single-node only; no distributed traces |
+| 23 | `node/explain endpoints`, `node/client`, `shardforge explain-node` | COMPLETE | 18 new (923 total) | — | Single-node HTTP only; no cross-node trace propagation |
 
 **Validation command (all phases):**
 ```bash
@@ -37,10 +38,10 @@ make build
 make vet
 ```
 
-**Current test pass status:** 905 tests pass across 23 packages (race detector on) on Apple M3 darwin/arm64, Go 1.26.
+**Current test pass status:** 923 tests pass across 23 packages (race detector on) on Apple M3 darwin/arm64, Go 1.26.
 
 ```
-go test -race -count=1 -v ./... | grep -c "^--- PASS:" → 865
+go test -race -count=1 -v ./... | grep -c "^--- PASS:" → 923
 ```
 
 ---
@@ -3982,3 +3983,99 @@ All Phase 21 unsafe claims remain unsafe. Additionally:
 - `ExplainScan` does not record per-key merge decisions (only aggregate counts).
 - No `--json` flag needed: JSON is the default trace output format.
 - No trace for `Flush` or `Compact` (not in the Phase 22 required list).
+
+---
+
+## Phase 23 — Networked Node Trace API + Node Runtime Hardening
+
+**Date:** 2026-06-11
+
+### What was built
+
+Phase 23 exposes the real Phase 22 engine execution traces through the existing networked HTTP node runtime. Every HTTP explain endpoint calls the real `engine.Explain*` API — no JSON trace is fabricated in the HTTP layer.
+
+**Hard rule compliance:** Every trace step returned by `/explain/*` endpoints was produced by the actual code that performed the operation on the node. The HTTP handler receives the `*trace.Trace` returned by `engine.ExplainGet/Put/Delete/Scan` and wraps it in the response body unchanged.
+
+**`cmd/shardforge/explain.go` fix:** Removed unnecessary `os.Stat` pre-check from `openEngineForExplain`. `engine.Open` calls `os.MkdirAll` internally; the pre-check was preventing valid use of non-existent directories that the engine can create.
+
+### New HTTP endpoints (`internal/node/handlers.go`)
+
+| Method | Path | Engine call |
+|---|---|---|
+| `POST` | `/explain/put` | `eng.ExplainPut(key, value)` |
+| `GET` | `/explain/get?key=` | `eng.ExplainGet(key)` |
+| `DELETE` | `/explain/delete?key=` | `eng.ExplainDelete(key)` |
+| `GET` | `/explain/scan?start=&end=` | `eng.ExplainScan(start, end)` |
+
+All endpoints return JSON with `node_id`, `operation`, `trace` (the real `*trace.Trace`), and optional `error`.
+
+Followers reject `/explain/put` and `/explain/delete` with 403 (same as regular write endpoints).
+
+### New response types (`internal/node/types.go`)
+
+- `ExplainPutResponse` — node_id, operation, trace, error
+- `ExplainGetResponse` — node_id, operation, key, found, value, trace, error
+- `ExplainDeleteResponse` — node_id, operation, key, trace, error
+- `ExplainScanResponse` — node_id, operation, result_count, trace, error
+
+### New client methods (`internal/node/client.go`)
+
+- `ExplainPut(ctx, key, value) (*ExplainPutResponse, error)`
+- `ExplainGet(ctx, key) (*ExplainGetResponse, error)`
+- `ExplainDelete(ctx, key) (*ExplainDeleteResponse, error)`
+- `ExplainScan(ctx, start, end) (*ExplainScanResponse, error)`
+
+### New CLI (`cmd/shardforge/explain_node.go`)
+
+```
+shardforge explain-node --addr http://localhost:9101 put mykey myvalue
+shardforge explain-node --addr http://localhost:9101 get mykey
+shardforge explain-node --addr http://localhost:9101 delete mykey
+shardforge explain-node --addr http://localhost:9101 scan a z
+```
+
+Calls node over HTTP; never opens the engine directly.
+
+### Scope flags
+
+This is NOT distributed tracing. Each explain endpoint:
+- Covers a single node's execution path only
+- Does not propagate trace context across nodes
+- Does not add any network-layer trace steps
+- Is safe to claim: "Networked single-node trace API via HTTP"
+
+### Test results
+
+```
+go test -race -count=1 ./internal/node/... → PASS (18 new tests in node_explain_test.go)
+go test -race -count=1 ./... → 923 tests PASS across 23 packages
+```
+
+New tests in `internal/node/node_explain_test.go`:
+- `TestExplainPut_ReturnsTrace` — trace has steps, node_id set, operation=PUT
+- `TestExplainPut_MethodNotAllowed` — GET on /explain/put returns 405
+- `TestExplainPut_InvalidJSON` — malformed body returns 400
+- `TestExplainPut_FollowerRejects` — follower node returns 403
+- `TestExplainGet_MissingKey` — existing key: found=true, value correct, trace non-nil
+- `TestExplainGet_NotFound` — absent key: found=false, trace non-nil
+- `TestExplainGet_EmptyKey` — missing key param returns 400
+- `TestExplainGet_MethodNotAllowed` — POST on /explain/get returns 405
+- `TestExplainDelete_ReturnsTrace` — trace has steps, node_id set, operation=DELETE
+- `TestExplainDelete_EmptyKey` — missing key param returns 400
+- `TestExplainDelete_MethodNotAllowed` — GET on /explain/delete returns 405
+- `TestExplainScan_ReturnsTrace` — result_count matches inserted keys, trace non-nil
+- `TestExplainScan_MethodNotAllowed` — POST on /explain/scan returns 405
+- `TestClientExplainPut` — HTTP client round-trip returns trace
+- `TestClientExplainGet` — HTTP client round-trip found=true, trace non-nil
+- `TestClientExplainDelete` — HTTP client round-trip returns trace
+- `TestClientExplainScan` — HTTP client round-trip result_count=3, trace non-nil
+- `TestExplainPut_TraceIsValidJSON` — response is valid JSON with trace field
+
+### Claims now safe
+
+- `Networked single-node trace API (HTTP)` — `POST /explain/put`, `GET /explain/get`, `DELETE /explain/delete`, `GET /explain/scan` call real `engine.Explain*` paths and return the unmodified trace over HTTP
+
+### Claims still unsafe
+
+- "Distributed operation traces" — traces cover single-node engine only; no cross-node propagation
+- "Networked traces" / "distributed tracing" — traces do not propagate over HTTP between nodes

@@ -1,6 +1,6 @@
 # ShardForgeDB — Claims Audit
 
-**Phase 22 — Runtime Operation Trace Mode**
+**Phase 23 — Networked Node Trace API + Node Runtime Hardening**
 
 This file is the authoritative record of what ShardForgeDB can and cannot claim. All documentation, README copy, demo scripts, and recruiter materials must comply with this list. If a claim does not appear in Section A, it must not be made.
 
@@ -32,7 +32,8 @@ The following are accurate, honest descriptions of what exists in the codebase w
 | Failure simulation (no live calls) | `internal/ops.SimulateFailure` — routing impact on sample keys, pure ring computation |
 | Manual rebalance planning (no data movement) | `internal/ops.PlanManualRebalance` — key movement plan, operator steps, pure computation |
 | Runtime operation trace mode (single-node) | `internal/engine.ExplainGet/Put/Delete/Scan`, `internal/vector.ExplainUpsert/Search/Delete` — real execution-path traces, JSON output, `shardforge explain` CLI; no fabricated steps |
-| 905 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 905 passing tests, 23 packages with test files, 4 packages with no test files (`cmd/shardforge-bench`, `cmd/shardforge-dashboard`, `cmd/shardforge-node`, `internal/storage`) |
+| Networked single-node trace API (HTTP) | `internal/node` — `POST /explain/put`, `GET /explain/get`, `DELETE /explain/delete`, `GET /explain/scan` call real `engine.Explain*` paths; `node.Client.ExplainGet/Put/Delete/Scan`; `shardforge explain-node` CLI; single-node HTTP only |
+| 923 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 923 passing tests, 23 packages with test files, 4 packages with no test files (`cmd/shardforge-bench`, `cmd/shardforge-dashboard`, `cmd/shardforge-node`, `internal/storage`) |
 | Reproducible benchmarks | `make bench-*` targets, results in `docs/BENCHMARKS.md` |
 
 ---

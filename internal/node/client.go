@@ -122,6 +122,50 @@ func (c *Client) Compact(ctx context.Context) error {
 	return nil
 }
 
+// ExplainPut calls POST /explain/put and returns the execution trace for a PUT.
+func (c *Client) ExplainPut(ctx context.Context, key, value []byte) (*ExplainPutResponse, error) {
+	body := explainPutRequest{Key: string(key), Value: string(value)}
+	var resp ExplainPutResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/explain/put", body, &resp); err != nil {
+		return nil, fmt.Errorf("node client: explain put %q: %w", key, err)
+	}
+	return &resp, nil
+}
+
+// ExplainGet calls GET /explain/get?key=<key> and returns the execution trace for a GET.
+func (c *Client) ExplainGet(ctx context.Context, key []byte) (*ExplainGetResponse, error) {
+	q := url.Values{}
+	q.Set("key", string(key))
+	var resp ExplainGetResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/explain/get?"+q.Encode(), nil, &resp); err != nil {
+		return nil, fmt.Errorf("node client: explain get %q: %w", key, err)
+	}
+	return &resp, nil
+}
+
+// ExplainDelete calls DELETE /explain/delete?key=<key> and returns the execution trace for a DELETE.
+func (c *Client) ExplainDelete(ctx context.Context, key []byte) (*ExplainDeleteResponse, error) {
+	q := url.Values{}
+	q.Set("key", string(key))
+	var resp ExplainDeleteResponse
+	if err := c.doJSON(ctx, http.MethodDelete, "/explain/delete?"+q.Encode(), nil, &resp); err != nil {
+		return nil, fmt.Errorf("node client: explain delete %q: %w", key, err)
+	}
+	return &resp, nil
+}
+
+// ExplainScan calls GET /explain/scan?start=<start>&end=<end> and returns the execution trace for a SCAN.
+func (c *Client) ExplainScan(ctx context.Context, start, end []byte) (*ExplainScanResponse, error) {
+	q := url.Values{}
+	q.Set("start", string(start))
+	q.Set("end", string(end))
+	var resp ExplainScanResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/explain/scan?"+q.Encode(), nil, &resp); err != nil {
+		return nil, fmt.Errorf("node client: explain scan: %w", err)
+	}
+	return &resp, nil
+}
+
 // Do executes an HTTP request with optional JSON body and decodes the response into a
 // map[string]any. Useful for proxy-forwarding when the exact response shape is unknown.
 // Returns an error for non-2xx status codes.

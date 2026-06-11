@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 
@@ -55,12 +54,10 @@ Examples:
 }
 
 // openEngineForExplain opens the engine at dataDir.
+// engine.Open creates the directory via os.MkdirAll if it does not exist.
 func openEngineForExplain(dataDir string) (*engine.Engine, error) {
 	if dataDir == "" {
 		return nil, fmt.Errorf("--data-dir is required")
-	}
-	if _, err := os.Stat(dataDir); err != nil {
-		return nil, fmt.Errorf("data-dir %q: %w", dataDir, err)
 	}
 	return engine.Open(engine.Options{Dir: dataDir})
 }

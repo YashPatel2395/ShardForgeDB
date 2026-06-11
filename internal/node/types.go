@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/YashPatel2395/ShardForgeDB/internal/replnet"
+	"github.com/YashPatel2395/ShardForgeDB/internal/trace"
 )
 
 // NodeID identifies a node in the network. It is a human-readable string such as "node-1".
@@ -127,4 +128,47 @@ type scanResponse struct {
 type errorResponse struct {
 	Error  string `json:"error"`
 	NodeID string `json:"node_id,omitempty"`
+}
+
+// explainPutRequest is the JSON body for POST /explain/put.
+type explainPutRequest struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// ExplainPutResponse is the JSON body returned by POST /explain/put.
+type ExplainPutResponse struct {
+	NodeID    string       `json:"node_id"`
+	Operation string       `json:"operation"`
+	Trace     *trace.Trace `json:"trace"`
+	Error     string       `json:"error,omitempty"`
+}
+
+// ExplainGetResponse is the JSON body returned by GET /explain/get?key=.
+type ExplainGetResponse struct {
+	NodeID    string       `json:"node_id"`
+	Operation string       `json:"operation"`
+	Key       string       `json:"key"`
+	Found     bool         `json:"found"`
+	Value     string       `json:"value,omitempty"`
+	Trace     *trace.Trace `json:"trace"`
+	Error     string       `json:"error,omitempty"`
+}
+
+// ExplainDeleteResponse is the JSON body returned by DELETE /explain/delete?key=.
+type ExplainDeleteResponse struct {
+	NodeID    string       `json:"node_id"`
+	Operation string       `json:"operation"`
+	Key       string       `json:"key"`
+	Trace     *trace.Trace `json:"trace"`
+	Error     string       `json:"error,omitempty"`
+}
+
+// ExplainScanResponse is the JSON body returned by GET /explain/scan?start=&end=.
+type ExplainScanResponse struct {
+	NodeID      string       `json:"node_id"`
+	Operation   string       `json:"operation"`
+	ResultCount int          `json:"result_count"`
+	Trace       *trace.Trace `json:"trace"`
+	Error       string       `json:"error,omitempty"`
 }

@@ -21,6 +21,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/replication/log", s.handleReplicationLog)
 	s.mux.HandleFunc("/replication/apply", s.handleReplicationApply)
 	s.mux.HandleFunc("/replication/sync", s.handleReplicationSync)
+	s.mux.HandleFunc("/explain/put", s.handleExplainPut)
+	s.mux.HandleFunc("/explain/get", s.handleExplainGet)
+	s.mux.HandleFunc("/explain/delete", s.handleExplainDelete)
+	s.mux.HandleFunc("/explain/scan", s.handleExplainScan)
 }
 
 // writeJSON encodes v as JSON and writes it with the given status code.
@@ -271,6 +275,133 @@ func (s *Server) handleReplicationApply(w http.ResponseWriter, r *http.Request) 
 		"applied":          len(body.Entries),
 		"last_applied_seq": lastSeq,
 	})
+}
+
+// handleExplainPut serves POST /explain/put.
+// Executes a real PUT via engine.ExplainPut and returns the execution trace.
+// SCOPE: single-node only. No distributed tracing.
+func (s *Server) handleExplainPut(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.opts.Replication.Role == replnet.RoleFollower {
+		s.writeError(w, http.StatusForbidden,
+			"follower: writes are not accepted; this node is a read replica")
+		return
+	}
+	var req explainPutRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	tr, err := s.eng.ExplainPut([]byte(req.Key), []byte(req.Value))
+	resp := ExplainPutResponse{
+		NodeID:    s.opts.NodeID,
+		Operation: "PUT",
+		Trace:     tr,
+	}
+	if err != nil {
+		resp.Error = err.Error()
+		writeJSON(w, http.StatusUnprocessableEntity, resp)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleExplainGet serves GET /explain/get?key=<key>.
+// Executes a real GET via engine.ExplainGet and returns the execution trace.
+// SCOPE: single-node only. No distributed tracing.
+func (s *Server) handleExplainGet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		s.writeError(w, http.StatusBadRequest, "key query parameter is required")
+		return
+	}
+	tr, val, found, err := s.eng.ExplainGet([]byte(key))
+	resp := ExplainGetResponse{
+		NodeID:    s.opts.NodeID,
+		Operation: "GET",
+		Key:       key,
+		Found:     found,
+		Trace:     tr,
+	}
+	if found {
+		resp.Value = string(val)
+	}
+	if err != nil {
+		resp.Error = err.Error()
+		writeJSON(w, http.StatusUnprocessableEntity, resp)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleExplainDelete serves DELETE /explain/delete?key=<key>.
+// Executes a real DELETE via engine.ExplainDelete and returns the execution trace.
+// SCOPE: single-node only. No distributed tracing.
+func (s *Server) handleExplainDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		w.Header().Set("Allow", "DELETE")
+		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if s.opts.Replication.Role == replnet.RoleFollower {
+		s.writeError(w, http.StatusForbidden,
+			"follower: writes are not accepted; this node is a read replica")
+		return
+	}
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		s.writeError(w, http.StatusBadRequest, "key query parameter is required")
+		return
+	}
+	tr, err := s.eng.ExplainDelete([]byte(key))
+	resp := ExplainDeleteResponse{
+		NodeID:    s.opts.NodeID,
+		Operation: "DELETE",
+		Key:       key,
+		Trace:     tr,
+	}
+	if err != nil {
+		resp.Error = err.Error()
+		writeJSON(w, http.StatusUnprocessableEntity, resp)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleExplainScan serves GET /explain/scan?start=<start>&end=<end>.
+// Executes a real SCAN via engine.ExplainScan and returns the execution trace.
+// SCOPE: single-node only. No distributed tracing.
+func (s *Server) handleExplainScan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	q := r.URL.Query()
+	start := []byte(q.Get("start"))
+	end := []byte(q.Get("end"))
+	tr, entries, err := s.eng.ExplainScan(start, end)
+	resp := ExplainScanResponse{
+		NodeID:      s.opts.NodeID,
+		Operation:   "SCAN",
+		ResultCount: len(entries),
+		Trace:       tr,
+	}
+	if err != nil {
+		resp.Error = err.Error()
+		writeJSON(w, http.StatusUnprocessableEntity, resp)
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleReplicationSync serves POST /replication/sync.

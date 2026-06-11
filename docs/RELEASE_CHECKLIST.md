@@ -275,3 +275,51 @@ git status --short
 - ~~"Implemented dynamic cluster membership or service discovery."~~
 - ~~"Nodes coordinate through the config."~~
 - ~~"Config provides automatic node health management."~~
+
+---
+
+## Phase 19 — Failure Handling and Manual Rebalance Simulation
+
+### Phase 19 Validation Gate
+
+- [ ] `go test -race -count=1 ./...` — all packages PASS (including `internal/ops`)
+- [ ] `make bench-ops` — 4 benchmarks PASS
+- [ ] `./bin/shardforge-cluster health configs/local-failure-sim-3node.json` — exits 0 (nodes may be unhealthy)
+- [ ] `./bin/shardforge-cluster simulate-failure configs/local-failure-sim-3node.json --down node-2 --key user:1` — exits 0, valid JSON
+- [ ] `./bin/shardforge-cluster plan-rebalance configs/local-failure-sim-3node.json --remove node-2 --key user:1` — exits 0, valid JSON
+- [ ] `./bin/shardforge-cluster validate configs/local-failure-sim-3node.json` — exits 0
+- [ ] `git status --short` — clean tree
+- [ ] `go test -race -count=1 ./internal/ops/...` — 40+ tests PASS
+- [ ] `go test -race -count=1 ./cmd/shardforge-cluster/...` — 25+ tests PASS
+
+### Phase 19 Scope Honesty Checklist
+
+- [ ] No claim of automatic failover
+- [ ] No claim of automatic rebalancing
+- [ ] No claim of shard migration
+- [ ] No claim of data movement
+- [ ] No claim of automatic rerouting on failure
+- [ ] No Raft, no consensus, no quorum
+- [ ] OpsScope returned in all results with all 8 flags true
+- [ ] CLI commands include scope disclaimers in help text
+- [ ] No files written by simulate-failure or plan-rebalance
+- [ ] No live node calls made by simulate-failure or plan-rebalance
+- [ ] health command exits 0 even if all nodes unhealthy (diagnostic only)
+
+### Allowed claims (Phase 19)
+
+- "Implemented health visibility and manual rebalance simulation for static clusters."
+- "Implemented failure simulation showing routing impact for specified down nodes on sample keys."
+- "Implemented manual rebalance planning showing key movement when nodes are added or removed."
+- "All simulation and planning is pure computation — no live node calls, no data movement."
+
+### Forbidden claims (Phase 19)
+
+- ~~"Implemented automatic failover"~~
+- ~~"Implemented automatic rebalancing"~~
+- ~~"Implemented shard migration"~~
+- ~~"Implemented resharding"~~
+- ~~"Implemented self-healing cluster"~~
+- ~~"Implemented distributed recovery"~~
+- ~~"Implemented production fault tolerance"~~
+- ~~"Nodes automatically reroute requests on failure"~~

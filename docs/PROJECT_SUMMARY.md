@@ -173,3 +173,27 @@ If this were a real production system, the logical next steps would be:
 8. **Multi-version concurrency control (MVCC)** — snapshot-isolated reads
 9. **Distributed tracing and metrics** — OpenTelemetry integration
 10. **Proxy horizontal scaling** — multiple proxy instances with shared ring configuration
+
+---
+
+## Phase 19 Addition
+
+Added operations simulation layer (`internal/ops`):
+
+- `CheckClusterHealth` — HTTP `/healthz` polling with latency tracking, sorted results, clear error strings
+- `RouteKey` / `RouteKeyWithAvailableNodes` — pure ring-based routing for simulation (no network)
+- `SimulateFailure` — routing impact analysis for specified node failures (simulation only)
+- `PlanManualRebalance` — key movement plan when nodes are added/removed (no data movement)
+- `DefaultOpsScope` — all 8 flags true: manual only, simulation only, no automatic failover, no data movement, etc.
+- 3 new `shardforge-cluster` commands: `health`, `simulate-failure`, `plan-rebalance`
+- `configs/local-failure-sim-3node.json` — ops demo config
+
+**Architecture map addition:**
+```
+internal/ops — operations simulation layer
+  ├── health.go     — CheckClusterHealth: HTTP /healthz polling
+  ├── simulate.go   — RouteKey, RouteKeyWithAvailableNodes, SimulateFailure
+  └── rebalance.go  — PlanManualRebalance, buildGateway
+```
+
+Honest claim: "Implemented failure visibility and manual rebalance simulation tools that show node health, routing impact, and key movement plans for static cluster configs."

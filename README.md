@@ -2,13 +2,12 @@
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer with strict documentation, tests, and benchmarks at every phase.
 
-> **Phase 18 in review.** All seventeen prior phases are implemented and locked.
-> Phase 18 adds networked read replicas v1 (`internal/replnet`): in-memory mutation log,
-> explicit pull-based follower sync, follower write rejection (403), 4 node replication
-> endpoints, 2 proxy admin endpoints, Docker Compose 1-primary+2-replica demo.
+> **Phase 19 in review.** Phases 1–18 are implemented and locked.
+> Phase 19 adds failure visibility and manual rebalance simulation (`internal/ops`):
+> health checks, failure simulation, manual rebalance planning, 3 new CLI commands.
 >
-> This is explicit pull-based replication only. No automatic sync. No Raft. No consensus.
-> No automatic failover. No quorum. Followers sync on demand via `POST /replication/sync`.
+> This is **simulation and planning only**. No automatic failover. No automatic rebalancing.
+> No data movement. No shard migration. Manual operator action required for all real changes.
 
 ---
 
@@ -414,7 +413,7 @@ make node-demo-down
 - [x] **No Raft, no consensus, no leader election, no replication, no failover**
 - [x] **Config loaded once at startup** — no runtime cluster updates
 
-**Phase 18 — Networked Read Replicas v1** (branch: `phase-18-read-replicas-networked-v1`, in review)
+**Phase 18 — Networked Read Replicas v1** ✓ locked
 
 - [x] `internal/replnet` — new package: `Role`, `Operation`, `Entry`, `Log` (in-memory mutation log), `Replicator` (HTTP pull client)
 - [x] `internal/node` — primary/follower roles, `replLog` mutation log, `--replication-role`, `--primary-url` CLI flags
@@ -430,7 +429,38 @@ make node-demo-down
 - [x] 55+ new tests; `bench-replnet` Makefile target
 - [x] **Explicit pull-based only** — no automatic background sync, no background goroutine
 - [x] **In-memory mutation log** — not persisted; engine WAL provides data durability
+- [x] **Explicit pull-based only** — no automatic background sync, no background goroutine
+- [x] **In-memory mutation log** — not persisted; engine WAL provides data durability
 - [x] **No Raft, no consensus, no quorum, no automatic failover, no strong consistency**
+
+**Phase 19 — Failure Handling and Manual Rebalance Simulation** (branch: `phase-19-failure-handling-manual-rebalance`, in review)
+
+- [x] `internal/ops` — new package: health visibility, failure simulation, rebalance planning
+- [x] `CheckClusterHealth(ctx, cfg, timeout)` — calls `GET /healthz` on all configured nodes, sorts by ID, returns latency + error strings. Diagnostic only.
+- [x] `RouteKey(cfg, key)` — pure consistent-hash routing using the cluster ring. No network call.
+- [x] `RouteKeyWithAvailableNodes(cfg, key, availableIDs)` — routes on a filtered node subset.
+- [x] `SimulateFailure(cfg, req)` — shows routing impact of specified down nodes on sample keys. No live node calls.
+- [x] `PlanManualRebalance(cfg, removed, added, keys)` — shows key movement when nodes change. No data movement. No file writes.
+- [x] `DefaultOpsScope()` — all 8 scope flags true (manual only, simulation only, no automatic failover, etc.)
+- [x] 3 new `shardforge-cluster` commands: `health`, `simulate-failure`, `plan-rebalance`
+- [x] `configs/local-failure-sim-3node.json` — 3-node config for ops demos
+- [x] 40 tests in `internal/ops`, 15 new tests in `cmd/shardforge-cluster`
+- [x] 4 benchmarks: `BenchmarkOps_RouteKey`, `BenchmarkOps_SimulateFailure_100Keys`, `BenchmarkOps_PlanManualRebalance_100Keys`, `BenchmarkOps_CheckClusterHealth_HealthyNodes`
+- [x] Makefile targets: `bench-ops`, `ops-health-demo`, `ops-simulate-failure-demo`, `ops-rebalance-plan-demo`
+- [x] **Simulation and planning only** — no automatic failover, no automatic rebalancing, no data movement
+- [x] **No Raft, no consensus, no quorum, no shard migration, no dynamic membership**
+- [x] **Manual operator action required** for all real cluster changes
+
+```bash
+# Health check (nodes can be down — command exits 0 with unhealthy report)
+./bin/shardforge-cluster health configs/local-failure-sim-3node.json
+
+# Simulate node-2 failure impact on sample keys (no live calls)
+./bin/shardforge-cluster simulate-failure configs/local-failure-sim-3node.json --down node-2 --key user:1 --key user:2
+
+# Plan manual rebalance after removing node-2 (no data movement)
+./bin/shardforge-cluster plan-rebalance configs/local-failure-sim-3node.json --remove node-2 --key user:1 --key user:2
+```
 
 ---
 

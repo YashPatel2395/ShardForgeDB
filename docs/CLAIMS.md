@@ -1,6 +1,6 @@
 # ShardForgeDB — Claims Audit
 
-**Phase 21 — Truth Lock**
+**Phase 22 — Runtime Operation Trace Mode**
 
 This file is the authoritative record of what ShardForgeDB can and cannot claim. All documentation, README copy, demo scripts, and recruiter materials must comply with this list. If a claim does not appear in Section A, it must not be made.
 
@@ -31,7 +31,8 @@ The following are accurate, honest descriptions of what exists in the codebase w
 | Health check visibility | `internal/ops.CheckClusterHealth` — HTTP /healthz polling, latency, sorted results |
 | Failure simulation (no live calls) | `internal/ops.SimulateFailure` — routing impact on sample keys, pure ring computation |
 | Manual rebalance planning (no data movement) | `internal/ops.PlanManualRebalance` — key movement plan, operator steps, pure computation |
-| 865 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 865 passing tests, 23 packages with test files, 4 packages with no test files (`cmd/shardforge-bench`, `cmd/shardforge-dashboard`, `cmd/shardforge-node`, `internal/storage`) |
+| Runtime operation trace mode (single-node) | `internal/engine.ExplainGet/Put/Delete/Scan`, `internal/vector.ExplainUpsert/Search/Delete` — real execution-path traces, JSON output, `shardforge explain` CLI; no fabricated steps |
+| 905 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 905 passing tests, 23 packages with test files, 4 packages with no test files (`cmd/shardforge-bench`, `cmd/shardforge-dashboard`, `cmd/shardforge-node`, `internal/storage`) |
 | Reproducible benchmarks | `make bench-*` targets, results in `docs/BENCHMARKS.md` |
 
 ---
@@ -64,6 +65,8 @@ The following must **never** appear in documentation, README, demo scripts, or r
 | "Automatic background sync" | Follower sync is explicit pull-on-demand only |
 | "Service discovery" / "gossip" | Cluster membership is static JSON loaded at startup |
 | "Dynamic membership" | No join/leave protocol exists |
+| "Distributed operation traces" | Traces cover single-node engine only; no cross-node trace propagation |
+| "Networked traces" / "distributed tracing" | Traces do not propagate over HTTP or any network protocol |
 
 ---
 

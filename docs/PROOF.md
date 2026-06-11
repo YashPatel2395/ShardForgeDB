@@ -4,7 +4,7 @@ This file records the evidence that each phase was implemented correctly and pas
 
 ---
 
-## Summary Table (Phase 21 — Truth Lock)
+## Summary Table (Phase 22 — Runtime Operation Trace Mode)
 
 | Phase | Component | Status | Tests | Benchmarks | Limitations |
 |---|---|---|---|---|---|
@@ -28,6 +28,7 @@ This file records the evidence that each phase was implemented correctly and pas
 | 18 | `internal/replnet` | COMPLETE | 55+ | 5 | Pull-based; in-memory log; no auto sync |
 | 19 | `internal/ops` | COMPLETE | 40 | 4 | Simulation/planning only; no data movement |
 | 21 | `internal/trace` | COMPLETE (types only) | 22 | — | Types only; engine wiring deferred to Phase 15 |
+| 22 | `engine/explain`, `vector/explain`, CLI | COMPLETE | 40 new (905 total) | — | Single-node only; no distributed traces |
 
 **Validation command (all phases):**
 ```bash
@@ -36,7 +37,7 @@ make build
 make vet
 ```
 
-**Current test pass status:** 865 tests pass across 23 packages (race detector on) on Apple M3 darwin/arm64, Go 1.26.
+**Current test pass status:** 905 tests pass across 23 packages (race detector on) on Apple M3 darwin/arm64, Go 1.26.
 
 ```
 go test -race -count=1 -v ./... | grep -c "^--- PASS:" → 865
@@ -3865,3 +3866,119 @@ All claims from `docs/CLAIMS.md` Section B remain unsafe. No new safe claims wer
 
 - `internal/trace` types only — no engine wiring until Phase 15
 - No benchmark in `internal/trace` (pure type definitions and marshaling; latency measurement is engine-level)
+
+---
+
+## Phase 22 — Runtime Operation Trace Mode
+
+### What was built
+
+Phase 22 wires the `internal/trace` type foundation (Phase 21) into real engine and vector execution paths.
+
+**New files:**
+- `internal/engine/explain.go` — `ExplainGet`, `ExplainPut`, `ExplainDelete`, `ExplainScan`
+- `internal/engine/explain_test.go` — 25 engine trace tests
+- `internal/vector/explain.go` — `ExplainUpsert`, `ExplainSearch`, `ExplainDelete`
+- `internal/vector/explain_test.go` — 15 vector trace tests
+- `cmd/shardforge/explain.go` — `shardforge explain get/put/delete` CLI
+
+**Modified files:**
+- `internal/trace/trace.go` — added 10 new StepType constants (scan, bounds skip, vector write steps, key validation)
+- `cmd/shardforge/main.go` — registered `explain` subcommand
+- `docs/CLAIMS.md` — updated test count, added runtime trace safe claim, added two unsafe claims
+- `docs/TRACE_DESIGN.md` — updated to Phase 22 status and package structure
+- `docs/PROOF.md` — this section
+
+### Hard rule compliance
+
+Every trace step in `internal/engine/explain.go` and `internal/vector/explain.go` is produced by the actual code path being executed:
+- WAL_APPEND: recorded after `e.walLog.Append()` returns
+- MEMTABLE_PUT/DELETE: recorded after `e.mem.Put()` / `e.mem.Delete()` returns
+- MEMTABLE_HIT/MISS: recorded after `e.mem.Get()` returns
+- BLOOM_CHECK/SKIP: recorded after `th.bloom.MightContain()` returns
+- BOUNDS_SKIP: recorded when bounds comparison fails
+- SSTABLE_HIT/MISS: recorded after `th.reader.Get()` returns
+- NOT_FOUND: recorded when all SSTables are exhausted without a hit
+- SCAN_SOURCE: recorded after each `Scan()` call on MemTable or SSTable
+- SCAN_MERGE: recorded after tombstone suppression and sort
+- VECTOR_VALIDATE: recorded after validateID + validateVector
+- VECTOR_ENCODE: recorded after encodeRecord
+- VECTOR_ENGINE_WRITE: recorded after eng.Put / eng.Delete
+- VECTOR_INDEX_UPDATE/DELETE: recorded after in-memory map write/delete
+- VECTOR_LOAD/COMPUTE/TOPK: recorded at candidate load, distance loop, sort
+
+No trace steps are fabricated, hardcoded, or pre-scripted.
+
+### Example trace output
+
+```
+$ shardforge explain --data-dir ./data put hello world
+{
+  "operation": "PUT",
+  "key": "hello",
+  "started_at": "...",
+  "finished_at": "...",
+  "total_duration_ns": 224041,
+  "step_sum_ns": 216916,
+  "steps": [
+    {"component":"ENGINE","step_type":"KEY_VALIDATED","status":"OK","duration_ns":0,"detail":"key_len=5 value_len=5"},
+    {"component":"WAL","step_type":"WAL_APPEND","status":"OK","duration_ns":215250,"detail":"seq=1 key_len=5 value_len=5"},
+    {"component":"MEMTABLE","step_type":"MEMTABLE_PUT","status":"OK","duration_ns":1666,"detail":"seq=1 key_len=5"}
+  ]
+}
+
+$ shardforge explain --data-dir ./data get hello
+{
+  "operation": "GET",
+  "key": "hello",
+  "steps": [
+    {"component":"ENGINE","step_type":"KEY_VALIDATED","status":"OK","duration_ns":0,"detail":"key_len=5"},
+    {"component":"MEMTABLE","step_type":"MEMTABLE_HIT","status":"OK","duration_ns":1625,"detail":"key_len=5 value_len=5"}
+  ]
+}
+```
+
+### Validation Commands
+
+```bash
+go mod tidy
+go fmt ./...
+go vet ./...
+go test -race -count=1 ./...
+make build
+make test
+make vet
+make release-check
+```
+
+### Test Results
+
+```
+go test -race -count=1 ./... → 905 tests PASS across 23 packages (4 packages have no test files)
+internal/engine: all explain tests pass including ExplainPut, ExplainGet (memtable/sstable/bloom paths),
+  ExplainDelete, ExplainScan, empty key handling, closed engine, tombstone paths
+internal/vector: all explain tests pass including ExplainUpsert, ExplainSearch, ExplainDelete,
+  invalid input error paths, result correctness vs non-explain variants
+make build → all 7 binaries built
+make vet → clean
+go fmt → clean
+```
+
+### Claims Now Safe
+
+- `internal/engine.ExplainGet/Put/Delete/Scan` — runtime operation trace for single-node engine
+- `internal/vector.ExplainUpsert/Search/Delete` — runtime operation trace for exact vector search
+- `shardforge explain get/put/delete` — CLI with JSON output and `--data-dir` flag
+
+### Claims Still Unsafe
+
+All Phase 21 unsafe claims remain unsafe. Additionally:
+- "Distributed operation traces" — traces cover single-node engine only; no cross-node propagation
+- "Networked traces" — traces do not propagate over HTTP or any network protocol
+
+### Known Limitations
+
+- Traces are single-node only. Phase 26 will add cross-node trace propagation.
+- `ExplainScan` does not record per-key merge decisions (only aggregate counts).
+- No `--json` flag needed: JSON is the default trace output format.
+- No trace for `Flush` or `Compact` (not in the Phase 22 required list).

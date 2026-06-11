@@ -73,6 +73,23 @@ const (
 	StepTypeVectorCompute StepType = "VECTOR_COMPUTE"
 	StepTypeVectorTopK    StepType = "VECTOR_TOPK"
 
+	// Vector write steps (Phase 22)
+	StepTypeVectorValidate    StepType = "VECTOR_VALIDATE"
+	StepTypeVectorEncode      StepType = "VECTOR_ENCODE"
+	StepTypeVectorEngineWrite StepType = "VECTOR_ENGINE_WRITE"
+	StepTypeVectorIndexUpdate StepType = "VECTOR_INDEX_UPDATE"
+	StepTypeVectorIndexDelete StepType = "VECTOR_INDEX_DELETE"
+
+	// Key validation step (Phase 22)
+	StepTypeKeyValidated StepType = "KEY_VALIDATED"
+
+	// SSTable bounds skip (Phase 22)
+	StepTypeBoundsSkip StepType = "BOUNDS_SKIP"
+
+	// Scan steps (Phase 22)
+	StepTypeScanSource StepType = "SCAN_SOURCE"
+	StepTypeScanMerge  StepType = "SCAN_MERGE"
+
 	// Routing steps
 	StepTypeRingLookup StepType = "RING_LOOKUP"
 	StepTypeNodeCall   StepType = "NODE_CALL"

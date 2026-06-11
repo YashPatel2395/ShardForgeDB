@@ -1,6 +1,6 @@
 # ShardForgeDB — Trace Design
 
-**Phase 21 — Trace Foundation**
+**Phase 22 — Runtime Operation Trace Mode** (updated; Phase 21 established types)
 
 ---
 
@@ -40,17 +40,26 @@ An invalid trace would be:
 
 ## Package structure
 
-The trace foundation lives in `internal/trace`:
-
 ```
 internal/trace/
 ├── trace.go       — Trace, TraceStep, OperationType, Component, StepType, Status
 └── trace_test.go  — 22 tests covering construction, ordering, duration, JSON, filtering
+
+internal/engine/
+├── explain.go     — ExplainGet, ExplainPut, ExplainDelete, ExplainScan (Phase 22)
+└── explain_test.go — engine trace tests (Phase 22)
+
+internal/vector/
+├── explain.go     — ExplainUpsert, ExplainSearch, ExplainDelete (Phase 22)
+└── explain_test.go — vector trace tests (Phase 22)
+
+cmd/shardforge/
+└── explain.go     — "shardforge explain get/put/delete" CLI (Phase 22)
 ```
 
-**Phase 21 scope:** Types only. No engine wiring. `internal/trace` is a pure type definition package.
+**Phase 21 scope:** Types only. `internal/trace` is a pure type definition package.
 
-**Phase 15 scope:** Wire trace into engine components. Add `ExplainGet`, `ExplainPut`, `ExplainVectorSearch` to the Engine API.
+**Phase 22 scope (COMPLETE):** Engine and vector explain APIs wired to real execution paths. CLI explain commands. JSON output. No engine behaviour changed.
 
 ---
 

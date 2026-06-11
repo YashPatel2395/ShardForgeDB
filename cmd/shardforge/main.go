@@ -33,6 +33,7 @@ Database internals are NOT implemented yet.`,
 	}
 
 	root.AddCommand(newVersionCmd())
+	root.AddCommand(newExplainCmd())
 	return root
 }
 

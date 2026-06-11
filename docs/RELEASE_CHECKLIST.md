@@ -323,3 +323,52 @@ git status --short
 - ~~"Implemented distributed recovery"~~
 - ~~"Implemented production fault tolerance"~~
 - ~~"Nodes automatically reroute requests on failure"~~
+
+---
+
+## Phase 20 — Final Polish + Portfolio Launch
+
+### Phase 20 Validation Gate
+
+- [ ] `make final-smoke` — all checks pass (tests, build, CLI, configs, ops sim)
+- [ ] `go test -race -count=1 ./...` — all 700+ tests PASS
+- [ ] `make build` — all 7 binaries produced
+- [ ] `./bin/shardforge-cluster validate configs/local-3node.json` — exits 0
+- [ ] `./bin/shardforge-cluster validate configs/local-3node-with-proxy.json` — exits 0
+- [ ] `./bin/shardforge-cluster validate configs/local-failure-sim-3node.json` — exits 0
+- [ ] `./bin/shardforge-cluster simulate-failure configs/local-failure-sim-3node.json --down node-2 --key user:1` — exits 0, valid JSON with `affected` field
+- [ ] `./bin/shardforge-cluster plan-rebalance configs/local-failure-sim-3node.json --remove node-2 --key user:1` — exits 0, valid JSON with `movements` field
+- [ ] `git status --short` — clean tree (only untracked docs OK)
+- [ ] Suggested release tag: `v0.2.0-portfolio`
+
+### Phase 20 Docs Checklist
+
+- [ ] `README.md` — rewritten as polished front door (no forbidden claims)
+- [ ] `docs/CLAIMS.md` — safe and forbidden claims documented
+- [ ] `docs/ARCHITECTURE.md` — layered diagram, component descriptions, data flows, limitations
+- [ ] `docs/ROADMAP.md` — completed phases + possible future work (clearly labeled NOT implemented)
+- [ ] `docs/DEMO_SCRIPT.md` — 9-step guided demo script with copy-paste commands
+- [ ] `docs/FINAL_REPORT.md` — engineering summary: phases, tests, benchmarks, learnings
+- [ ] `docs/RESUME_LINKEDIN.md` — resume bullets, LinkedIn post, GitHub description, skills list
+- [ ] `scripts/final_smoke.sh` — exists and is executable
+- [ ] `make final-smoke` target in Makefile
+
+### Phase 20 Scope Honesty Checklist
+
+- [ ] README does not contain any claims from the forbidden list in `docs/CLAIMS.md`
+- [ ] README explicitly states what ShardForgeDB does NOT implement
+- [ ] All new docs comply with `docs/CLAIMS.md` safe/forbidden list
+- [ ] `docs/RESUME_LINKEDIN.md` bullets match the safe claims list exactly
+- [ ] No forbidden claims in the LinkedIn post draft
+
+### Allowed claims (Phase 20)
+
+- "Final documentation and portfolio launch polish for ShardForgeDB v0.2.0."
+- "All 20 phases complete, tested, benchmarked, and documented."
+- "700+ race-safe tests across 25 packages; 120+ reproducible benchmarks."
+
+### Forbidden claims (Phase 20)
+
+- ~~Any claim from the `docs/CLAIMS.md` forbidden list~~
+- ~~"Production-ready database"~~
+- ~~"Distributed fault-tolerant system"~~

@@ -1,7 +1,8 @@
 # ShardForgeDB — High-Level Architecture Design
 
-> **Status:** WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable`), Bloom Filter (`internal/bloom`), and the single-node Engine (`internal/engine`) are implemented as of Phase 6.
-> All other components described here are intended design only — not yet implemented.
+> **Status (Phase 20 — Final):** All 20 phases are complete. WAL, MemTable, SSTable, Bloom filter, LSM-tree Engine, vector search, local sharding, local replication simulation, local dashboard, networked HTTP nodes, client-side routing gateway, stateless proxy, static cluster metadata, networked read replicas, and ops simulation are all implemented, tested, and benchmarked. See `docs/ARCHITECTURE.md` for the current system diagram and `docs/FINAL_REPORT.md` for the full engineering summary.
+>
+> This file (`DESIGN.md`) records the original design intent from early phases and is preserved for historical reference. For the authoritative current-state documentation, see `docs/ARCHITECTURE.md`.
 
 ---
 

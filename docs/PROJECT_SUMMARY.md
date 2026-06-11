@@ -2,7 +2,7 @@
 
 ## Overview
 
-ShardForgeDB is a ground-up Go database engine built layer-by-layer to be fully explainable at every level of the stack. Every design decision, data structure, trade-off, and benchmark result is documented alongside the code. The project is structured as a sequence of eighteen numbered phases, each building on the previous and producing its own tests, benchmarks, and documentation.
+ShardForgeDB is a ground-up Go database engine built layer-by-layer to be fully explainable at every level of the stack. Every design decision, data structure, trade-off, and benchmark result is documented alongside the code. The project is structured as a sequence of twenty numbered phases, each building on the previous and producing its own tests, benchmarks, and documentation.
 
 The goal is not to compete with production databases. The goal is to demonstrate deep understanding of database internals — how LSM trees actually work, what makes replication hard, why compaction matters, how to design a real networked node transport — through working code that is honest about what it is and what it is not.
 
@@ -82,6 +82,8 @@ Docker Compose Demo (Phase 18 — 1-primary + 2-replica read replicas)
 | 16 | `internal/proxy` + `cmd/shardforge-proxy` | Stateless HTTP routing proxy, 10 endpoints, scope flags, Docker Compose integration | 45 | 7 |
 | 17 | `internal/cluster` + `cmd/shardforge-cluster` | Static cluster metadata, JSON config format, --config for gateway/proxy CLIs, 3 example configs | 47 | 4 |
 | 18 | `internal/replnet` + `internal/node` + `internal/proxy` | Networked read replicas v1: in-memory mutation log, explicit pull-based sync, 4 node replication endpoints, 2 proxy replication admin endpoints, Docker Compose replica demo | 55+ | 5 |
+| 19 | `internal/ops` + `cmd/shardforge-cluster` | Health visibility, failure impact simulation, manual rebalance planning — all pure computation, 3 new CLI commands, `OpsScope` in every result | 40 | 4 |
+| 20 | docs | Architecture doc, claims audit, roadmap, demo script, final report, resume content, final smoke script, release polish | — | — |
 
 ---
 
@@ -154,7 +156,7 @@ The design documents explicitly state these boundaries at every phase.
 - Implemented a client-side routing gateway (`shardforge-gateway`) with deterministic consistent-hash routing, virtual nodes, weight support, and per-node health/flush/compact fanout
 - Implemented a stateless HTTP routing proxy (`shardforge-proxy`) that exposes one HTTP/JSON API and routes requests to independent nodes; includes scope flags, no-failover proof, and Docker Compose integration
 - Implemented networked read replicas (`internal/replnet`): in-memory append-only mutation log with monotonic seq numbers, explicit pull-based follower sync, follower write rejection (403), 4 node endpoints + 2 proxy admin endpoints, Docker Compose 1-primary+2-replica demo
-- 650+ tests across all packages, race-safe, with reproducible benchmark results documented at every phase
+- 700+ tests across all packages, race-safe, with reproducible benchmark results documented at every phase
 - Full documentation: DESIGN.md (architecture), PROOF.md (per-phase evidence), BENCHMARKS.md (reproducible numbers)
 
 ---

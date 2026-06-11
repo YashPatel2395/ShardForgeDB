@@ -3557,3 +3557,53 @@ BenchmarkOps_CheckClusterHealth_HealthyNodes-8   38815 iter    92532 ns/op
 
 - `internal/ops`: 40 tests PASS (11 health, 13 simulate, 13 rebalance, 3 route)
 - `cmd/shardforge-cluster`: 25 tests PASS (15 new Phase 19 tests)
+
+---
+
+## Phase 20 — Final Polish + Portfolio Launch
+
+**Date:** 2026-06-10
+**Go version:** go1.26.4 darwin/arm64
+**Branch:** phase-20-final-polish-launch
+
+### Changes Made
+
+| Item | Change |
+|------|--------|
+| `README.md` | Complete rewrite — polished front door with all 20 phases, architecture diagram, quickstart, honest limitations |
+| `docs/CLAIMS.md` | New — safe/forbidden claims audit, correct wording examples |
+| `docs/ARCHITECTURE.md` | New — layered diagram, all 14 component descriptions, 7 data flow walkthroughs, limitations table |
+| `docs/ROADMAP.md` | New — completed phases table + possible future work (explicitly NOT implemented) |
+| `docs/DEMO_SCRIPT.md` | New — 9-step guided demo with copy-paste commands |
+| `docs/FINAL_REPORT.md` | New — executive summary, phase table, testing/benchmark summaries, engineering learnings |
+| `docs/RESUME_LINKEDIN.md` | New — resume bullets (2/3/4-bullet), LinkedIn post, GitHub description, skills list |
+| `docs/RELEASE_CHECKLIST.md` | Updated — Phase 20 checklist, suggested tag `v0.2.0-portfolio` |
+| `docs/PROJECT_SUMMARY.md` | Updated — Phase 19+20 rows in phase table, test count updated to 700+ |
+| `docs/DESIGN.md` | Updated — Phase 20 status note at top |
+| `docs/PROOF.md` | Updated — this section |
+| `scripts/final_smoke.sh` | New — final smoke validation script (no Docker required) |
+| `Makefile` | Updated — `final-smoke` target, `final-smoke` in `.PHONY` |
+
+### Final Validation Commands
+
+```bash
+make final-smoke
+go test -race -count=1 ./...
+make build
+./bin/shardforge-cluster validate configs/local-3node.json
+./bin/shardforge-cluster validate configs/local-failure-sim-3node.json
+./bin/shardforge-cluster simulate-failure configs/local-failure-sim-3node.json --down node-2 --key user:1
+./bin/shardforge-cluster plan-rebalance configs/local-failure-sim-3node.json --remove node-2 --key user:1
+```
+
+All commands exit 0. Tests pass. Binaries build. Configs validate.
+
+### Release Status
+
+- All 20 phases implemented
+- All 25 packages pass `go test -race -count=1 ./...`
+- All 7 binaries build via `make build`
+- All Docker Compose configs validate
+- All cluster configs validate
+- All documentation complete and compliant with `docs/CLAIMS.md`
+- Suggested release tag: `v0.2.0-portfolio`

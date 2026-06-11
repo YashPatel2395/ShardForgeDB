@@ -29,7 +29,7 @@ This file records the evidence that each phase was implemented correctly and pas
 | 19 | `internal/ops` | COMPLETE | 40 | 4 | Simulation/planning only; no data movement |
 | 21 | `internal/trace` | COMPLETE (types only) | 22 | — | Types only; engine wiring deferred to Phase 15 |
 | 22 | `engine/explain`, `vector/explain`, CLI | COMPLETE | 40 new (905 total) | — | Single-node only; no distributed traces |
-| 23 | `node/explain endpoints`, `node/client`, `shardforge explain-node` | COMPLETE | 18 new (923 total) | — | Single-node HTTP only; no cross-node trace propagation |
+| 23 | `node/explain endpoints`, `node/client`, `shardforge explain-node` | COMPLETE | 24 new (929 total) | — | Single-node HTTP only; no cross-node trace propagation |
 
 **Validation command (all phases):**
 ```bash
@@ -38,10 +38,10 @@ make build
 make vet
 ```
 
-**Current test pass status:** 923 tests pass across 23 packages (race detector on) on Apple M3 darwin/arm64, Go 1.26.
+**Current test pass status:** 929 tests pass across 23 packages (race detector on) on Apple M3 darwin/arm64, Go 1.26.
 
 ```
-go test -race -count=1 -v ./... | grep -c "^--- PASS:" → 923
+go test -race -count=1 -v ./... | grep -c "^--- PASS:" → 929
 ```
 
 ---
@@ -4079,3 +4079,80 @@ New tests in `internal/node/node_explain_test.go`:
 
 - "Distributed operation traces" — traces cover single-node engine only; no cross-node propagation
 - "Networked traces" / "distributed tracing" — traces do not propagate over HTTP between nodes
+
+### Example HTTP trace output (via shardforge explain-node)
+
+**PUT — key written, WAL + MemTable steps visible:**
+```json
+{
+  "node_id": "node-demo",
+  "operation": "PUT",
+  "trace": {
+    "operation": "PUT",
+    "key": "httpkey",
+    "steps": [
+      {"component":"ENGINE","step_type":"KEY_VALIDATED","status":"OK","duration_ns":0,"detail":"key_len=7 value_len=7"},
+      {"component":"WAL","step_type":"WAL_APPEND","status":"OK","duration_ns":52833,"detail":"seq=1 key_len=7 value_len=7"},
+      {"component":"MEMTABLE","step_type":"MEMTABLE_PUT","status":"OK","duration_ns":791,"detail":"seq=1 key_len=7"}
+    ]
+  }
+}
+```
+
+**GET — key in MemTable, MEMTABLE_HIT returned:**
+```json
+{
+  "node_id": "node-demo",
+  "operation": "GET",
+  "key": "httpkey",
+  "found": true,
+  "value": "httpval",
+  "trace": {
+    "operation": "GET",
+    "key": "httpkey",
+    "steps": [
+      {"component":"ENGINE","step_type":"KEY_VALIDATED","status":"OK","duration_ns":0},
+      {"component":"MEMTABLE","step_type":"MEMTABLE_HIT","status":"OK","duration_ns":833,"detail":"key_len=7 value_len=7"}
+    ]
+  }
+}
+```
+
+**DELETE — tombstone written, WAL + MEMTABLE_DELETE steps:**
+```json
+{
+  "node_id": "node-demo",
+  "operation": "DELETE",
+  "key": "httpkey",
+  "trace": {
+    "operation": "DELETE",
+    "key": "httpkey",
+    "steps": [
+      {"component":"ENGINE","step_type":"KEY_VALIDATED","status":"OK","duration_ns":0},
+      {"component":"WAL","step_type":"WAL_APPEND","status":"OK","duration_ns":19167,"detail":"seq=2 key_len=7 tombstone=true"},
+      {"component":"MEMTABLE","step_type":"MEMTABLE_DELETE","status":"OK","duration_ns":708,"detail":"seq=2 key_len=7"}
+    ]
+  }
+}
+```
+
+### Example local CLI trace output (shardforge explain)
+
+```
+$ shardforge explain --data-dir ./data put demokey demovalue
+{
+  "operation": "PUT",
+  "key": "demokey",
+  "steps": [
+    {"component":"ENGINE","step_type":"KEY_VALIDATED","status":"OK","duration_ns":0,"detail":"key_len=7 value_len=9"},
+    {"component":"WAL","step_type":"WAL_APPEND","status":"OK","duration_ns":92750,"detail":"seq=1 key_len=7 value_len=9"},
+    {"component":"MEMTABLE","step_type":"MEMTABLE_PUT","status":"OK","duration_ns":1250,"detail":"seq=1 key_len=7"}
+  ]
+}
+```
+
+### make release-check result
+
+```
+[release-check] ALL CHECKS PASSED
+```

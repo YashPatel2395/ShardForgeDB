@@ -115,8 +115,13 @@ func TestScenario_EventsOrdered(t *testing.T) {
 	if len(result.Events) == 0 {
 		t.Fatal("no events")
 	}
+	// Use strict Before (not !After) as the less function for sort.SliceIsSorted.
+	// !After is equivalent to <=, which causes SliceIsSorted to return false when
+	// two adjacent events have identical nanosecond timestamps (both less(i,j) and
+	// less(j,i) would be true). Before correctly handles equal timestamps as
+	// "neither before nor after" — the sort check passes for equal adjacent events.
 	if !sort.SliceIsSorted(result.Events, func(i, j int) bool {
-		return !result.Events[i].Time.After(result.Events[j].Time)
+		return result.Events[i].Time.Before(result.Events[j].Time)
 	}) {
 		t.Error("events are not in non-decreasing time order")
 	}

@@ -1,7 +1,8 @@
 # ShardForgeDB — High-Level Architecture Design
 
-> **Status:** WAL (`internal/wal`), MemTable (`internal/memtable`), SSTable (`internal/sstable`), Bloom Filter (`internal/bloom`), and the single-node Engine (`internal/engine`) are implemented as of Phase 6.
-> All other components described here are intended design only — not yet implemented.
+> **Status (Phase 21 — Truth Lock):** Phases 1–19 are complete. All storage components (WAL, MemTable, SSTable, Bloom, Engine, compaction), vector search, local simulations (sharding, replication, dashboard), real networked HTTP nodes, client-side routing gateway, stateless proxy, static cluster metadata, explicit pull-based read replicas v1, and ops simulation are implemented, tested, and benchmarked. See `docs/CLAIMS.md` for the authoritative list of safe and unsafe claims. See `docs/ROADMAP_DISTRIBUTED.md` for the path to real distributed features.
+>
+> **Historical note:** This file was written incrementally, phase by phase. Per-component "Known Limitations" sections below reflect the state at the time that phase was written. Where a limitation has since been resolved, it is annotated with the phase that resolved it.
 
 ---
 
@@ -20,7 +21,7 @@
 
 **Phase 2 — Implemented** in `internal/wal`.
 
-All mutations are first written to an append-only WAL before being acknowledged. This guarantees durability in the event of a process crash. The engine (not yet implemented) will replay the WAL on startup to recover any writes not yet flushed to an SSTable.
+All mutations are first written to an append-only WAL before being acknowledged. This guarantees durability in the event of a process crash. The engine replays the WAL on startup to recover any writes not yet flushed to an SSTable (implemented in Phase 6).
 
 #### Record Format
 
@@ -61,7 +62,8 @@ The distinction between a partial tail and corruption is based on which bytes ar
 - No WAL compaction / GC.
 - No group commit (each `Append` is an independent write).
 - No compression or encryption.
-- WAL is not yet wired to the MemTable or Engine (future phases).
+- WAL rotation is manual only; no automatic size-based rotation.
+- **Resolved in Phase 6:** WAL is wired to MemTable and Engine; WAL replay reconstructs MemTable on restart.
 
 ### MemTable
 
@@ -81,7 +83,7 @@ Insertions maintain the sorted slice via binary search (`sort.SearchStrings`, O(
 #### Ordering and Tombstones
 
 - All keys are stored in lexicographic (byte) order; `Scan(start, end)` returns entries in that order.
-- `Delete` does not remove a key — it records an `EntryDelete` tombstone. The engine (not yet implemented) uses tombstones to shadow older versions of a key in lower SSTable levels during reads and compaction.
+- `Delete` does not remove a key — it records an `EntryDelete` tombstone. The engine uses tombstones to shadow older versions of a key in SSTable reads, and drops tombstones during full compaction (Phase 7).
 - `Get` returns tombstones; callers must check `entry.Kind`.
 
 #### Concurrency
@@ -101,8 +103,8 @@ Insertions maintain the sorted slice via binary search (`sort.SearchStrings`, O(
 
 - O(n) per insert; O(n²) bulk load. Skip list deferred to profiling phase.
 - Single `sync.RWMutex` — no per-key or per-shard locking.
-- No immutable (flushing) MemTable handoff — flush path not yet wired.
-- MemTable is not yet connected to the WAL or Engine; data is lost on process restart.
+- No immutable (flushing) MemTable handoff — the Engine flushes the mutable MemTable directly; a two-MemTable (active + immutable) design is future work.
+- **Resolved in Phase 6:** MemTable is connected to WAL and Engine; WAL replay reconstructs MemTable on restart.
 
 ### SSTables (Sorted String Tables)
 
@@ -217,14 +219,15 @@ Limitation: the parent directory is not fsynced after rename (a future improveme
 
 #### Known Limitations (Phase 4)
 
-- No Bloom filter; every `Get` for a missing key does a binary index search (no disk I/O) but confirms absence only after scanning the in-memory index.
 - No block cache; data reads go to the OS page cache only.
 - Dense index (one entry per key) — no sparse index, so large tables consume proportional RAM.
 - No compression or encryption.
 - No block-level layout; the data region is a flat record stream.
-- No compaction; multi-SSTable lookup logic is the Engine's responsibility.
-- SSTable is not yet wired to the MemTable or Engine.
+- No levelled or tiered compaction; only full manual compaction is implemented.
 - Parent directory is not fsynced after rename.
+- **Resolved in Phase 5:** Bloom filters added as per-SSTable sidecars.
+- **Resolved in Phase 6:** SSTable wired to Engine; multi-SSTable lookup with Bloom filter acceleration.
+- **Resolved in Phase 7:** Manual full compaction with atomic manifest swap.
 
 ### Bloom Filters
 
@@ -292,12 +295,12 @@ All integers are little-endian. The wordCount safety cap is 2³⁰ words (8 GiB 
 
 #### Known Limitations (Phase 5)
 
-- Not wired into SSTable or Engine yet; integration is the Engine's responsibility.
 - No scalable / partitioned Bloom filter; the entire bit array lives in RAM.
-- No counting Bloom filter; Delete is not supported.
+- No counting Bloom filter; Delete is not supported (keys are never removed from a filter).
 - No compression of the bit array.
 - `InsertedItems` counts successful `Add` calls, not unique keys.
 - False positives are possible by design; false negatives are impossible.
+- **Resolved in Phase 6:** Bloom filter wired into Engine as per-SSTable sidecar; MightContain gates all SSTable Get calls.
 
 ### Compaction
 
@@ -523,36 +526,94 @@ Every table entry loaded from the manifest is validated by `validateTableEntries
 
 ## Vector Search Layer
 
-The `vector` package will implement an Approximate Nearest Neighbour (ANN) index.
+**Phase 9 — Implemented** in `internal/vector`.
 
-- Candidate algorithm: HNSW (Hierarchical Navigable Small World).
-- Interface: `Insert(id, vector)`, `Search(query, topK) ([]Result, error)`.
-- Vectors are stored separately from key-value data but use the same WAL for durability.
+The `vector` package implements **exact k-nearest-neighbour (k-NN) search**. It is not ANN, not HNSW, not IVF. These must not be claimed.
+
+- Algorithm: brute-force O(n·d) — compute distance between query and every indexed vector.
+- Metrics: cosine similarity, L2 (Euclidean) distance, dot product.
+- Interface: `Insert(namespace, id, vec)`, `Search(namespace, query, k, metric) ([]Result, error)`.
+- Persistence: vectors are stored in the Engine under a namespace-prefixed key. The in-memory index is rebuilt on `Open` by scanning the namespace prefix.
+- Namespace isolation: each namespace is an independent index; `Search` within a namespace does not touch other namespaces.
+
+### Known Limitations (Phase 9)
+
+- O(n·d) brute force — query time grows linearly with index size.
+- No ANN approximation; every Search is exact.
+- In-memory index rebuilt from engine scan on every `Open` — not suitable for very large indices.
+- No filtered vector search (metadata filter + vector similarity).
+- **Not yet implemented:** ANN index (HNSW, IVF), distributed vector search, quantization. See `docs/ROADMAP_DISTRIBUTED.md` Phase 25.
 
 ---
 
 ## Cluster Layer
 
-### Sharding
+**Phases 10–19 — Implemented** (with explicit scope limitations on all components).
 
-Key space is partitioned across nodes using consistent hashing.
+### Local sharding simulation (Phase 10)
 
-- Virtual nodes reduce hotspot risk during node additions/removals.
-- The shard map is stored in a distributed metadata service.
+`internal/shard` — FNV-1a consistent-hash ring over multiple in-process Engine instances.
 
-### Replication
+- Virtual nodes and weight support.
+- `SHARDING.json` manifest for reopen safety.
+- **Scope:** in-process only. No cross-process networking. Data is not split across real nodes.
 
-Each shard is replicated across N nodes using a leader/follower model.
+### Local leader/follower replication simulation (Phase 11)
 
-- Leader handles all writes; followers serve reads (with optional staleness).
-- Automatic failover on leader failure is planned for a later sub-phase.
-- Log entries correspond to WAL entries, giving a natural replication unit.
+`internal/replica` — binary operation log, leader-commit semantics, follower pause/lag/catch-up.
 
-> **Note on Raft:** Full Raft-compatible consensus (leader election, term
-> handling, replicated log, commit index, voting, and failover) is a future
-> candidate algorithm, not the committed implementation. It will not be claimed
-> as implemented until leader election, term handling, replicated log, commit
-> index, voting, failover, and tests are all in place.
+- **Scope:** in-process only. No networking. Leaders and followers are in the same process.
+
+### Local HTTP dashboard (Phase 12)
+
+`internal/dashboard` — local HTTP observability, three deterministic chaos scenarios.
+
+- **Scope:** local only. No distributed node discovery.
+
+### Real networked HTTP node runtime (Phase 14)
+
+`internal/node` — independent HTTP/JSON node processes.
+
+- Each node is a real process with its own engine on disk.
+- Nodes do not coordinate with each other; there is no shared state between nodes.
+
+### Client-side routing gateway (Phase 15)
+
+`internal/gateway` — FNV-1a ring, deterministic key-to-node routing, virtual nodes, weight.
+
+- **Scope:** client-side only. The gateway is a library, not a server process. No failover.
+
+### Stateless HTTP routing proxy (Phase 16)
+
+`internal/proxy` — 10 endpoints, no retry on failure, scope flags in every response.
+
+### Static cluster metadata (Phase 17)
+
+`internal/cluster` — typed JSON config, validated, with scope flags documenting all limitations.
+
+### Networked read replicas v1 (Phase 18)
+
+`internal/replnet` — in-memory mutation log, explicit pull-based sync, follower write rejection.
+
+- **Scope:** explicit pull only. No automatic background sync. No automatic failover. No Raft.
+
+### Ops simulation (Phase 19)
+
+`internal/ops` — health polling, failure impact simulation (pure ring computation), manual rebalance planning.
+
+- **Scope:** simulation and planning only. No automatic failover. No data movement. All flags true in `OpsScope`.
+
+### Not yet implemented
+
+- Raft or any consensus protocol
+- Automatic leader election or failover
+- Quorum replication
+- Shard migration / data movement between nodes
+- Distributed metadata service
+- Dynamic cluster membership
+- Gossip / service discovery
+
+See `docs/ROADMAP_DISTRIBUTED.md` for the phases that will implement these.
 
 ---
 
@@ -573,9 +634,11 @@ Read path:
 | Decision | Trade-off |
 |----------|-----------|
 | LSM-tree over B-tree | Write-optimised; read amplification requires Bloom + cache |
-| Levelled compaction | Predictable read performance; higher write amplification than tiered |
-| Leader/follower replication | Simple to implement and reason about; Raft-compatible consensus is a future candidate if strong consistency is required |
-| HNSW for vector search | High recall; memory-intensive; no native disk-resident variant |
+| Manual full compaction only | Simple to reason about and test; no write-amplification from automatic triggers. Background compaction is future work (Phase 24). |
+| Exact k-NN vector search | Correct results guaranteed; O(n·d) cost grows with index. ANN (HNSW/IVF) is future work (Phase 25). |
+| Explicit pull-based replication | No background goroutine complexity; followers sync on demand. Automatic background replication is Phase 20. |
+| No consensus / Raft | Simple to implement phases 1–19; real fault tolerance requires consensus. Raft is Phase 23. |
+| Client-side routing (no server-side coordinator) | No single point of failure for routing; routing logic duplicated in each client. A routing server (service mesh layer) is future work. |
 
 ---
 

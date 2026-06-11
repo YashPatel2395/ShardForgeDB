@@ -3656,15 +3656,200 @@ go test -race -count=1 ./...
 make build
 make test
 make vet
+make release-check
 ```
 
-### Test Results
+### `make release-check` Full Output (exit 0)
 
 ```
-go test -race -count=1 ./... → all 23 packages PASS including internal/trace (22 new tests); 865 total passing tests
-make build                   → all 7 binaries built
-make vet                     → clean
-go fmt ./...                 → clean
+./scripts/release_check.sh
+[release-check] go mod tidy
+[release-check] go fmt ./...
+[release-check] go vet ./...
+[release-check] go test -race -count=1 ./...
+ok  	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge	1.176s
+?   	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-bench	[no test files]
+ok  	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-cluster	1.329s
+?   	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-dashboard	[no test files]
+ok  	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-gateway	1.482s
+?   	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-node	[no test files]
+ok  	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-proxy	1.483s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/bench	3.724s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/bloom	2.119s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/cluster	1.837s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/config	1.889s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/dashboard	2.320s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/engine	5.765s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/gateway	1.910s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/logging	1.207s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/memtable	1.219s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/node	2.383s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/ops	1.382s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/proxy	2.202s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/replica	4.481s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/replnet	1.211s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/shard	3.622s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/sstable	2.590s
+?   	github.com/YashPatel2395/ShardForgeDB/internal/storage	[no test files]
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/trace	1.163s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/vector	1.989s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/wal	1.254s
+[release-check] go test -bench dashboard
+goos: darwin
+goarch: arm64
+pkg: github.com/YashPatel2395/ShardForgeDB/internal/dashboard
+cpu: Apple M3
+BenchmarkRunFollowerPauseScenario-8     	     216	  17912362 ns/op	   42337 B/op	     398 allocs/op
+BenchmarkRunFollowerLagScenario-8       	     177	  21320221 ns/op	   69596 B/op	     757 allocs/op
+BenchmarkRunFollowerCatchupScenario-8   	     199	  17604306 ns/op	   58736 B/op	     615 allocs/op
+BenchmarkSnapshot_EngineCollector-8     	14741241	       241.0 ns/op	     736 B/op	       6 allocs/op
+BenchmarkSnapshot_ReplicaCollector-8    	 2583295	      1396 ns/op	    3113 B/op	      36 allocs/op
+BenchmarkSnapshot_MultiCollector-8      	 4267099	       839.9 ns/op	    2584 B/op	      18 allocs/op
+BenchmarkRenderHTML-8                   	  271453	     13283 ns/op	   10700 B/op	     184 allocs/op
+BenchmarkEncodeStatusJSON-8             	 1285980	      2813 ns/op	    8434 B/op	      47 allocs/op
+PASS
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/dashboard	41.153s
+[release-check] go test -bench replica
+goos: darwin
+goarch: arm64
+pkg: github.com/YashPatel2395/ShardForgeDB/internal/replica
+cpu: Apple M3
+BenchmarkPut_10k_LeaderOnly-8                	   10000	    334666 ns/op	    2980 B/op	      32 allocs/op
+BenchmarkReplicateAll_10k_2Followers-8       	       1	3026608959 ns/op	35023840 B/op	  360002 allocs/op
+BenchmarkGet_Leader_10k_Existing-8           	26403615	       134.3 ns/op	     103 B/op	       4 allocs/op
+BenchmarkGet_Follower_10k_Existing-8         	26212875	       135.5 ns/op	     103 B/op	       4 allocs/op
+BenchmarkScan_Leader_10k-8                   	    1062	   3382989 ns/op	 8638434 B/op	   60121 allocs/op
+BenchmarkReopen_10k-8                        	     355	  10137163 ns/op	 7534030 B/op	   90268 allocs/op
+BenchmarkReplicateOnce_SmallBatch-8          	   12069	    299305 ns/op	    2481 B/op	      34 allocs/op
+BenchmarkConcurrentPut-8                     	   12470	    286652 ns/op	    2746 B/op	      31 allocs/op
+BenchmarkConcurrentReplicateAllWithReads-8   	30074830	       116.6 ns/op	      51 B/op	       2 allocs/op
+BenchmarkLogAppendReplay-8                   	    3787	    959866 ns/op	  258834 B/op	    6022 allocs/op
+PASS
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/replica	217.587s
+[release-check] go test -bench shard
+goos: darwin
+goarch: arm64
+pkg: github.com/YashPatel2395/ShardForgeDB/internal/shard
+cpu: Apple M3
+BenchmarkRing_Route1M-8               	38700782	        78.92 ns/op	      32 B/op	       1 allocs/op
+BenchmarkPut_10k_4shards-8            	 2331141	      1481 ns/op	     201 B/op	       7 allocs/op
+BenchmarkGet_10k_existing_4shards-8   	22991466	       155.2 ns/op	     103 B/op	       4 allocs/op
+BenchmarkGet_10k_missing_4shards-8    	32865894	       109.2 ns/op	      31 B/op	       1 allocs/op
+BenchmarkScan_10k_4shards-8           	     681	   5255328 ns/op	10095829 B/op	   80266 allocs/op
+BenchmarkFlush_10k_4shards-8          	      34	 101653140 ns/op	 5834848 B/op	   50846 allocs/op
+BenchmarkCompact_10k_4shards-8        	      30	 127673836 ns/op	16970038 B/op	  218775 allocs/op
+BenchmarkReopen_10k_4shards-8         	    6012	    573878 ns/op	 1065552 B/op	   10794 allocs/op
+BenchmarkConcurrentPut_4shards-8      	 1445794	      2479 ns/op	     488 B/op	       6 allocs/op
+BenchmarkConcurrentGet_4shards-8      	24826401	       144.5 ns/op	     103 B/op	       4 allocs/op
+PASS
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/shard	50.531s
+[release-check] go test -bench vector
+goos: darwin
+goarch: arm64
+pkg: github.com/YashPatel2395/ShardForgeDB/internal/vector
+cpu: Apple M3
+BenchmarkUpsert_1k_dim128-8           	     859	   4547245 ns/op	 4304750 B/op	    9804 allocs/op
+BenchmarkSearch_1k_dim128_Cosine-8    	   18138	    198016 ns/op	   58568 B/op	       6 allocs/op
+BenchmarkSearch_10k_dim128_Cosine-8   	    1600	   2261175 ns/op	  566472 B/op	       6 allocs/op
+BenchmarkSearch_1k_dim128_L2-8        	   18514	    194981 ns/op	   58568 B/op	       6 allocs/op
+BenchmarkSearch_1k_dim128_Dot-8       	   18583	    193666 ns/op	   58568 B/op	       6 allocs/op
+BenchmarkReopen_1k-8                  	    2401	   1496536 ns/op	 3349410 B/op	   10125 allocs/op
+BenchmarkCodec_Encode_dim128-8        	23127903	       156.4 ns/op	     576 B/op	       1 allocs/op
+BenchmarkCodec_Decode_dim128-8        	24569724	       146.6 ns/op	     512 B/op	       1 allocs/op
+BenchmarkConcurrentSearch-8           	   76146	     51172 ns/op	   58569 B/op	       6 allocs/op
+BenchmarkConcurrentUpsert-8           	  948016	     18872 ns/op	    4353 B/op	      10 allocs/op
+PASS
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/vector	64.515s
+[release-check] go test -bench engine
+goos: darwin
+goarch: arm64
+pkg: github.com/YashPatel2395/ShardForgeDB/internal/engine
+cpu: Apple M3
+BenchmarkCompact_2SSTable_1kKeys-8           	     196	  18566494 ns/op	  717264 B/op	   10141 allocs/op
+BenchmarkCompact_10SSTable_10kKeys-8         	      44	  80850130 ns/op	 6700180 B/op	  100387 allocs/op
+BenchmarkCompact_WithOverwrites-8            	     226	  17847693 ns/op	  682308 B/op	   11158 allocs/op
+BenchmarkCompact_WithTombstones-8            	     711	   5113030 ns/op	  364147 B/op	    5084 allocs/op
+BenchmarkGet_MissingKey_BeforeCompaction-8   	231557818	        15.65 ns/op	       0 B/op	       0 allocs/op
+BenchmarkGet_MissingKey_AfterCompaction-8    	237023348	        15.18 ns/op	       0 B/op	       0 allocs/op
+BenchmarkScan_BeforeCompaction-8             	    3693	    978130 ns/op	  568497 B/op	    7054 allocs/op
+BenchmarkScan_AfterCompaction-8              	    3694	    971734 ns/op	  553585 B/op	    7045 allocs/op
+BenchmarkPut-8                               	 2740119	      1444 ns/op	     112 B/op	       4 allocs/op
+BenchmarkGet_MemTable_Existing-8             	91031691	        39.22 ns/op	      48 B/op	       3 allocs/op
+BenchmarkGet_MemTable_Missing-8             	224278622	        16.07 ns/op	       0 B/op	       0 allocs/op
+BenchmarkFlush_1k-8                          	     231	  16022992 ns/op	  444002 B/op	    5094 allocs/op
+BenchmarkFlush_100k-8                        	       5	 608980692 ns/op	63294766 B/op	  500132 allocs/op
+BenchmarkGet_SSTable_Existing-8              	 4273998	       842.0 ns/op	      96 B/op	       4 allocs/op
+BenchmarkGet_SSTable_Missing_BloomSkip-8     	86271454	        41.40 ns/op	       0 B/op	       0 allocs/op
+BenchmarkScan_1k-8                           	    5889	    611923 ns/op	  544497 B/op	    6554 allocs/op
+BenchmarkRestart_WALReplay-8                 	    6888	    523671 ns/op	  279601 B/op	    3551 allocs/op
+BenchmarkRestart_ManifestLoad-8              	   48926	     73636 ns/op	   50616 B/op	     557 allocs/op
+PASS
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/engine	155.702s
+[release-check] go test -bench bench
+goos: darwin
+goarch: arm64
+pkg: github.com/YashPatel2395/ShardForgeDB/internal/bench
+cpu: Apple M3
+BenchmarkGenKey-8                      	54720458	        66.29 ns/op	      24 B/op	       2 allocs/op
+BenchmarkGenValue_128-8                	90291471	        37.36 ns/op	3426.38 MB/s	       0 B/op	       0 allocs/op
+BenchmarkPercentile_1k-8               	 1440925	      2499 ns/op	    8248 B/op	       3 allocs/op
+BenchmarkWorkload_WriteHeavy_Small-8   	      28	 142949579 ns/op	 1901159 B/op	   15274 allocs/op
+BenchmarkWorkload_ReadHeavy_Small-8    	      28	 140226833 ns/op	 2334942 B/op	   20836 allocs/op
+PASS
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/bench	25.642s
+[release-check] make test
+go test -race -count=1 ./...
+ok  	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge	1.209s
+?   	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-bench	[no test files]
+ok  	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-cluster	1.319s
+?   	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-dashboard	[no test files]
+ok  	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-gateway	1.392s
+?   	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-node	[no test files]
+ok  	github.com/YashPatel2395/ShardForgeDB/cmd/shardforge-proxy	1.575s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/bench	3.438s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/bloom	2.339s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/cluster	2.100s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/config	2.177s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/dashboard	2.250s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/engine	5.388s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/gateway	2.011s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/logging	1.352s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/memtable	1.261s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/node	2.119s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/ops	1.269s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/proxy	2.097s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/replica	3.855s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/replnet	1.212s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/shard	3.182s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/sstable	2.643s
+?   	github.com/YashPatel2395/ShardForgeDB/internal/storage	[no test files]
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/trace	1.483s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/vector	1.896s
+ok  	github.com/YashPatel2395/ShardForgeDB/internal/wal	1.298s
+[release-check] make vet
+go vet ./...
+[release-check] make build
+go build  -o bin/shardforge ./cmd/shardforge
+go build  -o bin/shardforge-bench ./cmd/shardforge-bench
+go build  -o bin/shardforge-dashboard ./cmd/shardforge-dashboard
+go build  -o bin/shardforge-node ./cmd/shardforge-node
+go build  -o bin/shardforge-gateway ./cmd/shardforge-gateway
+go build  -o bin/shardforge-proxy ./cmd/shardforge-proxy
+go build  -o bin/shardforge-cluster ./cmd/shardforge-cluster
+[release-check] make bench-dashboard
+[release-check] make bench-replica
+[release-check] make bench-shard
+[release-check] make bench-vector
+[release-check] shardforge --help
+[release-check] shardforge version
+ShardForgeDB 0.1.0
+[release-check] shardforge-bench --scale small
+Report written to /tmp/shardforge-release-bench.md
+[release-check] shardforge-dashboard --help
+[release-check] git status --short
+[release-check] Working tree is clean.
+
+[release-check] ALL CHECKS PASSED
 ```
 
 ### Claims Now Safe

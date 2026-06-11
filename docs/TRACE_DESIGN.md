@@ -45,7 +45,7 @@ The trace foundation lives in `internal/trace`:
 ```
 internal/trace/
 ├── trace.go       — Trace, TraceStep, OperationType, Component, StepType, Status
-└── trace_test.go  — 25+ tests covering construction, ordering, duration, JSON, filtering
+└── trace_test.go  — 22 tests covering construction, ordering, duration, JSON, filtering
 ```
 
 **Phase 21 scope:** Types only. No engine wiring. `internal/trace` is a pure type definition package.

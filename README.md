@@ -468,7 +468,7 @@ make node-demo-down
 - [x] `docs/TRACE_DESIGN.md` — trace philosophy, types, Phase 15 integration plan
 - [x] Fixed stale statements in `docs/DESIGN.md` (ANN/HNSW claimed; levelled compaction claimed; WAL "not yet wired")
 - [x] Added summary table to `docs/PROOF.md`
-- [x] 25+ tests in `internal/trace`
+- [x] 22 tests in `internal/trace`
 - [x] **Types only** — trace wiring into engine is Phase 15
 
 ---

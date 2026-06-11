@@ -27,7 +27,7 @@ This file records the evidence that each phase was implemented correctly and pas
 | 17 | `internal/cluster` | COMPLETE | 47 | 4 | Static config only; no dynamic membership |
 | 18 | `internal/replnet` | COMPLETE | 55+ | 5 | Pull-based; in-memory log; no auto sync |
 | 19 | `internal/ops` | COMPLETE | 40 | 4 | Simulation/planning only; no data movement |
-| 21 | `internal/trace` | COMPLETE (types only) | 25+ | — | Types only; engine wiring deferred to Phase 15 |
+| 21 | `internal/trace` | COMPLETE (types only) | 22 | — | Types only; engine wiring deferred to Phase 15 |
 
 **Validation command (all phases):**
 ```bash
@@ -36,7 +36,11 @@ make build
 make vet
 ```
 
-**Current test pass status:** All 700+ tests pass on Apple M3 darwin/arm64, Go 1.26.
+**Current test pass status:** 865 tests pass across 23 packages (race detector on) on Apple M3 darwin/arm64, Go 1.26.
+
+```
+go test -race -count=1 -v ./... | grep -c "^--- PASS:" → 865
+```
 
 ---
 
@@ -3609,7 +3613,7 @@ BenchmarkOps_CheckClusterHealth_HealthyNodes-8   38815 iter    92532 ns/op
 | `docs/CLAIMS.md` | New — three-section claims audit: Safe, Unsafe, Future |
 | `docs/ROADMAP_DISTRIBUTED.md` | New — Phases 15–27 toward real distributed features |
 | `internal/trace/trace.go` | New — trace types: Trace, TraceStep, OperationType, Component, StepType, Status |
-| `internal/trace/trace_test.go` | New — 25+ tests covering construction, ordering, duration, JSON, filtering |
+| `internal/trace/trace_test.go` | New — 22 tests covering construction, ordering, duration, JSON, filtering |
 | `docs/TRACE_DESIGN.md` | New — trace philosophy, rules, Phase 15 integration plan |
 | `docs/DESIGN.md` | Fixed stale statements: WAL "not yet wired", HNSW as implemented, levelled compaction as implemented, vector layer description, cluster layer |
 | `docs/PROOF.md` | Added summary table at top |
@@ -3657,7 +3661,7 @@ make vet
 ### Test Results
 
 ```
-go test -race -count=1 ./... → all packages PASS including internal/trace (25+ new tests)
+go test -race -count=1 ./... → all 23 packages PASS including internal/trace (22 new tests); 865 total passing tests
 make build                   → all 7 binaries built
 make vet                     → clean
 go fmt ./...                 → clean

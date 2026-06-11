@@ -31,7 +31,7 @@ The following are accurate, honest descriptions of what exists in the codebase w
 | Health check visibility | `internal/ops.CheckClusterHealth` — HTTP /healthz polling, latency, sorted results |
 | Failure simulation (no live calls) | `internal/ops.SimulateFailure` — routing impact on sample keys, pure ring computation |
 | Manual rebalance planning (no data movement) | `internal/ops.PlanManualRebalance` — key movement plan, operator steps, pure computation |
-| 700+ race-safe tests | `go test -race -count=1 ./...` passes across all packages |
+| 865 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 865 passing tests, 23 packages with test files, 4 packages with no test files (`cmd/shardforge-bench`, `cmd/shardforge-dashboard`, `cmd/shardforge-node`, `internal/storage`) |
 | Reproducible benchmarks | `make bench-*` targets, results in `docs/BENCHMARKS.md` |
 
 ---
@@ -112,7 +112,7 @@ Every cluster config includes a `scope` object with all limitation flags documen
 ```
 Built an explainable Go database engine with WAL-backed LSM-tree storage, exact vector search,
 real networked HTTP node runtime, client-side consistent-hash routing, stateless proxy,
-explicit pull-based read replicas, and ops simulation tools — 700+ race-safe tests, reproducible
+explicit pull-based read replicas, and ops simulation tools — 865 race-safe tests, reproducible
 benchmarks at every phase.
 ```
 

@@ -1,6 +1,6 @@
 # ShardForgeDB — High-Level Architecture Design
 
-> **Status (Phase 21 — Truth Lock):** Phases 1–19 are complete. All storage components (WAL, MemTable, SSTable, Bloom, Engine, compaction), vector search, local simulations (sharding, replication, dashboard), real networked HTTP nodes, client-side routing gateway, stateless proxy, static cluster metadata, explicit pull-based read replicas v1, and ops simulation are implemented, tested, and benchmarked. See `docs/CLAIMS.md` for the authoritative list of safe and unsafe claims. See `docs/ROADMAP_DISTRIBUTED.md` for the path to real distributed features.
+> **Status (Phase 23 — Networked Node Trace API):** All 23 phases complete. Storage layer (WAL, MemTable, SSTable, Bloom, Engine, compaction), vector search, local simulations (sharding, replication, dashboard), real networked HTTP nodes, client-side routing gateway, stateless proxy, static cluster metadata, explicit pull-based read replicas, ops simulation, and the full runtime explainability system (local + networked) are implemented, tested, and benchmarked. 929 race-safe tests. See `docs/CLAIMS.md` for the authoritative list of safe and unsafe claims. See `docs/ROADMAP_DISTRIBUTED.md` for the path to future distributed features.
 >
 > **Historical note:** This file was written incrementally, phase by phase. Per-component "Known Limitations" sections below reflect the state at the time that phase was written. Where a limitation has since been resolved, it is annotated with the phase that resolved it.
 

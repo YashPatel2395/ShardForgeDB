@@ -2,7 +2,7 @@
 
 ## Overview
 
-ShardForgeDB is a ground-up Go database engine built layer-by-layer to be fully explainable at every level of the stack. Every design decision, data structure, trade-off, and benchmark result is documented alongside the code. The project is structured as a sequence of eighteen numbered phases, each building on the previous and producing its own tests, benchmarks, and documentation.
+ShardForgeDB is a ground-up Go database engine built layer-by-layer to be fully explainable at every level of the stack. Every design decision, data structure, trade-off, and benchmark result is documented alongside the code. The project is structured as a sequence of twenty-three phases, each building on the previous and producing its own tests, benchmarks, and documentation.
 
 The goal is not to compete with production databases. The goal is to demonstrate deep understanding of database internals — how LSM trees actually work, what makes replication hard, why compaction matters, how to design a real networked node transport — through working code that is honest about what it is and what it is not.
 
@@ -154,8 +154,10 @@ The design documents explicitly state these boundaries at every phase.
 - Implemented a client-side routing gateway (`shardforge-gateway`) with deterministic consistent-hash routing, virtual nodes, weight support, and per-node health/flush/compact fanout
 - Implemented a stateless HTTP routing proxy (`shardforge-proxy`) that exposes one HTTP/JSON API and routes requests to independent nodes; includes scope flags, no-failover proof, and Docker Compose integration
 - Implemented networked read replicas (`internal/replnet`): in-memory append-only mutation log with monotonic seq numbers, explicit pull-based follower sync, follower write rejection (403), 4 node endpoints + 2 proxy admin endpoints, Docker Compose 1-primary+2-replica demo
-- 650+ tests across all packages, race-safe, with reproducible benchmark results documented at every phase
-- Full documentation: DESIGN.md (architecture), PROOF.md (per-phase evidence), BENCHMARKS.md (reproducible numbers)
+- Implemented ops simulation layer (`internal/ops`): health checks, failure impact simulation, manual rebalance planning — all pure computation, no automatic failover, no data movement
+- Built a runtime explainability system: `ExplainGet/Put/Delete/Scan` (engine) and `ExplainUpsert/Search/Delete` (vector) produce real per-operation execution traces (WAL_APPEND, MEMTABLE_HIT, BLOOM_CHECK, SSTABLE_HIT, etc.); `shardforge explain` CLI for local use; HTTP `/explain/*` endpoints and `shardforge explain-node` CLI for networked nodes — every step produced by real code, no fabricated output
+- 929 race-safe tests across 27 packages, 120+ reproducible benchmarks at every phase
+- Full documentation: DESIGN.md (architecture), PROOF.md (per-phase evidence), BENCHMARKS.md (reproducible numbers), CLAIMS.md (safe/forbidden claims audit), ARCHITECTURE.md (layered diagrams + data flows)
 
 ---
 
@@ -194,6 +196,49 @@ internal/ops — operations simulation layer
   ├── health.go     — CheckClusterHealth: HTTP /healthz polling
   ├── simulate.go   — RouteKey, RouteKeyWithAvailableNodes, SimulateFailure
   └── rebalance.go  — PlanManualRebalance, buildGateway
+```
+
+## Phase 21–23 Addition
+
+Added runtime explainability layer:
+
+**Phase 21 — Trace Foundation:**
+- `internal/trace` — typed trace package: `Trace`, `TraceStep`, `StepType`, `Component`, `OperationType`, `Status`
+- `docs/CLAIMS.md` — three-section claims audit (Safe / Unsafe / Future)
+- `docs/ROADMAP_DISTRIBUTED.md` — path to real distributed features
+- Fixed stale documentation across all design docs
+
+**Phase 22 — Runtime Operation Traces:**
+- `engine.ExplainGet/Put/Delete/Scan` — real execution traces from the actual LSM-tree read/write paths
+- `vector.ExplainUpsert/Search/Delete` — real execution traces from vector operations
+- `shardforge explain` CLI — local explain mode with `--data-dir`
+
+**Phase 23 — Networked Node Trace API:**
+- HTTP `/explain/put`, `/explain/get`, `/explain/delete`, `/explain/scan` endpoints on every node
+- `node.Client.ExplainPut/Get/Delete/Scan` — typed client methods
+- `shardforge explain-node` CLI — calls any running node over HTTP, returns real execution trace
+- Total: 929 race-safe tests, 120+ benchmarks across all 23 phases
+
+**Architecture map addition:**
+```
+internal/trace — trace type package (Phase 21)
+  └── types.go — Trace, TraceStep, StepType, Component, OperationType, Status
+
+internal/engine — Phase 22 additions
+  ├── ExplainGet   — MEMTABLE_MISS/HIT, BLOOM_CHECK/SKIP, SSTABLE_HIT/MISS per SSTable
+  ├── ExplainPut   — WAL_APPEND, MEMTABLE_PUT
+  ├── ExplainDelete — WAL_APPEND, MEMTABLE_DELETE
+  └── ExplainScan  — SCAN_SOURCE per layer, SCAN_MERGE
+
+internal/node — Phase 23 additions
+  ├── POST /explain/put    → engine.ExplainPut (real write path)
+  ├── GET  /explain/get    → engine.ExplainGet (real read path)
+  ├── DELETE /explain/delete → engine.ExplainDelete (real delete path)
+  └── GET  /explain/scan   → engine.ExplainScan (real scan path)
+
+cmd/shardforge — explain + explain-node subcommands
+  ├── explain put/get/delete/scan — local engine explain mode
+  └── explain-node put/get/delete/scan --addr <node-url> — HTTP node explain mode
 ```
 
 Honest claim: "Implemented failure visibility and manual rebalance simulation tools that show node health, routing impact, and key movement plans for static cluster configs."

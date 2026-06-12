@@ -2,10 +2,12 @@
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer toward a real distributed system. Every phase is strictly documented, tested, and benchmarked. Every claim is audited.
 
-> **Phase 21 — Truth Lock + Trace Foundation.** Phases 1–19 complete and locked.
-> Phase 21 adds: `docs/CLAIMS.md` (safe/unsafe/future claims audit), `docs/ROADMAP_DISTRIBUTED.md` (Phases 15–27 toward real distributed features), `internal/trace` (trace types for future operation tracing), `docs/TRACE_DESIGN.md`, and fixes all stale documentation.
+> **Phase 23 — Networked Node Trace API.** Phases 1–23 complete and locked.
+> Phase 23 adds HTTP `/explain/*` endpoints to every node, typed `explain*` methods to `node.Client`, and the `shardforge explain-node` CLI — completing the full runtime explainability system across both local and networked execution paths.
+> Phase 22 adds `ExplainGet/Put/Delete/Scan` (engine) + `ExplainUpsert/Search/Delete` (vector) + `shardforge explain` CLI.
+> Phase 21 adds `internal/trace` type package, claims audit, and stale-doc fixes.
 >
-> **Final target:** ShardForgeDB — a real explainable distributed database engine for key-value and vector search workloads. See `docs/ROADMAP_DISTRIBUTED.md`.
+> **929 race-safe tests. 120+ reproducible benchmarks. All 23 phases complete.**
 
 ---
 
@@ -465,11 +467,25 @@ make node-demo-down
 - [x] `docs/CLAIMS.md` — three-section claims audit: Safe (proven by code), Unsafe (must never claim), Future (requires future phases)
 - [x] `docs/ROADMAP_DISTRIBUTED.md` — Phases 15–27 defining the path to real distributed features
 - [x] `internal/trace` — trace types: `Trace`, `TraceStep`, `OperationType`, `Component`, `StepType`, `Status`
-- [x] `docs/TRACE_DESIGN.md` — trace philosophy, types, Phase 15 integration plan
-- [x] Fixed stale statements in `docs/DESIGN.md` (ANN/HNSW claimed; levelled compaction claimed; WAL "not yet wired")
+- [x] `docs/TRACE_DESIGN.md` — trace philosophy, types, integration plan
+- [x] Fixed stale statements in `docs/DESIGN.md`
 - [x] Added summary table to `docs/PROOF.md`
 - [x] 22 tests in `internal/trace`
-- [x] **Types only** — trace wiring into engine is Phase 15
+
+**Phase 22 — Runtime Operation Traces** ✓ locked
+
+- [x] `engine.ExplainGet` / `ExplainPut` / `ExplainDelete` / `ExplainScan` — real per-op traces (WAL_APPEND, MEMTABLE_HIT, BLOOM_CHECK, SSTABLE_HIT, etc.)
+- [x] `vector.ExplainUpsert` / `ExplainSearch` / `ExplainDelete` — real per-op traces (VECTOR_UPSERT, VECTOR_SEARCH_EXACT, etc.)
+- [x] `shardforge explain` CLI — local explain mode (`put`, `get`, `delete`, `scan`, `vector-upsert`, `vector-search`)
+- [x] 40 new tests in `internal/engine` + `internal/vector`
+
+**Phase 23 — Networked Node Trace API** ✓ locked
+
+- [x] `POST /explain/put`, `GET /explain/get`, `DELETE /explain/delete`, `GET /explain/scan` — HTTP explain endpoints on every node
+- [x] `node.Client.ExplainPut` / `ExplainGet` / `ExplainDelete` / `ExplainScan` — typed client methods
+- [x] `shardforge explain-node` CLI — calls any live node over HTTP, prints real execution trace
+- [x] 24 new tests in `internal/node` + `cmd/shardforge`
+- [x] **929 total tests across 27 packages, race detector on every run**
 
 ---
 

@@ -1,6 +1,6 @@
 # ShardForgeDB — Claims Audit
 
-**Phase 23 — Networked Node Trace API + Node Runtime Hardening**
+**Phase 24 — Reproducible Multi-Node Local Cluster Demo**
 
 This file is the authoritative record of what ShardForgeDB can and cannot claim. All documentation, README copy, demo scripts, and recruiter materials must comply with this list. If a claim does not appear in Section A, it must not be made.
 
@@ -35,6 +35,7 @@ The following are accurate, honest descriptions of what exists in the codebase w
 | Networked single-node trace API (HTTP) | `internal/node` — `POST /explain/put`, `GET /explain/get`, `DELETE /explain/delete`, `GET /explain/scan` call real `engine.Explain*` paths; `node.Client.ExplainGet/Put/Delete/Scan`; `shardforge explain-node` CLI; single-node HTTP only |
 | 929 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 929 passing tests, 23 packages with test files, 4 packages with no test files (`cmd/shardforge-bench`, `cmd/shardforge-dashboard`, `cmd/shardforge-node`, `internal/storage`) |
 | Reproducible benchmarks | `make bench-*` targets, results in `docs/BENCHMARKS.md` |
+| Reproducible local three-node HTTP cluster demo with static routing | `scripts/demo_cluster_{up,smoke,down}.sh` — 3 independent HTTP nodes + stateless proxy, FNV-1a routing, separate data dirs, data isolation proven; `configs/cluster/demo-3node.json`; `make cluster-demo-{up,smoke,down}`; see `docs/DEMO.md` |
 
 ---
 

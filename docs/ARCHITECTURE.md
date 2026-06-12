@@ -222,3 +222,35 @@ SimulateFailure(cfg, {downNodeIDs, sampleKeys})
 | Proxy no-retry policy | Without replication, retrying to another node would silently miss data |
 | Local simulations only | `internal/shard`, `internal/replica`, `internal/dashboard` use in-process engines; no cross-node networking |
 | No distributed tracing | Explain traces cover a single node's execution path only; no cross-node trace propagation |
+
+---
+
+## Phase 24 — Local Cluster Demo Infrastructure
+
+Phase 24 adds reproducible local cluster demo scripts and tests on top of the existing networked node runtime and proxy. No new runtime packages were added.
+
+```
+configs/cluster/demo-3node.json   ← Phase 24 demo cluster config
+  │ 3 nodes (node-1/9101, node-2/9102, node-3/9103) + proxy/9200
+  │ scope: no_raft, no_consensus, no_failover, no_replication, no_shard_migration
+  ▼
+scripts/demo_cluster_up.sh     ← start nodes + proxy as local processes
+scripts/demo_cluster_smoke.sh  ← 18-check smoke: health, routing, put/get, isolation, explain
+scripts/demo_cluster_down.sh   ← stop processes, remove data dirs
+
+Routing (pure ring, no network call):
+  ./bin/shardforge-gateway --config configs/cluster/demo-3node.json route user:1
+  → key="user:1" → node_id=node-2  base_url=http://127.0.0.1:9102
+
+Data isolation (each node independent, no replication):
+  Write to node-1 → readable on node-1, NOT on node-2 or node-3 (404)
+
+explain-node across the cluster:
+  ./bin/shardforge explain-node --addr http://127.0.0.1:9101 put mykey myval
+  → WAL_APPEND, MEMTABLE_PUT steps from real engine code on node-1
+```
+
+**Scope:** This is a local demo with static routing. Not a real distributed cluster.
+- No Raft, no consensus, no quorum replication.
+- No automatic failover, no shard migration, no dynamic membership.
+- See `docs/DEMO.md` for the full demo guide and honest limitations.

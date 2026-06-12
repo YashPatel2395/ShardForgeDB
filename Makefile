@@ -16,7 +16,7 @@ CLUSTER_CMD      := ./cmd/shardforge-cluster
 GO               := go
 GOFLAGS          :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-replnet bench-ops bench-trace bench-report dashboard node node-demo node-demo-down replica-demo replica-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example replica-config-demo replica-status-demo ops-health-demo ops-simulate-failure-demo ops-rebalance-plan-demo smoke demo release-check final-smoke cluster-demo-up cluster-demo-smoke cluster-demo-down help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-replnet bench-ops bench-trace bench-report dashboard node node-demo node-demo-down replica-demo replica-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example replica-config-demo replica-status-demo ops-health-demo ops-simulate-failure-demo ops-rebalance-plan-demo smoke demo release-check final-smoke cluster-demo-up cluster-demo-smoke cluster-demo-down repl-demo-up repl-demo-smoke repl-demo-down help
 
 all: fmt vet build
 
@@ -218,6 +218,18 @@ cluster-demo-smoke:
 ## cluster-demo-down: Phase 24 — stop cluster demo processes and remove demo data directories
 cluster-demo-down:
 	./scripts/demo_cluster_down.sh
+
+## repl-demo-up: Phase 25 — start leader+follower replication demo (2 HTTP nodes, no Docker)
+repl-demo-up:
+	./scripts/repl_demo_up.sh
+
+## repl-demo-smoke: Phase 25 — run replication demo smoke test (14 checks: put/pull/delete/idempotent/error)
+repl-demo-smoke:
+	./scripts/repl_demo_smoke.sh
+
+## repl-demo-down: Phase 25 — stop replication demo processes and remove demo data directories
+repl-demo-down:
+	./scripts/repl_demo_down.sh
 
 ## clean: remove build artifacts
 clean:

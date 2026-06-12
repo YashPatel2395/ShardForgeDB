@@ -41,8 +41,9 @@ The project is not a production database. It is an explainable, deeply documente
 | 22 | `internal/engine`, `internal/vector`, `cmd/shardforge` | Runtime operation traces: `ExplainGet/Put/Delete/Scan`, vector `ExplainUpsert/Search/Delete`, `shardforge explain` CLI | 40 | — |
 | 23 | `internal/node`, `cmd/shardforge` | HTTP explain endpoints, `node.Client` explain methods, `shardforge explain-node` CLI | 24 | — |
 | 24 | `configs/cluster/`, `scripts/demo_cluster_*.sh`, `docs/DEMO.md`, `internal/cluster/demo_test.go` | Reproducible local 3-node cluster demo: up/smoke/down scripts, key placement proof, data isolation proof, 13 new cluster tests | 13 | — |
+| 25 | `configs/replication/`, `scripts/repl_demo_*.sh`, `internal/node` (SyncResult, Client.SyncReplication), `internal/node/replication_phase25_test.go`, `internal/cluster/replication_demo_test.go` | Networked pull-based replication demo: leader+follower HTTP nodes, explicit pull via POST /replication/sync, PUT+DELETE replication, idempotent pull, role enforcement, 20 new tests | 20 | — |
 
-**Total tests:** 942
+**Total tests:** 962
 **Total benchmarks:** 120+
 **Packages with tests:** 23 of 27
 
@@ -123,6 +124,6 @@ The trace system works only because each `Explain*` method mirrors the exact exe
 
 ## Release status
 
-All 24 phases complete. `make release-check` passes. `make final-smoke` passes 33/33. `go test -race -count=1 ./...` → 942 tests pass across 23 packages.
+All 25 phases complete. `make release-check` passes. `make final-smoke` passes 34/34. `go test -race -count=1 ./...` → 962 tests pass across 23 packages.
 
 The project is suitable for portfolio presentation, technical interviews, and as a reference implementation for database internals education. It is not suitable for production use.

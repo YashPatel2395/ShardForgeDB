@@ -405,7 +405,10 @@ func (s *Server) handleExplainScan(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleReplicationSync serves POST /replication/sync.
-// Triggers a pull-based sync from the primary. Only valid for follower nodes.
+// Triggers an explicit pull-based sync from the configured primary.
+// Only valid for follower nodes. Returns a SyncResult with fetched/applied counts.
+//
+// Scope: explicit operator-triggered pull only. No background loop, no quorum, no Raft.
 func (s *Server) handleReplicationSync(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -416,14 +419,29 @@ func (s *Server) handleReplicationSync(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, "sync is only valid for follower nodes")
 		return
 	}
-	status, err := s.SyncFromPrimary(r.Context())
+	result, err := s.SyncFromPrimary(r.Context())
 	if err != nil {
-		s.writeError(w, http.StatusBadGateway, "sync failed: "+err.Error())
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"ok":               false,
+			"node_id":          s.opts.NodeID,
+			"source_node":      result.SourceNode,
+			"follower_node":    result.FollowerNode,
+			"fetched":          result.Fetched,
+			"applied":          result.Applied,
+			"last_applied_seq": result.LastAppliedSeq,
+			"replication":      result.Replication,
+			"error":            err.Error(),
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":          true,
-		"node_id":     s.opts.NodeID,
-		"replication": status,
+		"ok":               true,
+		"node_id":          s.opts.NodeID,
+		"source_node":      result.SourceNode,
+		"follower_node":    result.FollowerNode,
+		"fetched":          result.Fetched,
+		"applied":          result.Applied,
+		"last_applied_seq": result.LastAppliedSeq,
+		"replication":      result.Replication,
 	})
 }

@@ -1,0 +1,50 @@
+{
+  "version": "v1",
+  "name": "phase-25-replication-demo",
+  "description": "Phase 25 — Networked Pull-Based Replication Demo. One leader (primary) node, one follower (replica) node. Explicit pull-based replication only. NOT Raft, NOT consensus, NOT quorum, NOT automatic failover, NOT background sync.",
+  "routing": {
+    "algorithm": "fnv1a-consistent-hash",
+    "virtual_nodes": 128
+  },
+  "proxy": {
+    "enabled": false,
+    "addr": "127.0.0.1:9200"
+  },
+  "nodes": [
+    {
+      "id": "leader",
+      "base_url": "http://127.0.0.1:9301",
+      "addr": "127.0.0.1:9301",
+      "data_dir": "/tmp/sfdb-repl-leader",
+      "weight": 1,
+      "replication": {
+        "enabled": true,
+        "role": "primary"
+      }
+    },
+    {
+      "id": "follower",
+      "base_url": "http://127.0.0.1:9302",
+      "addr": "127.0.0.1:9302",
+      "data_dir": "/tmp/sfdb-repl-follower",
+      "weight": 1,
+      "replication": {
+        "enabled": true,
+        "role": "follower",
+        "primary": "leader"
+      }
+    }
+  ],
+  "scope": {
+    "static_config_only": true,
+    "no_dynamic_membership": true,
+    "no_discovery": true,
+    "no_consensus": true,
+    "no_raft": true,
+    "no_replication": false,
+    "no_quorum_replication": true,
+    "no_failover": true,
+    "no_shard_migration": true,
+    "no_distributed_txns": true
+  }
+}

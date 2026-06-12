@@ -2,12 +2,12 @@
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer toward a real distributed system. Every phase is strictly documented, tested, and benchmarked. Every claim is audited.
 
-> **Phase 24 — Reproducible Multi-Node Local Cluster Demo.** Phases 1–24 complete and locked.
-> Phase 24 adds a clean, reproducible 3-node local cluster demo: independent HTTP nodes, stateless proxy, FNV-1a routing, data isolation proof, key placement proof, and `explain-node` over HTTP.
+> **Phase 25 — Networked Pull-Based Replication Demo.** Phases 1–25 complete and locked.
+> Phase 25 adds a reproducible leader+follower HTTP replication demo: explicit pull via `POST /replication/sync`, PUT+DELETE replication proven, idempotent pull proven, follower write-rejection proven.
+> Phase 24 adds a 3-node local cluster demo: independent HTTP nodes, stateless proxy, FNV-1a routing, data isolation proof.
 > Phase 23 adds HTTP `/explain/*` node endpoints and `shardforge explain-node` CLI.
-> Phase 22 adds `ExplainGet/Put/Delete/Scan` engine traces and `shardforge explain` CLI.
 >
-> **942 race-safe tests. 120+ reproducible benchmarks. All 24 phases complete.**
+> **962 race-safe tests. 120+ reproducible benchmarks. All 25 phases complete.**
 
 ---
 
@@ -497,6 +497,19 @@ make node-demo-down
 - [x] `make cluster-demo-{up,smoke,down}` — Makefile targets
 - [x] 13 new tests in `internal/cluster/demo_test.go` — config validity, unique IDs/addrs/dirs, scope flags, deterministic routing, known key routes, invalid config rejection
 - [x] **942 total tests (929 + 13)**
+
+**Phase 25 — Networked Pull-Based Replication Demo** ✓ locked
+
+- [x] `configs/replication/demo-leader-follower.json` — leader+follower replication config (leader/9301, follower/9302); `no_raft=true`, `no_quorum_replication=true`
+- [x] `scripts/repl_demo_up.sh` — start leader (primary) + follower as local HTTP processes, wait for health
+- [x] `scripts/repl_demo_smoke.sh` — 16-check smoke: health, PUT to leader, isolation before pull, explicit pull, value on follower, idempotent pull, DELETE replication, follower role enforcement, scope flags
+- [x] `scripts/repl_demo_down.sh` — stop all processes, clean data directories
+- [x] `make repl-demo-{up,smoke,down}` — Makefile targets
+- [x] Richer `POST /replication/sync` response: `fetched`, `applied`, `last_applied_seq`, `source_node`, `follower_node`
+- [x] `SyncResult` type in `internal/node` — returned by `SyncFromPrimary` and HTTP handler
+- [x] `Client.SyncReplication()` method in `node.Client`
+- [x] 20 new tests — 8 in `internal/node` (DELETE replication, idempotency, unavailable primary, cursor advancement, SyncResult counts, distinct data dirs, in-memory cursor) + 12 in `internal/cluster` (config validity, scope flags, leader/follower roles, deterministic routing, invalid config rejection)
+- [x] **962 total tests (942 + 20)**
 
 ---
 

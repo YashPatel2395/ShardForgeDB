@@ -261,3 +261,83 @@ The following claims are NOT safe and must not be made:
 - "Shard migration"
 - "Dynamic cluster membership"
 - "Distributed tracing"
+
+---
+
+## Phase 25 — Networked Pull-Based Replication Demo
+
+Phase 25 adds a reproducible leader+follower HTTP replication demo. See scripts and config below.
+
+### Scope
+
+| What it IS | What it is NOT |
+|---|---|
+| Explicit pull-based replication | Raft or consensus replication |
+| Operator-triggered sync | Automatic background sync |
+| PUT and DELETE mutation replication | Quorum replication |
+| Idempotent pull (safe to re-run) | Leader election |
+| Follower write rejection (403) | Automatic failover |
+| Real HTTP node processes | Shared memory / same process |
+| In-memory replication cursor | Persistent replication cursor |
+
+### Quick start
+
+```bash
+make repl-demo-up
+make repl-demo-smoke
+make repl-demo-down
+```
+
+### Manual demo sequence
+
+```bash
+# Start leader and follower
+./scripts/repl_demo_up.sh
+
+# Write to leader
+curl -X PUT http://127.0.0.1:9301/kv/hello \
+  -H 'Content-Type: application/json' \
+  -d '{"value":"world"}'
+
+# Confirm follower does NOT have it yet (no auto-sync)
+curl http://127.0.0.1:9302/kv/hello
+# → {"found":false,"key":"hello","node_id":"follower"}
+
+# Explicit pull (operator-triggered)
+curl -X POST http://127.0.0.1:9302/replication/sync
+# → {"ok":true,"fetched":1,"applied":1,"last_applied_seq":1,
+#    "source_node":"http://127.0.0.1:9301","follower_node":"follower",...}
+
+# Confirm follower now has the key
+curl http://127.0.0.1:9302/kv/hello
+# → {"found":true,"key":"hello","value":"world","node_id":"follower"}
+
+# Second pull is idempotent
+curl -X POST http://127.0.0.1:9302/replication/sync
+# → {"ok":true,"fetched":0,"applied":0,"last_applied_seq":1,...}
+
+# Tear down
+./scripts/repl_demo_down.sh
+```
+
+### Replication cursor
+
+The follower's replication cursor (`last_applied_seq`) is **in-memory only**.
+
+- It resets to 0 on follower restart.
+- After restart, the next sync will re-apply all mutations from seq 1 onward.
+- This is safe because `ApplyReplicationEntries` is idempotent for already-seen seqs.
+
+> "Replication cursor is demo-scoped and not production durable."
+
+### Safe claim (Phase 25)
+
+> "Networked explicit pull-based replication demo between HTTP nodes."
+
+### Still unsafe
+
+- Automatic replication, background sync
+- Raft, consensus, quorum replication
+- Persistent replication cursor
+- Leader election, automatic failover
+- Distributed transactions, distributed tracing

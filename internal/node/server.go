@@ -260,17 +260,50 @@ func (s *Server) ApplyReplicationEntries(entries []replnet.Entry) (uint64, error
 
 // SyncFromPrimary pulls new entries from the primary and applies them locally.
 // Only valid for follower nodes; returns an error for primary and standalone nodes.
-func (s *Server) SyncFromPrimary(ctx context.Context) (replnet.ReplicaStatus, error) {
+//
+// The returned SyncResult reports how many entries were fetched and how many were
+// newly applied. Re-running SyncFromPrimary is idempotent: already-applied entries
+// are skipped and Applied will be 0 when there is nothing new.
+func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 	if s.replicator == nil {
-		return replnet.ReplicaStatus{}, fmt.Errorf("node: SyncFromPrimary called on non-follower node")
+		return SyncResult{}, fmt.Errorf("node: SyncFromPrimary called on non-follower node")
 	}
-	after := atomic.LoadUint64(&s.lastApplied)
-	entries, err := s.replicator.PullEntries(ctx, after, 0)
+	before := atomic.LoadUint64(&s.lastApplied)
+	entries, err := s.replicator.PullEntries(ctx, before, 0)
 	if err != nil {
-		return s.ReplicationStatus(), fmt.Errorf("node: pull from primary: %w", err)
+		return SyncResult{
+			SourceNode:     s.opts.Replication.PrimaryBaseURL,
+			FollowerNode:   s.opts.NodeID,
+			LastAppliedSeq: before,
+			Replication:    s.ReplicationStatus(),
+		}, fmt.Errorf("node: pull from primary: %w", err)
 	}
-	if _, err := s.ApplyReplicationEntries(entries); err != nil {
-		return s.ReplicationStatus(), err
+
+	fetched := len(entries)
+	lastSeq, err := s.ApplyReplicationEntries(entries)
+	if err != nil {
+		return SyncResult{
+			SourceNode:     s.opts.Replication.PrimaryBaseURL,
+			FollowerNode:   s.opts.NodeID,
+			Fetched:        fetched,
+			LastAppliedSeq: lastSeq,
+			Replication:    s.ReplicationStatus(),
+		}, err
 	}
-	return s.ReplicationStatus(), nil
+
+	// Count entries actually applied (seq > before), not just fetched.
+	applied := 0
+	for _, e := range entries {
+		if e.Seq > before {
+			applied++
+		}
+	}
+	return SyncResult{
+		SourceNode:     s.opts.Replication.PrimaryBaseURL,
+		FollowerNode:   s.opts.NodeID,
+		Fetched:        fetched,
+		Applied:        applied,
+		LastAppliedSeq: lastSeq,
+		Replication:    s.ReplicationStatus(),
+	}, nil
 }

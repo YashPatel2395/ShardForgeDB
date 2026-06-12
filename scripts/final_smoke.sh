@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/final_smoke.sh — Phase 24 final smoke validation
+# scripts/final_smoke.sh — Phase 25 final smoke validation
 # Runs the full acceptance gate for portfolio launch readiness.
 # No Docker required. No network calls. Pure local validation.
 set -eu
@@ -34,7 +34,7 @@ ok "go vet ./... passes"
 echo ""
 echo "-- Tests (race detector)"
 go test -race -count=1 ./...
-ok "go test -race -count=1 ./... passes (942 tests)"
+ok "go test -race -count=1 ./... passes (962 tests)"
 
 # ── Build ─────────────────────────────────────────────────────────────
 echo ""
@@ -118,6 +118,9 @@ ok "configs/local-failure-sim-3node.json validates"
 
 ./bin/shardforge-cluster validate configs/cluster/demo-3node.json
 ok "configs/cluster/demo-3node.json validates"
+
+./bin/shardforge-cluster validate configs/replication/demo-leader-follower.json
+ok "configs/replication/demo-leader-follower.json validates"
 
 # ── Ops simulation (no live nodes required) ───────────────────────────
 echo ""

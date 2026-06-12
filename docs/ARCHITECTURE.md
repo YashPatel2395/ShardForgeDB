@@ -254,3 +254,46 @@ explain-node across the cluster:
 - No Raft, no consensus, no quorum replication.
 - No automatic failover, no shard migration, no dynamic membership.
 - See `docs/DEMO.md` for the full demo guide and honest limitations.
+
+---
+
+## Phase 25 — Networked Pull-Based Replication Demo
+
+Phase 25 adds a reproducible leader+follower HTTP replication demo on top of the existing `internal/replnet` and `internal/node` infrastructure. No new runtime packages were added.
+
+```
+configs/replication/demo-leader-follower.json   ← Phase 25 replication demo config
+  │ 2 nodes: leader/9301 (primary) + follower/9302 (follower)
+  │ scope: no_raft=true, no_consensus=true, no_quorum_replication=true, no_failover=true
+  ▼
+scripts/repl_demo_up.sh     ← start leader + follower as local HTTP processes
+scripts/repl_demo_smoke.sh  ← 16-check smoke: health, put, isolation, pull, delete, idempotency
+scripts/repl_demo_down.sh   ← stop processes, remove data dirs
+
+Replication endpoints (already present in internal/node since Phase 18):
+  GET  /replication/log?after=<seq>&limit=<n>   ← leader: serves mutation log
+  POST /replication/sync                         ← follower: explicit pull from primary
+  POST /replication/apply                        ← follower: apply entries from body
+  GET  /replication/status                       ← any node: replication state
+
+Phase 25 additions to internal/node:
+  SyncResult type          ← fetched, applied, last_applied_seq, source_node, follower_node
+  SyncFromPrimary returns  ← SyncResult (was replnet.ReplicaStatus)
+  Client.SyncReplication() ← calls POST /replication/sync, returns *SyncResult
+
+Explicit pull proof:
+  1. PUT key to leader → leader log has seq=1
+  2. GET key from follower → {"found":false} (no auto-sync)
+  3. POST /replication/sync → {"fetched":1,"applied":1,"last_applied_seq":1}
+  4. GET key from follower → value present
+  5. Second POST /replication/sync → {"fetched":0,"applied":0} (idempotent)
+  6. DELETE key on leader → leader log has seq=2
+  7. POST /replication/sync → {"fetched":1,"applied":1}
+  8. GET key from follower → {"found":false} (tombstone applied)
+```
+
+**Scope:** Explicit, operator-triggered pull replication. Not automatic. Not distributed consensus.
+- No Raft, no consensus, no quorum replication, no automatic failover.
+- Replication cursor (`lastApplied`) is in-memory only — not persisted across restarts.
+- Follower rejects client PUT/DELETE with 403.
+- See `docs/DEMO.md` for the full demo guide.

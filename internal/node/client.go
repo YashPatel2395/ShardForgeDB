@@ -122,6 +122,19 @@ func (c *Client) Compact(ctx context.Context) error {
 	return nil
 }
 
+// SyncReplication calls POST /replication/sync on a follower node, triggering an
+// explicit pull from the configured primary. Returns the SyncResult with fetched,
+// applied, and last_applied_seq counts.
+//
+// Scope: explicit operator-triggered pull only. No background loop, no Raft, no quorum.
+func (c *Client) SyncReplication(ctx context.Context) (*SyncResult, error) {
+	var result SyncResult
+	if err := c.doJSON(ctx, http.MethodPost, "/replication/sync", nil, &result); err != nil {
+		return nil, fmt.Errorf("node client: sync replication: %w", err)
+	}
+	return &result, nil
+}
+
 // ExplainPut calls POST /explain/put and returns the execution trace for a PUT.
 func (c *Client) ExplainPut(ctx context.Context, key, value []byte) (*ExplainPutResponse, error) {
 	body := explainPutRequest{Key: string(key), Value: string(value)}

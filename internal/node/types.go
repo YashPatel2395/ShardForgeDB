@@ -136,6 +136,27 @@ type explainPutRequest struct {
 	Value string `json:"value"`
 }
 
+// SyncResult is returned by SyncFromPrimary and POST /replication/sync.
+// It reports how many entries were fetched from the primary and how many
+// were newly applied (skipping already-applied entries).
+//
+// Scope: explicit pull-based replication only. No background sync, no quorum, no Raft.
+type SyncResult struct {
+	// SourceNode is the HTTP base URL of the primary this follower pulled from.
+	SourceNode string `json:"source_node"`
+	// FollowerNode is the node_id of this follower.
+	FollowerNode string `json:"follower_node"`
+	// Fetched is the total number of entries returned by the primary.
+	Fetched int `json:"fetched"`
+	// Applied is the number of entries newly written to the local engine.
+	// Applied <= Fetched. Already-applied entries are skipped (idempotent).
+	Applied int `json:"applied"`
+	// LastAppliedSeq is the follower's replication cursor after this sync.
+	LastAppliedSeq uint64 `json:"last_applied_seq"`
+	// Replication is the full replica status snapshot after the sync.
+	Replication replnet.ReplicaStatus `json:"replication"`
+}
+
 // ExplainPutResponse is the JSON body returned by POST /explain/put.
 type ExplainPutResponse struct {
 	NodeID    string       `json:"node_id"`

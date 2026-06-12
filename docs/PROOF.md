@@ -31,6 +31,7 @@ This file records the evidence that each phase was implemented correctly and pas
 | 22 | `engine/explain`, `vector/explain`, CLI | COMPLETE | 40 new (905 total) | — | Single-node only; no distributed traces |
 | 23 | `node/explain endpoints`, `node/client`, `shardforge explain-node` | COMPLETE | 24 new (929 total) | — | Single-node HTTP only; no cross-node trace propagation |
 | 24 | `configs/cluster/demo-3node.json`, `scripts/demo_cluster_*.sh`, `docs/DEMO.md` | COMPLETE | 13 new (942 total) | — | Local demo only; no Raft; no failover; no shard migration |
+| 25 | `configs/replication/demo-leader-follower.json`, `scripts/repl_demo_*.sh`, `SyncResult` type | COMPLETE | 20 new (962 total) | — | Explicit pull-based only; in-memory cursor; no Raft; no quorum |
 
 **Validation command (all phases):**
 ```bash
@@ -4250,4 +4251,159 @@ SCOPE: Static routing, no Raft, no consensus, no failover, no shard migration.
   Failed: 0
 
 All checks passed. Phase 24 local cluster demo is working correctly.
+```
+
+---
+
+## Phase 25 — Networked Pull-Based Replication Demo
+
+Phase 25 adds a reproducible networked pull-based replication demo between real ShardForgeDB HTTP node processes. One leader (primary) node and one follower (replica) node run as independent OS processes with separate data directories, communicating exclusively over HTTP/JSON.
+
+**Scope:** NOT Raft, NOT consensus, NOT quorum, NOT automatic failover, NOT background sync. Explicit operator-triggered pull only.
+
+### New artifacts
+
+- `configs/replication/demo-leader-follower.json` — Phase 25 replication demo config (leader/9301, follower/9302)
+- `scripts/repl_demo_up.sh` — start leader + follower as local background processes, wait for health
+- `scripts/repl_demo_smoke.sh` — 16-check smoke: health, PUT, isolation, explicit pull, DELETE, idempotency, role enforcement, scope flags
+- `scripts/repl_demo_down.sh` — stop all processes, remove demo data dirs
+- `internal/node`: `SyncResult` type, updated `SyncFromPrimary` return type, `Client.SyncReplication()`
+- `internal/node/replication_phase25_test.go` — 8 new tests
+- `internal/cluster/replication_demo_test.go` — 12 new tests
+
+### Replication cursor behavior
+
+The follower tracks `lastApplied` (a `uint64` atomic) in memory. It is **not** persisted to disk. This is the documented, honest behavior:
+
+> "Replication cursor is demo-scoped and not production durable. After a follower restart, the cursor resets to 0 and the next sync will re-apply all mutations from the primary."
+
+`TestPhase25_ReplDemoConfig_ReplicationCursorIsInMemory` explicitly verifies this behavior.
+
+### PUT replication proof
+
+```
+1. PUT repl:smoke=hello-replication to leader
+   → leader log: seq=1, op=put, key=repl:smoke
+2. GET repl:smoke from follower → {"found":false}   (no auto-sync)
+3. POST /replication/sync on follower
+   → {"ok":true,"fetched":1,"applied":1,"last_applied_seq":1,
+      "source_node":"http://127.0.0.1:9301","follower_node":"follower"}
+4. GET repl:smoke from follower → {"found":true,"value":"hello-replication"}
+```
+
+### DELETE/tombstone replication proof
+
+```
+5. DELETE repl:smoke on leader
+   → leader log: seq=2, op=delete, key=repl:smoke
+6. GET repl:smoke from follower → {"found":true}   (no auto-sync; still has it)
+7. POST /replication/sync on follower
+   → {"ok":true,"fetched":1,"applied":1,"last_applied_seq":2}
+8. GET repl:smoke from follower → {"found":false}   (tombstone applied)
+```
+
+### Idempotent pull proof
+
+```
+9. POST /replication/sync (second call, nothing new on primary)
+   → {"ok":true,"fetched":0,"applied":0,"last_applied_seq":2}
+   No duplicate writes. Follower state unchanged.
+```
+
+### Follower role enforcement
+
+```
+GET /replication/log on follower → {"error":"replication log is only available on primary nodes"}
+PUT /kv/any-key on follower → {"error":"follower: writes are not accepted; this node is a read replica"} (403)
+```
+
+### Scope flags (configs/replication/demo-leader-follower.json)
+
+```json
+"scope": {
+  "no_raft": true,
+  "no_consensus": true,
+  "no_quorum_replication": true,
+  "no_failover": true,
+  "no_shard_migration": true,
+  "no_distributed_txns": true,
+  "no_replication": false
+}
+```
+
+`no_replication=false` is intentional: replication IS present. `no_quorum_replication=true` asserts it is pull-based only — no Raft, no quorum, no automatic failover election.
+
+### New tests (20 total)
+
+**`internal/node/replication_phase25_test.go`** (8 tests):
+- `TestPhase25_FollowerSync_AppliesDelete`
+- `TestPhase25_FollowerSync_SecondPullIsIdempotent`
+- `TestPhase25_FollowerSync_UnavailablePrimary_ReturnsBadGateway`
+- `TestPhase25_HandleReplicationSync_UnavailablePrimary_Returns502`
+- `TestPhase25_FollowerCursorAdvancesAfterSync`
+- `TestPhase25_SyncResult_IncludesFetchedAndAppliedCounts`
+- `TestPhase25_LeaderAndFollower_DistinctDataDirs`
+- `TestPhase25_ReplDemoConfig_ReplicationCursorIsInMemory`
+
+**`internal/cluster/replication_demo_test.go`** (12 tests):
+- `TestPhase25_ReplDemoConfig_LoadsAndValidates`
+- `TestPhase25_ReplDemoConfig_TwoNodes`
+- `TestPhase25_ReplDemoConfig_UniqueNodeIDs`
+- `TestPhase25_ReplDemoConfig_UniqueNodeAddresses`
+- `TestPhase25_ReplDemoConfig_UniqueDataDirs`
+- `TestPhase25_ReplDemoConfig_ScopeFlagsNoRaftNoConsensus`
+- `TestPhase25_ReplDemoConfig_NoQuorumReplication`
+- `TestPhase25_ReplDemoConfig_LeaderAndFollowerRoles`
+- `TestPhase25_ReplDemoConfig_DeterministicRouting`
+- `TestPhase25_ReplDemoConfig_InvalidDuplicateID`
+- `TestPhase25_ReplDemoConfig_InvalidScopeMissingRaftFlag`
+- `TestPhase25_ReplDemoConfig_NodeDataDirsAreAbsolutePaths`
+
+### Smoke test output (repl-demo-smoke 16/16)
+
+```
+=== ShardForgeDB Phase 25 — Replication Demo Smoke Test ===
+
+SCOPE: Explicit pull-based replication only.
+       No Raft. No consensus. No quorum. No automatic failover.
+
+-- Health checks
+  PASS: leader /healthz → ok
+  PASS: follower /healthz → ok
+
+-- Write to leader
+  PASS: PUT repl:smoke to leader succeeded
+  PASS: GET repl:smoke from leader returns hello-replication
+
+-- Isolation before pull (no automatic replication)
+  PASS: GET from follower BEFORE pull: not found (data isolation confirmed)
+
+-- Explicit pull (operator-triggered)
+  PASS: POST /replication/sync on follower succeeded
+  sync: fetched=1 applied=1
+  PASS: GET from follower AFTER pull: hello-replication (replication confirmed)
+
+-- Idempotency: second pull when nothing new
+  second sync: fetched=0 applied=0
+  PASS: second pull is idempotent (fetched=0, applied=0 — no duplicate writes)
+
+-- DELETE on leader, then pull
+  PASS: DELETE repl:smoke on leader succeeded
+  PASS: follower still has repl:smoke before delete-pull (no auto-sync)
+  PASS: pull after DELETE succeeded (applied=1)
+  PASS: follower no longer has repl:smoke after delete-pull (tombstone applied)
+
+-- Follower role enforcement
+  PASS: GET /replication/log on follower returns error (correct: follower has no log)
+  PASS: PUT on follower rejected (403 — follower is read-only)
+
+-- Scope flags in demo config
+  PASS: config scope flags: no_raft=true, no_consensus=true, no_quorum_replication=true
+  PASS: leader /replication/status shows role=primary
+
+=== Summary ===
+  Passed: 16
+  Failed: 0
+
+All checks passed. Phase 25 pull-based replication demo is working correctly.
 ```

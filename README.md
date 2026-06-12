@@ -7,7 +7,7 @@ An **explainable** Go database engine for key-value and vector search workloads,
 > Phase 23 adds HTTP `/explain/*` node endpoints and `shardforge explain-node` CLI.
 > Phase 22 adds `ExplainGet/Put/Delete/Scan` engine traces and `shardforge explain` CLI.
 >
-> **940 race-safe tests. 120+ reproducible benchmarks. All 24 phases complete.**
+> **942 race-safe tests. 120+ reproducible benchmarks. All 24 phases complete.**
 
 ---
 
@@ -495,8 +495,8 @@ make node-demo-down
 - [x] `scripts/demo_cluster_down.sh` — stop all processes, clean data directories
 - [x] `docs/DEMO.md` — full demo documentation with scope table, limitations, examples
 - [x] `make cluster-demo-{up,smoke,down}` — Makefile targets
-- [x] 11 new tests in `internal/cluster/demo_test.go` — config validity, unique IDs/addrs/dirs, scope flags, deterministic routing, known key routes, invalid config rejection
-- [x] **940 total tests (929 + 11)**
+- [x] 13 new tests in `internal/cluster/demo_test.go` — config validity, unique IDs/addrs/dirs, scope flags, deterministic routing, known key routes, invalid config rejection
+- [x] **942 total tests (929 + 13)**
 
 ---
 

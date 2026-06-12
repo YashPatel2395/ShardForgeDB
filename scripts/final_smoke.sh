@@ -34,7 +34,7 @@ ok "go vet ./... passes"
 echo ""
 echo "-- Tests (race detector)"
 go test -race -count=1 ./...
-ok "go test -race -count=1 ./... passes (940 tests)"
+ok "go test -race -count=1 ./... passes (942 tests)"
 
 # ── Build ─────────────────────────────────────────────────────────────
 echo ""

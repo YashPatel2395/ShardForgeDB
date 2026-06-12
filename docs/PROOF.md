@@ -30,7 +30,7 @@ This file records the evidence that each phase was implemented correctly and pas
 | 21 | `internal/trace` | COMPLETE (types only) | 22 | — | Types only; engine wiring deferred to Phase 15 |
 | 22 | `engine/explain`, `vector/explain`, CLI | COMPLETE | 40 new (905 total) | — | Single-node only; no distributed traces |
 | 23 | `node/explain endpoints`, `node/client`, `shardforge explain-node` | COMPLETE | 24 new (929 total) | — | Single-node HTTP only; no cross-node trace propagation |
-| 24 | `configs/cluster/demo-3node.json`, `scripts/demo_cluster_*.sh`, `docs/DEMO.md` | COMPLETE | 11 new (940 total) | — | Local demo only; no Raft; no failover; no shard migration |
+| 24 | `configs/cluster/demo-3node.json`, `scripts/demo_cluster_*.sh`, `docs/DEMO.md` | COMPLETE | 13 new (942 total) | — | Local demo only; no Raft; no failover; no shard migration |
 
 **Validation command (all phases):**
 ```bash
@@ -4198,7 +4198,7 @@ Verified in `TestDemoConfig_ScopeFlagsNoRaftNoConsensus` and `demo_cluster_smoke
 
 ### New test count
 
-940 tests (929 Phase 23 + 11 Phase 24).
+942 tests (929 Phase 23 + 13 Phase 24).
 
 ### make cluster-demo-smoke result
 

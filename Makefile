@@ -223,7 +223,7 @@ cluster-demo-down:
 repl-demo-up:
 	./scripts/repl_demo_up.sh
 
-## repl-demo-smoke: Phase 25 — run replication demo smoke test (14 checks: put/pull/delete/idempotent/error)
+## repl-demo-smoke: Phase 25 — run replication demo smoke test (16 checks: health, PUT, explicit pull, idempotency, DELETE replication, role enforcement, error handling)
 repl-demo-smoke:
 	./scripts/repl_demo_smoke.sh
 

@@ -491,7 +491,7 @@ make node-demo-down
 
 - [x] `configs/cluster/demo-3node.json` — dedicated 3-node cluster config (node-1/9101, node-2/9102, node-3/9103, proxy/9200)
 - [x] `scripts/demo_cluster_up.sh` — start 3 nodes + proxy as local processes, wait for health
-- [x] `scripts/demo_cluster_smoke.sh` — 18-check smoke: health, key placement proof, put/get, data isolation proof, explain-node, config validation
+- [x] `scripts/demo_cluster_smoke.sh` — 25-check smoke: health, key placement proof, put/get, data isolation proof, explain-node, config validation
 - [x] `scripts/demo_cluster_down.sh` — stop all processes, clean data directories
 - [x] `docs/DEMO.md` — full demo documentation with scope table, limitations, examples
 - [x] `make cluster-demo-{up,smoke,down}` — Makefile targets

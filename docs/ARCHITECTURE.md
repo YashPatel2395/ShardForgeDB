@@ -235,7 +235,7 @@ configs/cluster/demo-3node.json   ← Phase 24 demo cluster config
   │ scope: no_raft, no_consensus, no_failover, no_replication, no_shard_migration
   ▼
 scripts/demo_cluster_up.sh     ← start nodes + proxy as local processes
-scripts/demo_cluster_smoke.sh  ← 18-check smoke: health, routing, put/get, isolation, explain
+scripts/demo_cluster_smoke.sh  ← 25-check smoke: health, routing, put/get, isolation, explain
 scripts/demo_cluster_down.sh   ← stop processes, remove data dirs
 
 Routing (pure ring, no network call):

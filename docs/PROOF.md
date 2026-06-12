@@ -4168,10 +4168,10 @@ Phase 24 adds a clean, reproducible local cluster demo: 3 independent HTTP nodes
 
 - `configs/cluster/demo-3node.json` — dedicated Phase 24 cluster config (node-1/9101, node-2/9102, node-3/9103, proxy/9200)
 - `scripts/demo_cluster_up.sh` — start 3 nodes + proxy as local background processes, wait for health
-- `scripts/demo_cluster_smoke.sh` — 18-check smoke: health, status, key placement proof, put/get via proxy, data isolation proof, explain-node, config validation, scope flag verification, gateway health fanout
+- `scripts/demo_cluster_smoke.sh` — 25-check smoke: health, status, key placement proof, put/get via proxy, data isolation proof, explain-node, config validation, scope flag verification, gateway health fanout
 - `scripts/demo_cluster_down.sh` — stop all processes, remove demo data directories and logs
 - `docs/DEMO.md` — complete demo documentation with scope table, key placement proof, data isolation proof, honest limitations
-- `internal/cluster/demo_test.go` — 11 new tests: config loads/validates, 3 nodes, unique IDs, unique addresses, unique data dirs, scope flags, deterministic routing, known key routes, invalid duplicate ID, invalid duplicate addr, proxy enabled, absolute data dir paths
+- `internal/cluster/demo_test.go` — 13 new tests: config loads/validates, 3 nodes, unique IDs, unique addresses, unique data dirs, scope flags, deterministic routing, known key routes, invalid duplicate ID, invalid duplicate addr, invalid scope flag, proxy enabled, absolute data dir paths
 - `Makefile` — `cluster-demo-up`, `cluster-demo-smoke`, `cluster-demo-down` targets
 
 ### Key placement proof (stable for the 3-node ring, 128 virtual nodes)

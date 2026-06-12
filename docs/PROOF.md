@@ -4246,7 +4246,7 @@ SCOPE: Static routing, no Raft, no consensus, no failover, no shard migration.
   PASS: gateway health fanout: all nodes responding
 
 === Summary ===
-  Passed: 18
+  Passed: 25
   Failed: 0
 
 All checks passed. Phase 24 local cluster demo is working correctly.

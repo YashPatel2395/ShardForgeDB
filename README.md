@@ -2,12 +2,12 @@
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer toward a real distributed system. Every phase is strictly documented, tested, and benchmarked. Every claim is audited.
 
-> **Phase 23 — Networked Node Trace API.** Phases 1–23 complete and locked.
-> Phase 23 adds HTTP `/explain/*` endpoints to every node, typed `explain*` methods to `node.Client`, and the `shardforge explain-node` CLI — completing the full runtime explainability system across both local and networked execution paths.
-> Phase 22 adds `ExplainGet/Put/Delete/Scan` (engine) + `ExplainUpsert/Search/Delete` (vector) + `shardforge explain` CLI.
-> Phase 21 adds `internal/trace` type package, claims audit, and stale-doc fixes.
+> **Phase 24 — Reproducible Multi-Node Local Cluster Demo.** Phases 1–24 complete and locked.
+> Phase 24 adds a clean, reproducible 3-node local cluster demo: independent HTTP nodes, stateless proxy, FNV-1a routing, data isolation proof, key placement proof, and `explain-node` over HTTP.
+> Phase 23 adds HTTP `/explain/*` node endpoints and `shardforge explain-node` CLI.
+> Phase 22 adds `ExplainGet/Put/Delete/Scan` engine traces and `shardforge explain` CLI.
 >
-> **929 race-safe tests. 120+ reproducible benchmarks. All 23 phases complete.**
+> **942 race-safe tests. 120+ reproducible benchmarks. All 24 phases complete.**
 
 ---
 
@@ -486,6 +486,17 @@ make node-demo-down
 - [x] `shardforge explain-node` CLI — calls any live node over HTTP, prints real execution trace
 - [x] 24 new tests in `internal/node` + `cmd/shardforge`
 - [x] **929 total tests across 27 packages, race detector on every run**
+
+**Phase 24 — Reproducible Multi-Node Local Cluster Demo** ✓ locked
+
+- [x] `configs/cluster/demo-3node.json` — dedicated 3-node cluster config (node-1/9101, node-2/9102, node-3/9103, proxy/9200)
+- [x] `scripts/demo_cluster_up.sh` — start 3 nodes + proxy as local processes, wait for health
+- [x] `scripts/demo_cluster_smoke.sh` — 25-check smoke: health, key placement proof, put/get, data isolation proof, explain-node, config validation
+- [x] `scripts/demo_cluster_down.sh` — stop all processes, clean data directories
+- [x] `docs/DEMO.md` — full demo documentation with scope table, limitations, examples
+- [x] `make cluster-demo-{up,smoke,down}` — Makefile targets
+- [x] 13 new tests in `internal/cluster/demo_test.go` — config validity, unique IDs/addrs/dirs, scope flags, deterministic routing, known key routes, invalid config rejection
+- [x] **942 total tests (929 + 13)**
 
 ---
 

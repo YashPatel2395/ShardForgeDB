@@ -16,7 +16,7 @@ CLUSTER_CMD      := ./cmd/shardforge-cluster
 GO               := go
 GOFLAGS          :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-replnet bench-ops bench-trace bench-report dashboard node node-demo node-demo-down replica-demo replica-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example replica-config-demo replica-status-demo ops-health-demo ops-simulate-failure-demo ops-rebalance-plan-demo smoke demo release-check final-smoke help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-replnet bench-ops bench-trace bench-report dashboard node node-demo node-demo-down replica-demo replica-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example replica-config-demo replica-status-demo ops-health-demo ops-simulate-failure-demo ops-rebalance-plan-demo smoke demo release-check final-smoke cluster-demo-up cluster-demo-smoke cluster-demo-down help
 
 all: fmt vet build
 
@@ -203,9 +203,21 @@ demo:
 release-check:
 	./scripts/release_check.sh
 
-## final-smoke: Phase 23 final smoke — go mod tidy, fmt, vet, tests, build, CLI checks (including explain), config validate, ops sim
+## final-smoke: Phase 24 final smoke — go mod tidy, fmt, vet, tests, build, CLI checks (including explain), config validate, ops sim
 final-smoke:
 	./scripts/final_smoke.sh
+
+## cluster-demo-up: Phase 24 — start 3-node local cluster demo (nodes + proxy as local processes, no Docker)
+cluster-demo-up:
+	./scripts/demo_cluster_up.sh
+
+## cluster-demo-smoke: Phase 24 — run cluster demo smoke test (health, routing, put/get, isolation, explain-node)
+cluster-demo-smoke:
+	./scripts/demo_cluster_smoke.sh
+
+## cluster-demo-down: Phase 24 — stop cluster demo processes and remove demo data directories
+cluster-demo-down:
+	./scripts/demo_cluster_down.sh
 
 ## clean: remove build artifacts
 clean:

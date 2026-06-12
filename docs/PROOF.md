@@ -4,7 +4,7 @@ This file records the evidence that each phase was implemented correctly and pas
 
 ---
 
-## Summary Table (Phase 23 — Networked Node Trace API + Node Runtime Hardening)
+## Summary Table (Phase 24 — Reproducible Multi-Node Local Cluster Demo)
 
 | Phase | Component | Status | Tests | Benchmarks | Limitations |
 |---|---|---|---|---|---|
@@ -30,6 +30,7 @@ This file records the evidence that each phase was implemented correctly and pas
 | 21 | `internal/trace` | COMPLETE (types only) | 22 | — | Types only; engine wiring deferred to Phase 15 |
 | 22 | `engine/explain`, `vector/explain`, CLI | COMPLETE | 40 new (905 total) | — | Single-node only; no distributed traces |
 | 23 | `node/explain endpoints`, `node/client`, `shardforge explain-node` | COMPLETE | 24 new (929 total) | — | Single-node HTTP only; no cross-node trace propagation |
+| 24 | `configs/cluster/demo-3node.json`, `scripts/demo_cluster_*.sh`, `docs/DEMO.md` | COMPLETE | 13 new (942 total) | — | Local demo only; no Raft; no failover; no shard migration |
 
 **Validation command (all phases):**
 ```bash
@@ -4155,4 +4156,98 @@ $ shardforge explain --data-dir ./data put demokey demovalue
 
 ```
 [release-check] ALL CHECKS PASSED
+```
+
+---
+
+## Phase 24 — Reproducible Multi-Node Local Cluster Demo
+
+Phase 24 adds a clean, reproducible local cluster demo: 3 independent HTTP nodes + stateless proxy running as local processes with separate data directories and static FNV-1a routing.
+
+### What was built
+
+- `configs/cluster/demo-3node.json` — dedicated Phase 24 cluster config (node-1/9101, node-2/9102, node-3/9103, proxy/9200)
+- `scripts/demo_cluster_up.sh` — start 3 nodes + proxy as local background processes, wait for health
+- `scripts/demo_cluster_smoke.sh` — 25-check smoke: health, status, key placement proof, put/get via proxy, data isolation proof, explain-node, config validation, scope flag verification, gateway health fanout
+- `scripts/demo_cluster_down.sh` — stop all processes, remove demo data directories and logs
+- `docs/DEMO.md` — complete demo documentation with scope table, key placement proof, data isolation proof, honest limitations
+- `internal/cluster/demo_test.go` — 13 new tests: config loads/validates, 3 nodes, unique IDs, unique addresses, unique data dirs, scope flags, deterministic routing, known key routes, invalid duplicate ID, invalid duplicate addr, invalid scope flag, proxy enabled, absolute data dir paths
+- `Makefile` — `cluster-demo-up`, `cluster-demo-smoke`, `cluster-demo-down` targets
+
+### Key placement proof (stable for the 3-node ring, 128 virtual nodes)
+
+```
+user:1  → node-2  (http://127.0.0.1:9102)
+user:2  → node-2  (http://127.0.0.1:9102)
+order:9 → node-1  (http://127.0.0.1:9101)
+```
+
+Verified by: `./bin/shardforge-gateway --config configs/cluster/demo-3node.json route <key>`
+Asserted deterministically in: `TestDemoConfig_KnownKeyRoutes`
+
+### Data isolation proof
+
+Writing to node-1 directly does NOT make data available on node-2 or node-3. There is no replication. Each node is fully independent. Verified in `TestDemoConfig_UniqueDataDirs` and `demo_cluster_smoke.sh`.
+
+### Scope assertion
+
+`configs/cluster/demo-3node.json` has all scope flags true:
+- `no_raft`, `no_consensus`, `no_failover`, `no_shard_migration`, `no_replication`, `no_distributed_txns`
+
+Verified in `TestDemoConfig_ScopeFlagsNoRaftNoConsensus` and `demo_cluster_smoke.sh`.
+
+### New test count
+
+942 tests (929 Phase 23 + 13 Phase 24).
+
+### make cluster-demo-smoke result
+
+```
+=== ShardForgeDB Phase 24 — Cluster Demo Smoke Test ===
+
+SCOPE: Static routing, no Raft, no consensus, no failover, no shard migration.
+
+-- Health checks
+  PASS: node-1 /healthz → ok
+  PASS: node-2 /healthz → ok
+  PASS: node-3 /healthz → ok
+  PASS: proxy  /healthz → ok
+
+-- Key placement proof (static FNV-1a consistent hash, no migration)
+  key="user:1" → node_id=node-2  base_url=http://127.0.0.1:9102
+  key="user:2" → node_id=node-2  base_url=http://127.0.0.1:9102
+  key="order:9" → node_id=node-1  base_url=http://127.0.0.1:9101
+  key="item:42" → node_id=node-3  base_url=http://127.0.0.1:9103
+  PASS: routing is deterministic for user:1
+  PASS: user:1 routes to a node
+  PASS: order:9 routes to a node
+
+-- Put/get through proxy
+  PASS: PUT user:1=alice via proxy succeeded
+  PASS: GET user:1 via proxy returns alice
+  PASS: GET order:9 via proxy returns widget
+
+-- Data isolation proof (each node has independent storage, no replication)
+  PASS: node-1 has iso:test (direct write confirmed)
+  PASS: node-2 does NOT have iso:test (data isolation confirmed, no replication)
+  PASS: node-3 does NOT have iso:test (data isolation confirmed, no replication)
+  PASS: all three nodes use distinct data directories
+
+-- explain-node: runtime execution trace over HTTP
+  PASS: explain-node put returns WAL_APPEND step
+  PASS: explain-node put returns MEMTABLE_PUT step
+  PASS: explain-node get returns MEMTABLE_HIT step
+
+-- Config validation
+  PASS: configs/cluster/demo-3node.json validates
+  PASS: config scope flags: no_raft=true, no_consensus=true, no_failover=true, no_shard_migration=true, no_replication=true
+
+-- Gateway health fanout (all nodes)
+  PASS: gateway health fanout: all nodes responding
+
+=== Summary ===
+  Passed: 25
+  Failed: 0
+
+All checks passed. Phase 24 local cluster demo is working correctly.
 ```

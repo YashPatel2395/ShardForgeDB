@@ -40,8 +40,9 @@ The project is not a production database. It is an explainable, deeply documente
 | 21 | `internal/trace` | Trace type package: `Trace`, `TraceStep`, `OperationType`, `Component`, `StepType`, `Status` | 22 | — |
 | 22 | `internal/engine`, `internal/vector`, `cmd/shardforge` | Runtime operation traces: `ExplainGet/Put/Delete/Scan`, vector `ExplainUpsert/Search/Delete`, `shardforge explain` CLI | 40 | — |
 | 23 | `internal/node`, `cmd/shardforge` | HTTP explain endpoints, `node.Client` explain methods, `shardforge explain-node` CLI | 24 | — |
+| 24 | `configs/cluster/`, `scripts/demo_cluster_*.sh`, `docs/DEMO.md`, `internal/cluster/demo_test.go` | Reproducible local 3-node cluster demo: up/smoke/down scripts, key placement proof, data isolation proof, 13 new cluster tests | 13 | — |
 
-**Total tests:** 929
+**Total tests:** 942
 **Total benchmarks:** 120+
 **Packages with tests:** 23 of 27
 
@@ -65,7 +66,7 @@ The explainability layer (Phases 21–23) makes every operation traceable: `Expl
 
 ## Explainability system (Phases 21–23)
 
-Phase 23 is the current final phase. The explainability system is the most important feature for understanding how the database internals actually work:
+Phase 23 completed the explainability system. Phase 24 (the current final phase) adds the reproducible multi-node local cluster demo. The explainability system is the most important feature for understanding how the database internals actually work:
 
 **Example GET trace (key found in SSTable after flush):**
 
@@ -122,6 +123,6 @@ The trace system works only because each `Explain*` method mirrors the exact exe
 
 ## Release status
 
-All 23 phases complete. `make release-check` passes. `go test -race -count=1 ./...` → 929 tests pass across 23 packages.
+All 24 phases complete. `make release-check` passes. `make final-smoke` passes 33/33. `go test -race -count=1 ./...` → 942 tests pass across 23 packages.
 
 The project is suitable for portfolio presentation, technical interviews, and as a reference implementation for database internals education. It is not suitable for production use.

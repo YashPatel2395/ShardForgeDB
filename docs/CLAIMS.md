@@ -1,6 +1,6 @@
 # ShardForgeDB — Claims Audit
 
-**Phase 25 — Networked Pull-Based Replication Demo**
+**Phase 26 — Durable Replication State and Restart Recovery**
 
 This file is the authoritative record of what ShardForgeDB can and cannot claim. All documentation, README copy, demo scripts, and recruiter materials must comply with this list. If a claim does not appear in Section A, it must not be made.
 
@@ -27,16 +27,17 @@ The following are accurate, honest descriptions of what exists in the codebase w
 | Client-side consistent-hash routing | `internal/gateway` + `cmd/shardforge-gateway` — FNV-1a ring, virtual nodes, weight support |
 | Stateless HTTP routing proxy | `internal/proxy` + `cmd/shardforge-proxy` — 10 endpoints, no failover, explicit scope flags |
 | Static cluster metadata | `internal/cluster` + `cmd/shardforge-cluster` — typed JSON config, validate/print/example |
-| Explicit pull-based read-replica sync v1 | `internal/replnet` — in-memory mutation log, follower pulls on demand, 403 for follower writes |
+| Explicit pull-based read-replica sync with durable state | `internal/replnet` — durable binary journal (`DurableLog`), durable follower cursor (`ReplicationStateStore`), gap detection (HTTP 409), follower pulls on demand, 403 for follower writes |
 | Health check visibility | `internal/ops.CheckClusterHealth` — HTTP /healthz polling, latency, sorted results |
 | Failure simulation (no live calls) | `internal/ops.SimulateFailure` — routing impact on sample keys, pure ring computation |
 | Manual rebalance planning (no data movement) | `internal/ops.PlanManualRebalance` — key movement plan, operator steps, pure computation |
 | Runtime operation trace mode (single-node) | `internal/engine.ExplainGet/Put/Delete/Scan`, `internal/vector.ExplainUpsert/Search/Delete` — real execution-path traces, JSON output, `shardforge explain` CLI; no fabricated steps |
 | Networked single-node trace API (HTTP) | `internal/node` — `POST /explain/put`, `GET /explain/get`, `DELETE /explain/delete`, `GET /explain/scan` call real `engine.Explain*` paths; `node.Client.ExplainGet/Put/Delete/Scan`; `shardforge explain-node` CLI; single-node HTTP only |
-| 962 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 962 passing tests, 23 packages with test files, 4 packages with no test files (`cmd/shardforge-bench`, `cmd/shardforge-dashboard`, `cmd/shardforge-node`, `internal/storage`) |
+| 994 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 994 passing tests, 23 packages with test files, 4 packages with no test files (`cmd/shardforge-bench`, `cmd/shardforge-dashboard`, `cmd/shardforge-node`, `internal/storage`) |
 | Reproducible benchmarks | `make bench-*` targets, results in `docs/BENCHMARKS.md` |
 | Reproducible local three-node HTTP cluster demo with static routing | `scripts/demo_cluster_{up,smoke,down}.sh` — 3 independent HTTP nodes + stateless proxy, FNV-1a routing, separate data dirs, data isolation proven; `configs/cluster/demo-3node.json`; `make cluster-demo-{up,smoke,down}`; see `docs/DEMO.md` |
-| Networked explicit pull-based replication demo between HTTP nodes | `scripts/repl_demo_{up,smoke,down}.sh` — leader (primary) + follower (replica) as real HTTP processes; explicit pull via `POST /replication/sync`; PUT+DELETE replication proven; idempotent pull proven; follower write-rejection proven; `configs/replication/demo-leader-follower.json`; `make repl-demo-{up,smoke,down}`; cursor is in-memory only |
+| Networked explicit pull-based replication demo between HTTP nodes | `scripts/repl_demo_{up,smoke,down}.sh` — leader (primary) + follower (replica) as real HTTP processes; explicit pull via `POST /replication/sync`; PUT+DELETE replication proven; idempotent pull proven; follower write-rejection proven; `configs/replication/demo-leader-follower.json`; `make repl-demo-{up,smoke,down}` |
+| Durable replication restart recovery demo | `scripts/repl_restart_demo_{up,smoke,down}.sh` — 18 checks: primary journal survives restart, follower cursor restored after restart, replication resumes from correct position, idempotent pull; `make repl-restart-demo-{up,smoke,down}` |
 
 ---
 

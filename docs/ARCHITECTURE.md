@@ -26,7 +26,7 @@ This document describes the system architecture, component responsibilities, dat
 ║  shardforge-node  (independent HTTP node processes)          ║
 ║  internal/node    (server, handlers, client, types)          ║
 ║  internal/node    (explain endpoints: POST/GET/DELETE/SCAN)  ║
-║  internal/replnet (in-memory mutation log, replicator)       ║
+║  internal/replnet (durable journal, state store, replicator) ║
 ╚══════════════════════════════════╦═══════════════════════════╝
                                    │
 ╔══════════════════════════════════▼═══════════════════════════╗
@@ -96,7 +96,7 @@ Local HTTP observability dashboard. HTML dashboard, JSON status, `/healthz`, `/e
 Real networked node runtime. Each node is an independent HTTP/JSON server backed by a local Engine. API: `GET /healthz`, `GET /status`, `PUT/GET/DELETE /kv/{key}`, `GET /scan`, `POST /flush`, `POST /compact`, plus 4 replication endpoints, plus 4 explain endpoints (`POST /explain/put`, `GET /explain/get`, `DELETE /explain/delete`, `GET /explain/scan`). `node.Client` includes typed explain methods.
 
 ### `internal/replnet`
-Networked replication primitives. `Log` is an in-memory append-only mutation log with monotonic `uint64` sequence numbers. `Replicator` is an HTTP pull client that calls `GET /replication/log` on the primary. Follower nodes sync on demand via `POST /replication/sync`. Not persisted — cleared on restart.
+Networked replication primitives. `DurableLog` is an append-only binary journal (`replication.journal`) with CRC-verified records, an in-memory index for fast seeks, and partial-tail crash recovery. `ReplicationStateStore` persists the follower cursor (`replication_state.json`) using atomic temp→fsync→rename writes. `Replicator` is an HTTP pull client that calls `GET /replication/log` on the primary and decodes HTTP 409 gap errors into `*ReplicationGapError`. The in-memory `Log` is retained for standalone and test use. Both the journal and cursor survive process restarts; explicit pull via `POST /replication/sync` is still operator-triggered only.
 
 ### `internal/gateway`
 Client-side routing gateway. FNV-1a 64-bit consistent-hash ring. `NodeForKey` does clockwise ring lookup. `Put/Get/Delete` route to the responsible node — no retry to another node. `FlushAll/CompactAll/HealthAll` fan out to all nodes.
@@ -294,6 +294,57 @@ Explicit pull proof:
 
 **Scope:** Explicit, operator-triggered pull replication. Not automatic. Not distributed consensus.
 - No Raft, no consensus, no quorum replication, no automatic failover.
-- Replication cursor (`lastApplied`) is in-memory only — not persisted across restarts.
+- Replication cursor (`lastApplied`) was in-memory only in Phase 25 — made durable in Phase 26.
 - Follower rejects client PUT/DELETE with 403.
 - See `docs/DEMO.md` for the full demo guide.
+
+## Phase 26 — Durable Replication State and Restart Recovery
+
+Phase 26 makes the Phase 25 replication infrastructure durable. No new HTTP endpoints. No new packages. Changes to `internal/replnet` and `internal/node` only.
+
+```
+New files in internal/replnet:
+  durable_log.go      ← DurableLog: binary journal (replication.journal)
+  state_store.go      ← ReplicationStateStore: follower cursor (replication_state.json)
+
+New types in internal/replnet/types.go:
+  DurableLogStats     ← count, last_seq, first_available_seq, journal_bytes, durable=true
+  ReplicationGapError ← requested_after, first_available_seq, latest_seq; HTTP 409
+
+New errors in internal/replnet/errors.go:
+  ErrReplicationGap, ErrCorruptedJournal, ErrCorruptedState, ErrInvalidSeqRegression
+
+Changes to internal/node/server.go:
+  replLog *replnet.Log  →  durableLog *replnet.DurableLog   (primary)
+  + stateStore *replnet.ReplicationStateStore               (follower)
+  Open() loads cursor from stateStore.LastAppliedSeq() on startup
+  ApplyReplicationEntries() calls stateStore.AdvanceTo() after each batch
+  ReplicationEntries() returns *ReplicationGapError when after+1 < firstAvailableSeq
+
+Changes to internal/node/handlers.go:
+  GET  /replication/log   ← returns HTTP 409 + gap struct when cursor behind journal
+  POST /replication/sync  ← returns HTTP 409 + gap struct when primary reports gap
+  PUT/DELETE /kv/*        ← calls durableLog.Append() instead of replLog.Append()
+
+Journal binary format (replication.journal):
+  [4] length uint32 LE  — bytes after this field
+  [4] crc32  uint32 LE  — IEEE CRC32 of payload
+  [8] seq    uint64 LE
+  [1] op     uint8      — 1=put, 2=delete
+  [4] keyLen uint32 LE
+  [4] valLen uint32 LE
+  [8] tsNano uint64 LE
+  [keyLen] key bytes
+  [valLen] val bytes
+
+Cursor persistence (replication_state.json):
+  {"last_applied_seq":42,"checksum":1234567890}
+  checksum = CRC32 of 8-byte little-endian encoding of last_applied_seq
+  atomic write: write temp → fsync → rename
+```
+
+**Scope:** Durable state only. Replication is still pull-based and operator-triggered.
+- No Raft, no consensus, no quorum, no automatic failover, no background sync loop.
+- Primary journal is never truncated in Phase 26 (no compaction of journal).
+- Gap detection is implemented but only triggers if the journal file is externally deleted/truncated.
+- `docs/REPLICATION_DURABILITY_DESIGN.md` documents all 12 design decisions.

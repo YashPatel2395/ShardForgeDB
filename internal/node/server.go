@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -30,12 +31,15 @@ type Server struct {
 	closed bool
 	start  time.Time
 
-	// Replication state. replLog is non-nil only for primary nodes.
+	// Replication state.
+	// durableLog is non-nil only for primary nodes (Phase 26+: persisted binary journal).
+	// stateStore is non-nil only for follower nodes (Phase 26+: persisted cursor).
 	// replicator is non-nil only for follower nodes.
-	// lastApplied is the last replication log seq applied (follower only).
-	replLog     *replnet.Log
+	// lastApplied is the last replication log seq applied (follower only; authoritative is stateStore).
+	durableLog  *replnet.DurableLog
+	stateStore  *replnet.ReplicationStateStore
 	replicator  *replnet.Replicator
-	lastApplied uint64 // accessed via atomic
+	lastApplied uint64 // accessed via atomic; initialised from stateStore on Open
 }
 
 // Open validates opts, opens (or creates) the local Engine, and wires up the HTTP mux.
@@ -68,8 +72,22 @@ func Open(opts Options) (*Server, error) {
 
 	switch opts.Replication.Role {
 	case replnet.RolePrimary:
-		s.replLog = replnet.NewLog()
+		dl, err := replnet.OpenDurableLog(opts.DataDir)
+		if err != nil {
+			eng.Close()
+			return nil, fmt.Errorf("node: open durable log: %w", err)
+		}
+		s.durableLog = dl
+
 	case replnet.RoleFollower:
+		ss, err := replnet.NewReplicationStateStore(opts.DataDir)
+		if err != nil {
+			eng.Close()
+			return nil, fmt.Errorf("node: open replication state store: %w", err)
+		}
+		s.stateStore = ss
+		// Restore cursor from persistent state.
+		atomic.StoreUint64(&s.lastApplied, ss.LastAppliedSeq())
 		s.replicator = replnet.NewReplicator(opts.Replication.PrimaryBaseURL, 0)
 	}
 
@@ -159,8 +177,8 @@ func (s *Server) Close() error {
 			firstErr = err
 		}
 	}
-	if s.replLog != nil {
-		if err := s.replLog.Close(); err != nil && firstErr == nil {
+	if s.durableLog != nil {
+		if err := s.durableLog.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -198,44 +216,66 @@ func (s *Server) ReplicationStatus() replnet.ReplicaStatus {
 	switch role {
 	case replnet.RolePrimary:
 		var lastSeq uint64
-		if s.replLog != nil {
-			if st, err := s.replLog.Stats(); err == nil {
+		var firstSeq uint64
+		if s.durableLog != nil {
+			if st, err := s.durableLog.Stats(); err == nil {
 				lastSeq = st.LastSeq
+				firstSeq = st.FirstAvailableSeq
 			}
 		}
+		_ = firstSeq // included in DurableLogStats; not in ReplicaStatus directly
 		return replnet.ReplicaStatus{
 			Role:         replnet.RolePrimary,
 			LastLocalSeq: lastSeq,
+			Durable:      true,
 		}
 	case replnet.RoleFollower:
 		return replnet.ReplicaStatus{
-			Role:           replnet.RoleFollower,
-			PrimaryBaseURL: s.opts.Replication.PrimaryBaseURL,
-			LastAppliedSeq: atomic.LoadUint64(&s.lastApplied),
+			Role:            replnet.RoleFollower,
+			PrimaryBaseURL:  s.opts.Replication.PrimaryBaseURL,
+			LastAppliedSeq:  atomic.LoadUint64(&s.lastApplied),
+			Durable:         true,
+			StatePersistent: true,
 		}
 	default:
 		return replnet.ReplicaStatus{}
 	}
 }
 
-// ReplicationEntries returns up to limit log entries with Seq > after.
-// Only valid for primary nodes; returns nil for standalone and follower nodes.
+// ReplicationEntries returns up to limit log entries with Seq > after from the durable log.
+// Only valid for primary nodes; returns nil, nil for standalone and follower nodes.
+// Returns *replnet.ReplicationGapError if after is behind the first available journal entry.
 func (s *Server) ReplicationEntries(after uint64, limit int) ([]replnet.Entry, error) {
-	if s.replLog == nil {
+	if s.durableLog == nil {
 		return nil, nil
 	}
-	return s.replLog.EntriesAfter(after, limit)
+
+	// Gap detection: if the follower's cursor is behind the journal's first entry,
+	// the follower cannot catch up without a reseed.
+	firstSeq := s.durableLog.FirstAvailableSeq()
+	if firstSeq > 0 && after+1 < firstSeq {
+		st, _ := s.durableLog.Stats()
+		return nil, &replnet.ReplicationGapError{
+			RequestedAfter:    after,
+			FirstAvailableSeq: firstSeq,
+			LatestSeq:         st.LastSeq,
+		}
+	}
+
+	return s.durableLog.EntriesAfter(after, limit)
 }
 
 // ApplyReplicationEntries applies a batch of entries from the primary to the local engine.
 // Entries must be in ascending Seq order. Already-applied entries (Seq <= lastApplied) are
 // safely skipped. Out-of-order gaps return replnet.ErrInvalidEntry.
 // Returns the last applied sequence number after this batch.
+//
+// After successful application the follower's cursor is persisted via stateStore (if present).
 func (s *Server) ApplyReplicationEntries(entries []replnet.Entry) (uint64, error) {
 	last := atomic.LoadUint64(&s.lastApplied)
 	for _, e := range entries {
 		if e.Seq <= last {
-			continue // already applied
+			continue // already applied; idempotent
 		}
 		if e.Seq != last+1 {
 			return last, fmt.Errorf("%w: expected seq %d, got %d", replnet.ErrInvalidEntry, last+1, e.Seq)
@@ -255,6 +295,16 @@ func (s *Server) ApplyReplicationEntries(entries []replnet.Entry) (uint64, error
 		last = e.Seq
 		atomic.StoreUint64(&s.lastApplied, last)
 	}
+
+	// Persist cursor after batch apply (not per-entry, for performance).
+	if s.stateStore != nil && last > 0 {
+		if err := s.stateStore.AdvanceTo(last); err != nil {
+			// Persistence failure is non-fatal in-process but must be reported so
+			// the operator knows the cursor will not survive a restart.
+			return last, fmt.Errorf("node: persist replication cursor seq %d: %w", last, err)
+		}
+	}
+
 	return last, nil
 }
 
@@ -264,6 +314,9 @@ func (s *Server) ApplyReplicationEntries(entries []replnet.Entry) (uint64, error
 // The returned SyncResult reports how many entries were fetched and how many were
 // newly applied. Re-running SyncFromPrimary is idempotent: already-applied entries
 // are skipped and Applied will be 0 when there is nothing new.
+//
+// If the primary returns a replication gap (HTTP 409), SyncFromPrimary propagates
+// a *replnet.ReplicationGapError which callers can check with errors.As.
 func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 	if s.replicator == nil {
 		return SyncResult{}, fmt.Errorf("node: SyncFromPrimary called on non-follower node")
@@ -271,6 +324,16 @@ func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 	before := atomic.LoadUint64(&s.lastApplied)
 	entries, err := s.replicator.PullEntries(ctx, before, 0)
 	if err != nil {
+		var gapErr *replnet.ReplicationGapError
+		if errors.As(err, &gapErr) {
+			return SyncResult{
+				SourceNode:     s.opts.Replication.PrimaryBaseURL,
+				FollowerNode:   s.opts.NodeID,
+				LastAppliedSeq: before,
+				Replication:    s.ReplicationStatus(),
+				Gap:            gapErr,
+			}, err
+		}
 		return SyncResult{
 			SourceNode:     s.opts.Replication.PrimaryBaseURL,
 			FollowerNode:   s.opts.NodeID,

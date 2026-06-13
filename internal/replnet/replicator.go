@@ -41,8 +41,17 @@ type logResponse struct {
 	Entries []Entry `json:"entries"`
 }
 
+// gapResponse is the JSON structure returned by GET /replication/log when HTTP 409.
+type gapResponse struct {
+	Error string               `json:"error"`
+	Gap   *ReplicationGapError `json:"gap"`
+}
+
 // PullEntries fetches up to limit entries with Seq > after from the primary's
 // GET /replication/log endpoint. Returns the entries in ascending Seq order.
+//
+// If the primary returns HTTP 409 (replication gap), PullEntries returns a
+// *ReplicationGapError which wraps ErrReplicationGap.
 func (r *Replicator) PullEntries(ctx context.Context, after uint64, limit int) ([]Entry, error) {
 	if limit <= 0 {
 		limit = DefaultEntriesLimit
@@ -59,6 +68,19 @@ func (r *Replicator) PullEntries(ctx context.Context, after uint64, limit int) (
 		return nil, fmt.Errorf("replnet: pull from primary: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusConflict {
+		// Replication gap: decode structured error.
+		var body gapResponse
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			return nil, fmt.Errorf("%w: primary returned 409 (could not decode gap body: %v)",
+				ErrReplicationGap, err)
+		}
+		if body.Gap != nil {
+			return nil, body.Gap
+		}
+		return nil, fmt.Errorf("%w: %s", ErrReplicationGap, body.Error)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("replnet: primary returned HTTP %d", resp.StatusCode)

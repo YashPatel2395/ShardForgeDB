@@ -2,12 +2,12 @@
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer toward a real distributed system. Every phase is strictly documented, tested, and benchmarked. Every claim is audited.
 
-> **Phase 25 — Networked Pull-Based Replication Demo.** Phases 1–25 complete and locked.
+> **Phase 26 — Durable Replication State and Restart Recovery.** Phases 1–26 complete and locked.
+> Phase 26 makes replication state durable: primary binary journal (`replication.journal`) and follower cursor (`replication_state.json`) survive process restarts. Replication gap detection added (HTTP 409).
 > Phase 25 adds a reproducible leader+follower HTTP replication demo: explicit pull via `POST /replication/sync`, PUT+DELETE replication proven, idempotent pull proven, follower write-rejection proven.
 > Phase 24 adds a 3-node local cluster demo: independent HTTP nodes, stateless proxy, FNV-1a routing, data isolation proof.
-> Phase 23 adds HTTP `/explain/*` node endpoints and `shardforge explain-node` CLI.
 >
-> **962 race-safe tests. 120+ reproducible benchmarks. All 25 phases complete.**
+> **994 race-safe tests. 120+ reproducible benchmarks. All 26 phases complete.**
 
 ---
 
@@ -510,6 +510,21 @@ make node-demo-down
 - [x] `Client.SyncReplication()` method in `node.Client`
 - [x] 20 new tests — 8 in `internal/node` (DELETE replication, idempotency, unavailable primary, cursor advancement, SyncResult counts, distinct data dirs, in-memory cursor) + 12 in `internal/cluster` (config validity, scope flags, leader/follower roles, deterministic routing, invalid config rejection)
 - [x] **962 total tests (942 + 20)**
+
+**Phase 26 — Durable Replication State and Restart Recovery** ✓ locked
+
+- [x] `internal/replnet/durable_log.go` — `DurableLog`: binary journal (`replication.journal`) with CRC-verified records, in-memory index for fast `EntriesAfter`, partial-tail truncation on crash recovery
+- [x] `internal/replnet/state_store.go` — `ReplicationStateStore`: follower cursor persistence (`replication_state.json`) with CRC checksum, atomic temp→fsync→rename write
+- [x] `internal/replnet/errors.go` — `ErrReplicationGap`, `ErrCorruptedJournal`, `ErrCorruptedState`, `ErrInvalidSeqRegression`
+- [x] `internal/replnet/types.go` — `ReplicationGapError` (HTTP 409 struct), `DurableLogStats`, `Durable`/`StatePersistent` fields in `ReplicaStatus`
+- [x] `internal/replnet/replicator.go` — gap detection: decodes 409 from primary, returns `*ReplicationGapError`
+- [x] `internal/node/server.go` — replaces in-memory `Log` with `DurableLog`; adds `ReplicationStateStore` for followers; cursor loaded from disk on `Open`; `ApplyReplicationEntries` persists cursor after batch; gap detection in `ReplicationEntries`
+- [x] `internal/node/handlers.go` — `GET /replication/log` returns HTTP 409 on gap; `POST /replication/sync` returns HTTP 409 with `gap` struct on gap
+- [x] `scripts/repl_restart_demo_{up,smoke,down}.sh` — 18-check smoke: writes before restart, journal file present, follower state file present, restart leader, journal survives, write after restart, restart follower, cursor restored, pull fetches only new entries, idempotent second pull
+- [x] `make repl-restart-demo-{up,smoke,down}` — Makefile targets
+- [x] `docs/REPLICATION_DURABILITY_DESIGN.md` — 12 design decisions documented before code was written
+- [x] 32 new tests — 12 in `internal/replnet` (DurableLog + StateStore) + 10 in `internal/node/replication_phase26_test.go`
+- [x] **994 total tests (962 + 32)**
 
 ---
 

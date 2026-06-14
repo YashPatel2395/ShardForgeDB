@@ -32,7 +32,7 @@ This file records the evidence that each phase was implemented correctly and pas
 | 23 | `node/explain endpoints`, `node/client`, `shardforge explain-node` | COMPLETE | 24 new (929 total) | — | Single-node HTTP only; no cross-node trace propagation |
 | 24 | `configs/cluster/demo-3node.json`, `scripts/demo_cluster_*.sh`, `docs/DEMO.md` | COMPLETE | 13 new (942 total) | — | Local demo only; no Raft; no failover; no shard migration |
 | 25 | `configs/replication/demo-leader-follower.json`, `scripts/repl_demo_*.sh`, `SyncResult` type | COMPLETE | 20 new (962 total) | — | Explicit pull-based only; cursor was in-memory (fixed Phase 26); no Raft; no quorum |
-| 26 | `internal/replnet/durable_log.go`, `internal/replnet/state_store.go`, `internal/node/replication_phase26_test.go`, `scripts/repl_restart_demo_*.sh` | COMPLETE | 59 new (1021 total) | — | Durable binary journal (per-Append fsync, rollback-on-failure, ErrPoisonedLog), identity-bound versioned JSON cursor (CRC32 all fields), replay boundary checks (seq 0, first≠1, gap, dup, MaxUint64), gap detection (HTTP 409), concurrent-sync guard (ErrSyncInProgress); operator-triggered only; no Raft; no quorum |
+| 26 | `internal/replnet/durable_log.go`, `internal/replnet/state_store.go`, `internal/node/replication_phase26_test.go`, `scripts/repl_restart_demo_*.sh` | COMPLETE | 61 new (1023 total) | — | Durable binary journal (per-Append fsync, rollback-on-failure, ErrPoisonedLog), identity-bound versioned JSON cursor (CRC32 all fields), replay boundary checks (seq 0, first≠1, gap, dup, MaxUint64), gap detection (HTTP 409), concurrent-sync guard (ErrSyncInProgress); operator-triggered only; no Raft; no quorum |
 
 **Validation command (all phases):**
 ```bash
@@ -41,10 +41,10 @@ make build
 make vet
 ```
 
-**Current test pass status:** 1021 tests pass across 23 packages (race detector on) on Apple M3 darwin/arm64, Go 1.26.
+**Current test pass status:** 1023 tests pass across 23 packages (race detector on) on Apple M3 darwin/arm64, Go 1.26.
 
 ```
-go test -race -count=1 -v ./... | grep -c "^--- PASS:" → 1021
+go test -race -count=1 -v ./... | grep -c "^--- PASS:" → 1023
 ```
 
 ---
@@ -4428,7 +4428,7 @@ All checks passed. Phase 25 pull-based replication demo is working correctly.
 | Crash window (documented) | engine.Put before journal.Append — mutation visible in engine but absent from replication log if process crashes between them. Journal entries ⊆ engine state is the invariant. |
 | ErrPoisonedLog | New sentinel: if rollback (truncate/seek/sync) fails after a write/sync error, the log is marked poisoned. All future Appends return ErrPoisonedLog until close+reopen. |
 
-### Test breakdown (59 Phase 26 tests, 1021 total)
+### Test breakdown (61 Phase 26 tests, 1023 total)
 
 | File | Tests | Coverage |
 |---|---|---|
@@ -4447,7 +4447,7 @@ make repl-restart-demo-down
 ### Validation
 
 ```
-go test -race -count=1 ./... → 1021 tests, 0 failures
+go test -race -count=1 ./... → 1023 tests, 0 failures
 make release-check            → build + vet + test + final-smoke all pass
 make repl-restart-demo-smoke  → 18/18 checks pass
 ```

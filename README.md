@@ -7,7 +7,7 @@ An **explainable** Go database engine for key-value and vector search workloads,
 > Phase 25 adds a reproducible leader+follower HTTP replication demo: explicit pull via `POST /replication/sync`, PUT+DELETE replication proven, idempotent pull proven, follower write-rejection proven.
 > Phase 24 adds a 3-node local cluster demo: independent HTTP nodes, stateless proxy, FNV-1a routing, data isolation proof.
 >
-> **1021 race-safe tests. 120+ reproducible benchmarks. All 26 phases complete.**
+> **1023 race-safe tests. 120+ reproducible benchmarks. All 26 phases complete.**
 
 ---
 
@@ -523,8 +523,8 @@ make node-demo-down
 - [x] `scripts/repl_restart_demo_{up,smoke,down}.sh` — 18-check smoke: writes before restart, journal file present, follower state file present, restart leader, journal survives, write after restart, restart follower, cursor restored, pull fetches only new entries, idempotent second pull
 - [x] `make repl-restart-demo-{up,smoke,down}` — Makefile targets
 - [x] `docs/REPLICATION_DURABILITY_DESIGN.md` — 12 design decisions documented before code was written
-- [x] 59 new tests — 29 in `internal/replnet/durable_log_test.go` + 12 in `internal/replnet/state_store_test.go` + 18 in `internal/node/replication_phase26_test.go`
-- [x] **1021 total tests (962 + 59)**
+- [x] 61 new tests — 31 in `internal/replnet/durable_log_test.go` + 12 in `internal/replnet/state_store_test.go` + 18 in `internal/node/replication_phase26_test.go`
+- [x] **1023 total tests (962 + 61)**
 
 ---
 

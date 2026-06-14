@@ -75,6 +75,30 @@ type DurableLogStats struct {
 	Durable bool `json:"durable"`
 }
 
+// RollbackError is returned when a DurableLog rollback fails, rendering the log poisoned.
+// It embeds ErrPoisonedLog plus the error that triggered the rollback (Original) and the
+// error that occurred during the rollback attempt (Rollback). All three are inspectable via
+// errors.Is / errors.As without unwrapping manually.
+type RollbackError struct {
+	// Original is the write or sync error that triggered the rollback.
+	Original error
+	// Rollback is the truncate, seek, or sync error that occurred during rollback.
+	Rollback error
+}
+
+func (e *RollbackError) Error() string {
+	return fmt.Sprintf(
+		"replnet: durable log rollback failed: original=%v rollback=%v",
+		e.Original, e.Rollback,
+	)
+}
+
+// Unwrap returns ErrPoisonedLog, the original error, and the rollback error, allowing
+// errors.Is to find any of the three in the chain.
+func (e *RollbackError) Unwrap() []error {
+	return []error{ErrPoisonedLog, e.Original, e.Rollback}
+}
+
 // ReplicationGapError is returned (HTTP 409) when the follower's cursor is behind
 // the primary's earliest retained journal entry. The follower cannot resume replication
 // without a manual reseed or snapshot restore.

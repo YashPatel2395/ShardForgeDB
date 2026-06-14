@@ -317,33 +317,129 @@ func TestDurableLog_CorruptRecord(t *testing.T) {
 
 func TestDurableLog_PartialTailTruncated(t *testing.T) {
 	dir := t.TempDir()
-	dl, err := OpenDurableLog(dir)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	dl.Append(OpPut, "k1", "v1")
-	dl.Append(OpPut, "k2", "v2")
-	dl.Close()
-
-	// Truncate the file to remove the last few bytes of the second record.
 	path := filepath.Join(dir, journalFileName)
-	fi, _ := os.Stat(path)
-	os.Truncate(path, fi.Size()-3)
 
-	// Should open cleanly (partial record is silently trimmed).
+	// Write first record, capture its file size (the "clean boundary" for recovery).
+	dl1, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open 1: %v", err)
+	}
+	dl1.Append(OpPut, "k1", "v1")
+	dl1.Close()
+
+	fi1, _ := os.Stat(path)
+	sizeAfterFirst := fi1.Size()
+	if sizeAfterFirst == 0 {
+		t.Fatal("file empty after first append")
+	}
+
+	// Append second record then close.
 	dl2, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open 2: %v", err)
+	}
+	dl2.Append(OpPut, "k2", "v2")
+	dl2.Close()
+
+	// Simulate a crash mid-write of the second record by removing the last few bytes.
+	fi2, _ := os.Stat(path)
+	if err := os.Truncate(path, fi2.Size()-3); err != nil {
+		t.Fatalf("truncate for test setup: %v", err)
+	}
+
+	// Reopen: partial record must be removed and the corrected size synced.
+	dl3, err := OpenDurableLog(dir)
 	if err != nil {
 		t.Fatalf("open after partial tail: %v", err)
 	}
+	defer dl3.Close()
+
+	// Only the first complete record should survive.
+	entries, err := dl3.EntriesAfter(0, 0)
+	if err != nil {
+		t.Fatalf("entries: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("want 1 entry (partial tail trimmed), got %d", len(entries))
+	}
+	if len(entries) > 0 && entries[0].Key != "k1" {
+		t.Errorf("surviving entry: want key=k1, got %q", entries[0].Key)
+	}
+
+	// File size must match the clean boundary after the first record.
+	fi3, _ := os.Stat(path)
+	if fi3.Size() != sizeAfterFirst {
+		t.Errorf("file size after recovery: want %d (1-record boundary), got %d",
+			sizeAfterFirst, fi3.Size())
+	}
+
+	// Append after recovery must continue at seq=2 (no gap).
+	e, err := dl3.Append(OpPut, "k3", "v3")
+	if err != nil {
+		t.Fatalf("append after recovery: %v", err)
+	}
+	if e.Seq != 2 {
+		t.Errorf("seq after recovery: want 2, got %d", e.Seq)
+	}
+}
+
+// TestDurableLog_PartialLengthField_Truncated proves that a crash during the 4-byte length
+// field write (io.ErrUnexpectedEOF on ReadFull) is handled by truncateTailAndSync:
+// the partial bytes are removed, the corrected size is synced, and appends resume correctly.
+func TestDurableLog_PartialLengthField_Truncated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, journalFileName)
+
+	// Write one complete record and close.
+	dl1, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	dl1.Append(OpPut, "key", "val")
+	dl1.Close()
+
+	fi1, _ := os.Stat(path)
+	sizeAfterFirst := fi1.Size()
+
+	// Simulate a crash mid-way through writing the 4-byte length field of the next record
+	// by appending 2 garbage bytes to the journal file.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	f.Write([]byte{0xAB, 0xCD}) // partial length field
+	f.Close()
+
+	// Reopen: partial length field must be removed and size synced.
+	dl2, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open after partial length field: %v", err)
+	}
 	defer dl2.Close()
 
+	// Only the first complete record survives.
 	entries, err := dl2.EntriesAfter(0, 0)
 	if err != nil {
 		t.Fatalf("entries: %v", err)
 	}
-	// Only the first complete record should survive.
 	if len(entries) != 1 {
-		t.Errorf("want 1 entry (partial tail trimmed), got %d", len(entries))
+		t.Errorf("entries after partial-length recovery: want 1, got %d", len(entries))
+	}
+
+	// File size must be restored to the clean boundary.
+	fi2, _ := os.Stat(path)
+	if fi2.Size() != sizeAfterFirst {
+		t.Errorf("file size after partial-length recovery: want %d, got %d",
+			sizeAfterFirst, fi2.Size())
+	}
+
+	// Append continues at seq=2.
+	e, err := dl2.Append(OpPut, "k2", "v2")
+	if err != nil {
+		t.Fatalf("append after partial-length recovery: %v", err)
+	}
+	if e.Seq != 2 {
+		t.Errorf("seq after partial-length recovery: want 2, got %d", e.Seq)
 	}
 }
 
@@ -710,8 +806,9 @@ func TestDurableLog_ReopenAfterSyncedAppend_EntryPreserved(t *testing.T) {
 // ── rollback failure / poisoned-log tests ─────────────────────────────────────
 
 // TestDurableLog_RollbackSyncFails_PoisonsLog verifies that when the main sync fails
-// AND the rollback sync also fails (because syncFn always fails), the log is marked
-// poisoned and subsequent Append calls return ErrPoisonedLog.
+// AND the rollback sync also fails, the log is marked poisoned and the returned error is
+// a *RollbackError whose Unwrap() chain contains ErrPoisonedLog, the original sync error,
+// and the rollback sync error — all inspectable via errors.Is.
 func TestDurableLog_RollbackSyncFails_PoisonsLog(t *testing.T) {
 	dir := t.TempDir()
 	dl, err := OpenDurableLog(dir)
@@ -720,19 +817,48 @@ func TestDurableLog_RollbackSyncFails_PoisonsLog(t *testing.T) {
 	}
 	defer dl.Close()
 
-	// syncFn always fails: main sync fails → rollback sync also fails → log poisoned.
-	dl.syncFn = func() error { return errors.New("permanent disk error") }
+	// Use DISTINCT sentinel errors so we can verify each is independently inspectable.
+	mainSyncErr := errors.New("main sync failed (injected)")
+	rollbackSyncErr := errors.New("rollback sync failed (injected)")
+	calls := 0
+	dl.syncFn = func() error {
+		calls++
+		if calls == 1 {
+			return mainSyncErr // main sync fails → triggers rollback
+		}
+		return rollbackSyncErr // rollback sync also fails → log poisoned
+	}
 
 	_, err = dl.Append(OpPut, "k", "v")
 	if err == nil {
 		t.Fatal("Append with always-failing syncFn: want error, got nil")
 	}
+
+	// All three errors must be in the chain.
 	if !errors.Is(err, ErrPoisonedLog) {
-		t.Errorf("want ErrPoisonedLog in error chain, got %v", err)
+		t.Errorf("errors.Is(err, ErrPoisonedLog): want true, got false; err=%v", err)
+	}
+	if !errors.Is(err, mainSyncErr) {
+		t.Errorf("errors.Is(err, mainSyncErr): want true (original error inspectable); err=%v", err)
+	}
+	if !errors.Is(err, rollbackSyncErr) {
+		t.Errorf("errors.Is(err, rollbackSyncErr): want true (rollback error inspectable); err=%v", err)
+	}
+
+	// The error must be a *RollbackError.
+	var rbErr *RollbackError
+	if !errors.As(err, &rbErr) {
+		t.Fatalf("errors.As(*RollbackError): want true, got false")
+	}
+	if rbErr.Original == nil {
+		t.Error("RollbackError.Original: want non-nil")
+	}
+	if rbErr.Rollback == nil {
+		t.Error("RollbackError.Rollback: want non-nil")
 	}
 
 	// Subsequent Append must also return ErrPoisonedLog (no matter the syncFn).
-	dl.syncFn = func() error { return nil } // restore so the check is purely on poisoned state
+	dl.syncFn = func() error { return nil }
 	_, err = dl.Append(OpPut, "k2", "v2")
 	if !errors.Is(err, ErrPoisonedLog) {
 		t.Errorf("second Append after poison: want ErrPoisonedLog, got %v", err)
@@ -740,13 +866,13 @@ func TestDurableLog_RollbackSyncFails_PoisonsLog(t *testing.T) {
 }
 
 // TestDurableLog_WriteAndTruncateFail_PoisonsLog verifies that when Write fails and the
-// rollback Truncate also fails, the log is marked poisoned.
+// rollback truncateFn also fails, the log is marked poisoned. The returned *RollbackError
+// contains ErrPoisonedLog and the injected truncate sentinel in its Unwrap() chain.
 //
-// Mechanism: replace dl.f with a read-only file descriptor pointing at the same path.
-//   - f.Seek(0, SeekCurrent) succeeds (seeks are position queries; no write permission needed).
-//   - f.Write(...) fails with EBADF / "write: bad file descriptor" on most platforms.
-//   - rollback calls f.Truncate(...) which also fails (truncate requires write permission).
-//   - The double failure marks the log poisoned and returns ErrPoisonedLog.
+// Write failure mechanism: dl.f is replaced with a read-only fd so f.Write returns an
+// error. The pre-write f.Seek(0, SeekCurrent) succeeds (seeks don't need write access).
+// Truncate failure mechanism: truncateFn is injected with a sentinel error so the rollback
+// error is distinct and inspectable via errors.Is.
 func TestDurableLog_WriteAndTruncateFail_PoisonsLog(t *testing.T) {
 	dir := t.TempDir()
 	dl, err := OpenDurableLog(dir)
@@ -755,8 +881,12 @@ func TestDurableLog_WriteAndTruncateFail_PoisonsLog(t *testing.T) {
 	}
 	// DO NOT defer dl.Close() — we replace dl.f below.
 
-	// Replace dl.f with a read-only descriptor to the same file.
-	// The existing write-capable fd is closed to avoid a leak.
+	// Inject a sentinel truncate error so the rollback failure is inspectable.
+	truncateErr := errors.New("injected truncate failure (rollback)")
+	dl.truncateFn = func(int64) error { return truncateErr }
+
+	// Replace dl.f with a read-only descriptor so Write fails.
+	// The original write-capable fd is closed to avoid a leak.
 	roPath := dl.path
 	dl.f.Close()
 	roFD, openErr := os.Open(roPath) // O_RDONLY
@@ -770,9 +900,25 @@ func TestDurableLog_WriteAndTruncateFail_PoisonsLog(t *testing.T) {
 	if err == nil {
 		t.Fatal("Append on read-only fd: want error, got nil")
 	}
-	// The log must be poisoned because Write failed and rollback Truncate also failed.
+
+	// ErrPoisonedLog must be in the chain.
 	if !errors.Is(err, ErrPoisonedLog) {
-		t.Errorf("want ErrPoisonedLog after write+truncate failure, got %v", err)
+		t.Errorf("errors.Is(err, ErrPoisonedLog): want true; err=%v", err)
+	}
+	// The injected truncate sentinel must be in the chain (rollback error inspectable).
+	if !errors.Is(err, truncateErr) {
+		t.Errorf("errors.Is(err, truncateErr): want true; err=%v", err)
+	}
+	// Must be a *RollbackError with both Original and Rollback populated.
+	var rbErr *RollbackError
+	if !errors.As(err, &rbErr) {
+		t.Fatalf("errors.As(*RollbackError): want true")
+	}
+	if rbErr.Original == nil {
+		t.Error("RollbackError.Original: want non-nil (write error)")
+	}
+	if !errors.Is(rbErr.Rollback, truncateErr) {
+		t.Errorf("RollbackError.Rollback: want truncateErr in chain, got %v", rbErr.Rollback)
 	}
 
 	// Future Appends must also be refused.
@@ -849,5 +995,69 @@ func TestDurableLog_SuccessfulRollback_AllowsSequenceReuse(t *testing.T) {
 	}
 	if entries[1].Key != "second-retry" {
 		t.Errorf("key: want 'second-retry', got %q", entries[1].Key)
+	}
+}
+
+// TestDurableLog_RollbackSeekFailure_PoisonsLog verifies the intermediate rollback failure
+// path where truncateFn succeeds but seekFn fails. The returned *RollbackError must have
+// ErrPoisonedLog, the original sync error, and the seek error all in its Unwrap() chain.
+//
+// Mechanism:
+//  1. syncFn fails on call 1 (main sync) → triggers rollback.
+//  2. rollback: truncateFn succeeds (real truncate).
+//  3. rollback: seekFn fails with a sentinel error.
+//  4. Log is poisoned; *RollbackError is returned with all three errors inspectable.
+func TestDurableLog_RollbackSeekFailure_PoisonsLog(t *testing.T) {
+	dir := t.TempDir()
+	dl, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer dl.Close()
+
+	mainSyncErr := errors.New("main sync failed (injected)")
+	seekErr := errors.New("rollback seek failed (injected)")
+
+	// Main sync fails on call 1; rollback sync (call 2) succeeds — but rollback seek
+	// fails first, so the rollback sync is never reached.
+	dl.syncFn = syncOnceFailFn(mainSyncErr)
+	// seekFn is called only in rollback (the pre-write offset capture uses dl.f.Seek directly).
+	dl.seekFn = func(offset int64, whence int) (int64, error) {
+		return 0, seekErr
+	}
+
+	_, err = dl.Append(OpPut, "k", "v")
+	if err == nil {
+		t.Fatal("Append with failing sync+seek: want error, got nil")
+	}
+
+	// All three errors must be inspectable via errors.Is.
+	if !errors.Is(err, ErrPoisonedLog) {
+		t.Errorf("errors.Is(err, ErrPoisonedLog): want true; err=%v", err)
+	}
+	if !errors.Is(err, mainSyncErr) {
+		t.Errorf("errors.Is(err, mainSyncErr): want true (original error preserved); err=%v", err)
+	}
+	if !errors.Is(err, seekErr) {
+		t.Errorf("errors.Is(err, seekErr): want true (rollback error preserved); err=%v", err)
+	}
+
+	// The error must be a *RollbackError.
+	var rbErr *RollbackError
+	if !errors.As(err, &rbErr) {
+		t.Fatalf("errors.As(*RollbackError): want true")
+	}
+	if !errors.Is(rbErr.Original, mainSyncErr) {
+		t.Errorf("RollbackError.Original: want mainSyncErr in chain, got %v", rbErr.Original)
+	}
+	if !errors.Is(rbErr.Rollback, seekErr) {
+		t.Errorf("RollbackError.Rollback: want seekErr in chain, got %v", rbErr.Rollback)
+	}
+
+	// Future Appends must be rejected (log is poisoned).
+	dl.seekFn = dl.f.Seek // restore so the check is on poisoned state only
+	_, err = dl.Append(OpPut, "k2", "v2")
+	if !errors.Is(err, ErrPoisonedLog) {
+		t.Errorf("Append after seek-failure poison: want ErrPoisonedLog, got %v", err)
 	}
 }

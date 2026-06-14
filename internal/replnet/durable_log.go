@@ -36,25 +36,34 @@ type indexEntry struct {
 // file on disk. Every Append is durably synced to disk before returning.
 //
 // Durability guarantee:
-//   - Each Append writes the complete record, calls Sync, then updates the in-memory
+//   - Each Append writes the complete record, calls syncFn, then updates the in-memory
 //     index and advances nextSeq. If write or sync fails, rollback() truncates the file
-//     back to the pre-write offset (and syncs the truncation) so no partial record is
-//     left on disk. If rollback itself fails, the log is marked poisoned and all future
-//     Append calls return ErrPoisonedLog until the log is closed and reopened.
+//     back to the pre-write offset (via truncateFn) and syncs the truncation so no partial
+//     record is left on disk. If rollback itself fails (truncateFn, seekFn, or syncFn returns
+//     an error), the log is marked poisoned and all future Append calls return ErrPoisonedLog
+//     until the log is closed and reopened. Rollback errors are returned as *RollbackError so
+//     callers can inspect ErrPoisonedLog, the original error, and the rollback error in chain.
+//
+// Injectable file operations:
+//   - syncFn defaults to f.Sync (used in Append and rollback)
+//   - truncateFn defaults to f.Truncate (used in rollback only)
+//   - seekFn defaults to f.Seek (used in rollback only)
 //
 // Scope:
 //   - Primary nodes only. Followers do not hold a DurableLog.
 //   - No automatic log truncation in Phase 26.
 //   - Goroutine-safe.
 type DurableLog struct {
-	mu       sync.RWMutex
-	f        *os.File
-	index    []indexEntry // in-memory index built from replay on open
-	nextSeq  uint64       // next seq to assign; starts at 1
-	closed   bool
-	poisoned bool         // true if a rollback failure has made this log unusable
-	path     string       // full path to journal file, for Stats()
-	syncFn   func() error // injectable for testing; defaults to f.Sync
+	mu         sync.RWMutex
+	f          *os.File
+	index      []indexEntry // in-memory index built from replay on open
+	nextSeq    uint64       // next seq to assign; starts at 1
+	closed     bool
+	poisoned   bool                            // true if a rollback failure has made this log unusable
+	path       string                          // full path to journal file, for Stats()
+	syncFn     func() error                    // injectable; defaults to f.Sync
+	truncateFn func(int64) error               // injectable; defaults to f.Truncate (rollback only)
+	seekFn     func(int64, int) (int64, error) // injectable; defaults to f.Seek (rollback only)
 }
 
 // OpenDurableLog opens (or creates) the binary journal file in dataDir and replays
@@ -76,7 +85,9 @@ func OpenDurableLog(dataDir string) (*DurableLog, error) {
 		nextSeq: 1,
 		path:    path,
 	}
-	dl.syncFn = f.Sync // default: real fsync; override in tests to inject failures
+	dl.syncFn = f.Sync         // default: real fsync; override in tests to inject failures
+	dl.truncateFn = f.Truncate // default: real truncate; override in tests for rollback path
+	dl.seekFn = f.Seek         // default: real seek; override in tests for rollback path
 
 	if err := dl.replay(); err != nil {
 		f.Close()
@@ -90,6 +101,29 @@ func OpenDurableLog(dataDir string) (*DurableLog, error) {
 	return dl, nil
 }
 
+// truncateTailAndSync removes a partial-tail record at offset by truncating the file,
+// seeking to the new end, and syncing to make the corrected length durable.
+//
+// This is used during replay to recover from a crash that left a partial record at the
+// end of the journal. It uses the real file methods (not the injectable seams) because
+// it runs during OpenDurableLog before tests have a chance to override them — and because
+// partial-tail recovery must always be durable.
+//
+// Returns an error if truncate, seek, or sync fails; OpenDurableLog will then fail rather
+// than returning a log whose tail correction could not be persisted.
+func (dl *DurableLog) truncateTailAndSync(offset int64) error {
+	if err := dl.f.Truncate(offset); err != nil {
+		return fmt.Errorf("replnet: durable log: truncate tail at %d: %w", offset, err)
+	}
+	if _, err := dl.f.Seek(offset, io.SeekStart); err != nil {
+		return fmt.Errorf("replnet: durable log: seek after tail truncate: %w", err)
+	}
+	if err := dl.f.Sync(); err != nil {
+		return fmt.Errorf("replnet: durable log: sync after tail truncate: %w", err)
+	}
+	return nil
+}
+
 // replay reads all records from the journal and populates the in-memory index.
 //
 // Sequence invariants enforced during replay:
@@ -100,7 +134,8 @@ func OpenDurableLog(dataDir string) (*DurableLog, error) {
 //
 // Partial-tail handling:
 //   - EOF at record boundary → clean stop.
-//   - io.ErrUnexpectedEOF reading length or body → partial tail, truncate and stop.
+//   - io.ErrUnexpectedEOF reading length or body → partial tail; truncateTailAndSync removes
+//     the partial record and syncs the corrected length. OpenDurableLog fails if this sync fails.
 //   - CRC mismatch on a complete record → ErrCorruptedJournal (hard error, not truncated).
 func (dl *DurableLog) replay() error {
 	if _, err := dl.f.Seek(0, io.SeekStart); err != nil {
@@ -119,8 +154,9 @@ func (dl *DurableLog) replay() error {
 				return nil // clean end of file
 			}
 			if err == io.ErrUnexpectedEOF {
-				// Partial length field: crash mid-write. Truncate to last good record.
-				return dl.f.Truncate(offset)
+				// Partial length field: crash mid-write. Truncate to last good record
+				// and sync so the corrected file length is durable.
+				return dl.truncateTailAndSync(offset)
 			}
 			return err
 		}
@@ -130,8 +166,8 @@ func (dl *DurableLog) replay() error {
 		body := make([]byte, recLen)
 		if _, err := io.ReadFull(dl.f, body); err != nil {
 			if err == io.ErrUnexpectedEOF {
-				// Partial record body: crash mid-write. Truncate.
-				return dl.f.Truncate(offset)
+				// Partial record body: crash mid-write. Truncate and sync.
+				return dl.truncateTailAndSync(offset)
 			}
 			return err
 		}
@@ -191,34 +227,32 @@ func (dl *DurableLog) replay() error {
 }
 
 // rollback undoes a partial or unsynced Append by truncating the file back to offset
-// and syncing the truncation to make it durable.
+// (via truncateFn), resetting the file position (via seekFn), and syncing the truncation
+// (via syncFn) to make the corrected length durable.
 //
-// If truncation, seek, or sync fails, the log is marked poisoned (dl.poisoned = true)
-// and a combined error wrapping the rollback failure is returned. The caller must then
-// return this error to its own caller; future Append calls on a poisoned log return
-// ErrPoisonedLog. Closing and reopening the log clears the poisoned state.
+// If any step fails, the log is marked poisoned (dl.poisoned = true) and a *RollbackError
+// is returned. *RollbackError.Unwrap() returns [ErrPoisonedLog, originalErr, rollbackErr],
+// so callers can use errors.Is to inspect all three. Future Append calls on a poisoned log
+// return ErrPoisonedLog. Closing and reopening the log clears the poisoned state.
 //
-// originalErr is included in the error message for context; it is NOT wrapped (callers
-// handle wrapping of the original error separately on the success path).
+// On success (all three steps pass), rollback returns nil and the caller returns originalErr
+// to its own caller.
 //
 // Caller must hold dl.mu.Lock.
 func (dl *DurableLog) rollback(offset int64, originalErr error) error {
-	if err := dl.f.Truncate(offset); err != nil {
+	if err := dl.truncateFn(offset); err != nil {
 		dl.poisoned = true
-		return fmt.Errorf("%w: truncate failed during rollback (original: %v, rollback: %v)",
-			ErrPoisonedLog, originalErr, err)
+		return &RollbackError{Original: originalErr, Rollback: fmt.Errorf("truncate: %w", err)}
 	}
-	if _, err := dl.f.Seek(offset, io.SeekStart); err != nil {
+	if _, err := dl.seekFn(offset, io.SeekStart); err != nil {
 		dl.poisoned = true
-		return fmt.Errorf("%w: seek failed during rollback (original: %v, rollback: %v)",
-			ErrPoisonedLog, originalErr, err)
+		return &RollbackError{Original: originalErr, Rollback: fmt.Errorf("seek: %w", err)}
 	}
 	// Sync the truncation: if the original write landed in the page cache, the truncation
 	// must also be synced to ensure the file length update is durable before we return.
 	if err := dl.syncFn(); err != nil {
 		dl.poisoned = true
-		return fmt.Errorf("%w: sync failed during rollback (original: %v, rollback: %v)",
-			ErrPoisonedLog, originalErr, err)
+		return &RollbackError{Original: originalErr, Rollback: fmt.Errorf("sync: %w", err)}
 	}
 	return nil
 }

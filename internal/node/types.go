@@ -125,7 +125,7 @@ type BackgroundSyncStatus struct {
 	// is currently unreachable. Never interpret LagEntries as zero-lag when LagKnown is false.
 	FollowerLastAppliedSeq uint64     `json:"follower_last_applied_seq"`
 	PrimaryLatestSeq       uint64     `json:"primary_latest_seq,omitempty"`
-	LagEntries             int64      `json:"lag_entries,omitempty"`
+	LagEntries             int64      `json:"lag_entries"`
 	LagKnown               bool       `json:"lag_known"`
 	LagObservedAt          *time.Time `json:"lag_observed_at,omitempty"`
 

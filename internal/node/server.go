@@ -19,7 +19,8 @@ import (
 // Scope limitations:
 //   - No Raft, no consensus, no quorum replication, no automatic leader election.
 //   - No distributed sharding or shard migration.
-//   - Replication is explicit pull-based only (no background sync loop).
+//   - Replication is pull-based only (explicit via POST /replication/sync, or automatic
+//     background pull when BackgroundSync is enabled on a follower node).
 //   - Each Server is an independent single-process node.
 type Server struct {
 	opts   Options
@@ -42,6 +43,10 @@ type Server struct {
 	replicator     *replnet.Replicator
 	lastApplied    uint64      // accessed via atomic; initialised from stateStore on Open
 	syncInProgress atomic.Bool // true while a SyncFromPrimary call is in flight
+
+	// Background sync (Phase 27, follower only).
+	// bgWorker is non-nil when BackgroundSync.Enabled is true.
+	bgWorker *backgroundSyncWorker
 }
 
 // Open validates opts, opens (or creates) the local Engine, and wires up the HTTP mux.
@@ -90,7 +95,19 @@ func Open(opts Options) (*Server, error) {
 		s.stateStore = ss
 		// Restore cursor from persistent state.
 		atomic.StoreUint64(&s.lastApplied, ss.LastAppliedSeq())
-		s.replicator = replnet.NewReplicator(opts.Replication.PrimaryBaseURL, 0)
+
+		// Use a dedicated timeout for background-sync requests if configured,
+		// otherwise use the replicator default.
+		replTimeout := time.Duration(0)
+		if opts.Replication.BackgroundSync.Enabled && opts.Replication.BackgroundSync.RequestTimeout.Duration > 0 {
+			replTimeout = opts.Replication.BackgroundSync.RequestTimeout.Duration
+		}
+		s.replicator = replnet.NewReplicator(opts.Replication.PrimaryBaseURL, replTimeout)
+
+		// Phase 27: optional background sync worker.
+		if opts.Replication.BackgroundSync.Enabled {
+			s.bgWorker = newBackgroundSyncWorker(opts.Replication.BackgroundSync, s.SyncFromPrimary)
+		}
 	}
 
 	s.registerRoutes()
@@ -115,6 +132,7 @@ func (s *Server) Addr() string {
 
 // Start binds the configured Addr and begins serving HTTP requests.
 // It blocks until the server is stopped via Close or an error occurs.
+// If background sync is configured on a follower, the worker is started after binding.
 func (s *Server) Start() error {
 	s.mu.Lock()
 	if s.closed {
@@ -131,6 +149,11 @@ func (s *Server) Start() error {
 	s.srv = srv
 	s.mu.Unlock()
 
+	// Start the background sync worker after the listener is bound.
+	if s.bgWorker != nil {
+		s.bgWorker.start()
+	}
+
 	// Serve blocks; ErrServerClosed is normal on shutdown.
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
@@ -141,6 +164,7 @@ func (s *Server) Start() error {
 // StartBackground binds and starts the server in a goroutine.
 // It waits until the listener is bound before returning so callers can
 // immediately use Addr(). Returns any bind error synchronously.
+// If background sync is configured on a follower, the worker is started after binding.
 func (s *Server) StartBackground() error {
 	s.mu.Lock()
 	if s.closed {
@@ -160,18 +184,36 @@ func (s *Server) StartBackground() error {
 	go func() {
 		_ = srv.Serve(ln)
 	}()
+
+	// Start the background sync worker after the listener is bound.
+	if s.bgWorker != nil {
+		s.bgWorker.start()
+	}
+
 	return nil
 }
 
 // Close shuts down the HTTP server and closes the Engine.
 // It is safe to call Close multiple times.
+// The background sync worker (if any) is stopped before other resources are released.
 func (s *Server) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return nil
 	}
 	s.closed = true
+	bgWorker := s.bgWorker
+	s.mu.Unlock()
+
+	// Stop the background sync worker first so it does not access resources
+	// after they are closed. stop() cancels the context and waits for the goroutine.
+	if bgWorker != nil {
+		bgWorker.stop()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	var firstErr error
 	if s.srv != nil {
@@ -319,6 +361,9 @@ func (s *Server) ApplyReplicationEntries(entries []replnet.Entry) (uint64, error
 //
 // If the primary returns a replication gap (HTTP 409), SyncFromPrimary propagates
 // a *replnet.ReplicationGapError which callers can check with errors.As.
+//
+// This method is the single authoritative synchronization path used by both
+// POST /replication/sync (manual) and the background sync worker (automatic).
 func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 	if s.replicator == nil {
 		return SyncResult{}, fmt.Errorf("node: SyncFromPrimary called on non-follower node")
@@ -332,52 +377,83 @@ func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 	}
 	defer s.syncInProgress.Store(false)
 
+	bgEnabled := s.bgWorker != nil
+
 	before := atomic.LoadUint64(&s.lastApplied)
-	entries, err := s.replicator.PullEntries(ctx, before, 0)
+	pr, err := s.replicator.PullEntries(ctx, before, 0)
 	if err != nil {
 		var gapErr *replnet.ReplicationGapError
 		if errors.As(err, &gapErr) {
 			return SyncResult{
-				SourceNode:     s.opts.Replication.PrimaryBaseURL,
-				FollowerNode:   s.opts.NodeID,
-				LastAppliedSeq: before,
-				Replication:    s.ReplicationStatus(),
-				Gap:            gapErr,
+				SourceNode:            s.opts.Replication.PrimaryBaseURL,
+				FollowerNode:          s.opts.NodeID,
+				LastAppliedSeq:        before,
+				BackgroundSyncEnabled: bgEnabled,
+				Replication:           s.ReplicationStatus(),
+				Gap:                   gapErr,
 			}, err
 		}
 		return SyncResult{
-			SourceNode:     s.opts.Replication.PrimaryBaseURL,
-			FollowerNode:   s.opts.NodeID,
-			LastAppliedSeq: before,
-			Replication:    s.ReplicationStatus(),
+			SourceNode:            s.opts.Replication.PrimaryBaseURL,
+			FollowerNode:          s.opts.NodeID,
+			LastAppliedSeq:        before,
+			BackgroundSyncEnabled: bgEnabled,
+			Replication:           s.ReplicationStatus(),
 		}, fmt.Errorf("node: pull from primary: %w", err)
 	}
 
-	fetched := len(entries)
-	lastSeq, err := s.ApplyReplicationEntries(entries)
+	fetched := len(pr.Entries)
+	lastSeq, err := s.ApplyReplicationEntries(pr.Entries)
 	if err != nil {
 		return SyncResult{
-			SourceNode:     s.opts.Replication.PrimaryBaseURL,
-			FollowerNode:   s.opts.NodeID,
-			Fetched:        fetched,
-			LastAppliedSeq: lastSeq,
-			Replication:    s.ReplicationStatus(),
+			SourceNode:            s.opts.Replication.PrimaryBaseURL,
+			FollowerNode:          s.opts.NodeID,
+			Fetched:               fetched,
+			LastAppliedSeq:        lastSeq,
+			PrimaryLatestSeq:      pr.PrimaryLatestSeq,
+			BackgroundSyncEnabled: bgEnabled,
+			Replication:           s.ReplicationStatus(),
 		}, err
 	}
 
 	// Count entries actually applied (seq > before), not just fetched.
 	applied := 0
-	for _, e := range entries {
+	for _, e := range pr.Entries {
 		if e.Seq > before {
 			applied++
 		}
 	}
+
+	// Compute operation-count lag. After a successful pull we always know the
+	// primary's latest seq (even if 0 means primary is empty). Clamp defensively.
+	lagKnown := true
+	var lagEntries int64
+	if pr.PrimaryLatestSeq >= lastSeq {
+		lagEntries = int64(pr.PrimaryLatestSeq - lastSeq)
+	}
+
 	return SyncResult{
-		SourceNode:     s.opts.Replication.PrimaryBaseURL,
-		FollowerNode:   s.opts.NodeID,
-		Fetched:        fetched,
-		Applied:        applied,
-		LastAppliedSeq: lastSeq,
-		Replication:    s.ReplicationStatus(),
+		SourceNode:            s.opts.Replication.PrimaryBaseURL,
+		FollowerNode:          s.opts.NodeID,
+		Fetched:               fetched,
+		Applied:               applied,
+		LastAppliedSeq:        lastSeq,
+		PrimaryLatestSeq:      pr.PrimaryLatestSeq,
+		LagEntriesAfterSync:   lagEntries,
+		LagKnown:              lagKnown,
+		BackgroundSyncEnabled: bgEnabled,
+		Replication:           s.ReplicationStatus(),
 	}, nil
+}
+
+// BackgroundSyncStatus returns the current background sync worker status.
+// Returns a disabled-state snapshot when background sync is not configured.
+func (s *Server) BackgroundSyncStatus() BackgroundSyncStatus {
+	if s.bgWorker == nil {
+		return BackgroundSyncStatus{
+			Enabled: false,
+			State:   WorkerStateDisabled,
+		}
+	}
+	return s.bgWorker.Status()
 }

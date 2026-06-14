@@ -16,7 +16,7 @@ CLUSTER_CMD      := ./cmd/shardforge-cluster
 GO               := go
 GOFLAGS          :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-replnet bench-ops bench-trace bench-report dashboard node node-demo node-demo-down replica-demo replica-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example replica-config-demo replica-status-demo ops-health-demo ops-simulate-failure-demo ops-rebalance-plan-demo smoke demo release-check final-smoke cluster-demo-up cluster-demo-smoke cluster-demo-down repl-demo-up repl-demo-smoke repl-demo-down repl-restart-demo-up repl-restart-demo-smoke repl-restart-demo-down help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-replnet bench-ops bench-trace bench-report dashboard node node-demo node-demo-down replica-demo replica-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example replica-config-demo replica-status-demo ops-health-demo ops-simulate-failure-demo ops-rebalance-plan-demo smoke demo release-check final-smoke cluster-demo-up cluster-demo-smoke cluster-demo-down repl-demo-up repl-demo-smoke repl-demo-down repl-restart-demo-up repl-restart-demo-smoke repl-restart-demo-down repl-auto-demo-up repl-auto-demo-smoke repl-auto-demo-down help
 
 all: fmt vet build
 
@@ -242,6 +242,18 @@ repl-restart-demo-smoke:
 ## repl-restart-demo-down: Phase 26 — stop restart demo processes and remove demo data directories
 repl-restart-demo-down:
 	./scripts/repl_restart_demo_down.sh
+
+## repl-auto-demo-up: Phase 27 — start automatic background pull replication demo (leader+follower, auto 500ms sync)
+repl-auto-demo-up:
+	./scripts/repl_auto_demo_up.sh
+
+## repl-auto-demo-smoke: Phase 27 — run automatic background replication smoke test (24 checks including lag tracking, restart recovery)
+repl-auto-demo-smoke:
+	./scripts/repl_auto_demo_smoke.sh
+
+## repl-auto-demo-down: Phase 27 — stop automatic replication demo and remove demo data directories
+repl-auto-demo-down:
+	./scripts/repl_auto_demo_down.sh
 
 ## clean: remove build artifacts
 clean:

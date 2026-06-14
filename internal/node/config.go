@@ -37,14 +37,44 @@ func (o Options) validate() error {
 	role := o.Replication.Role
 	switch role {
 	case "", replnet.RolePrimary:
-		// valid
+		// valid; background sync must be disabled for non-follower nodes.
+		if o.Replication.BackgroundSync.Enabled {
+			return fmt.Errorf("%w: BackgroundSync.Enabled is only valid for follower nodes", ErrInvalidOptions)
+		}
 	case replnet.RoleFollower:
 		if o.Replication.PrimaryBaseURL == "" {
 			return fmt.Errorf("%w: PrimaryBaseURL is required when Role is %q", ErrInvalidOptions, replnet.RoleFollower)
 		}
+		if err := o.Replication.BackgroundSync.validate(); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidOptions, err)
+		}
 	default:
 		return fmt.Errorf("%w: unknown replication role %q (want %q, %q, or empty for standalone)",
 			ErrInvalidOptions, role, replnet.RolePrimary, replnet.RoleFollower)
+	}
+	return nil
+}
+
+// validate checks BackgroundSyncConfig fields when background sync is enabled.
+func (c BackgroundSyncConfig) validate() error {
+	if !c.Enabled {
+		return nil // disabled: no other fields matter
+	}
+	if c.Interval.Duration <= 0 {
+		return fmt.Errorf("BackgroundSync.Interval must be positive (got %v)", c.Interval.Duration)
+	}
+	if c.RequestTimeout.Duration <= 0 {
+		return fmt.Errorf("BackgroundSync.RequestTimeout must be positive (got %v)", c.RequestTimeout.Duration)
+	}
+	if c.InitialBackoff.Duration <= 0 {
+		return fmt.Errorf("BackgroundSync.InitialBackoff must be positive (got %v)", c.InitialBackoff.Duration)
+	}
+	if c.MaxBackoff.Duration < c.InitialBackoff.Duration {
+		return fmt.Errorf("BackgroundSync.MaxBackoff (%v) must be >= InitialBackoff (%v)",
+			c.MaxBackoff.Duration, c.InitialBackoff.Duration)
+	}
+	if c.JitterFraction < 0 || c.JitterFraction > 1.0 {
+		return fmt.Errorf("BackgroundSync.JitterFraction must be in [0.0, 1.0] (got %v)", c.JitterFraction)
 	}
 	return nil
 }

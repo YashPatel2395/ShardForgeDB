@@ -1,13 +1,13 @@
 # ShardForgeDB — Final Engineering Report
 
-**Version:** v0.3.0-portfolio
-**Status:** 23-phase build complete, all tests passing, all benchmarks reproducible.
+**Version:** v0.4.0-portfolio
+**Status:** 27-phase build complete, all tests passing, all benchmarks reproducible.
 
 ---
 
 ## Executive summary
 
-ShardForgeDB is a ground-up Go database engine built as a 23-phase educational and portfolio project. It implements a WAL-backed LSM-tree key-value store, exact vector search, a real networked HTTP node runtime, a stateless routing proxy, explicit pull-based read replicas, an operations simulation layer, and a full explainability system that produces real execution traces for every key database operation. All phases are tested, benchmarked, and documented. Every design decision and limitation is explicitly stated.
+ShardForgeDB is a ground-up Go database engine built as a 27-phase educational and portfolio project. It implements a WAL-backed LSM-tree key-value store, exact vector search, a real networked HTTP node runtime, a stateless routing proxy, explicit pull-based read replicas with durable journal and cursor, automatic background pull replication with configurable interval/backoff/jitter and lag tracking, an operations simulation layer, and a full explainability system that produces real execution traces for every key database operation. All phases are tested, benchmarked, and documented. Every design decision and limitation is explicitly stated.
 
 The project is not a production database. It is an explainable, deeply documented implementation that demonstrates real engineering depth across storage, networking, routing, replication, observability, and operations tooling.
 
@@ -43,8 +43,9 @@ The project is not a production database. It is an explainable, deeply documente
 | 24 | `configs/cluster/`, `scripts/demo_cluster_*.sh`, `docs/DEMO.md`, `internal/cluster/demo_test.go` | Reproducible local 3-node cluster demo: up/smoke/down scripts, key placement proof, data isolation proof, 13 new cluster tests | 13 | — |
 | 25 | `configs/replication/`, `scripts/repl_demo_*.sh`, `internal/node` (SyncResult, Client.SyncReplication), `internal/node/replication_phase25_test.go`, `internal/cluster/replication_demo_test.go` | Networked pull-based replication demo: leader+follower HTTP nodes, explicit pull via POST /replication/sync, PUT+DELETE replication, idempotent pull, role enforcement, 20 new tests | 20 | — |
 | 26 | `internal/replnet/durable_log.go`, `internal/replnet/state_store.go`, `internal/node/replication_phase26_test.go`, `scripts/repl_restart_demo_*.sh`, `docs/REPLICATION_DURABILITY_DESIGN.md` | Durable replication state: binary journal for primary (`replication.journal` — per-Append fsync, rollback-on-failure, ErrPoisonedLog on rollback failure, replay boundary checks); identity-bound versioned JSON cursor for follower (`replication_state.json` — version+follower_node_id+primary_url+last_applied_seq+updated_at+checksum, CRC32 over all fields, directory fsync best-effort); gap detection (HTTP 409); sequence monotonicity enforcement; concurrent sync guard (`ErrSyncInProgress`); crash window documented; restart recovery demo (18 checks). Test breakdown: 31 DurableLog + 12 StateStore + 18 Phase26_node = 61 Phase 26 tests | 61 | — |
+| 27 | `internal/node/background_sync.go`, `internal/node/background_sync_test.go`, `internal/node/replication_phase27_test.go`, `internal/node/types.go` (Duration, BackgroundSyncConfig, WorkerState, BackgroundSyncStatus), `internal/replnet/replicator.go` (PullResult), `cmd/shardforge-node/main.go` (bg-sync flags), `scripts/repl_auto_demo_*.sh`, `configs/replication/demo-background-sync.json`, `docs/BACKGROUND_REPLICATION_DESIGN.md` | Automatic background pull replication with lag tracking: configurable goroutine polls primary every 500ms; exponential backoff (initial→max) with bounded jitter (fraction); ErrSyncInProgress→skip (no failure counter); *ReplicationGapError→WorkerStateBlocked (terminal); lag_entries/lag_known always set after successful sync; PullResult carries PrimaryLatestSeq from /replication/log with no extra round-trip; worker stopped before engine/journal close (use-after-free prevention); CLI flags (--bg-sync, --bg-sync-interval, --bg-sync-request-timeout, --bg-sync-initial-backoff, --bg-sync-max-backoff, --bg-sync-jitter-fraction); 24-check smoke demo; NOT Raft; NOT automatic failover. Test breakdown: 58 unit + 1 integration file = 59 Phase 27 tests | 59 | — |
 
-**Total tests:** 1023
+**Total tests:** 1082
 **Total benchmarks:** 120+
 **Packages with tests:** 23 of 27
 
@@ -58,7 +59,9 @@ The vector store uses the engine as its persistence layer and maintains an in-me
 
 The networked layer adds real HTTP/JSON nodes, a client-side consistent-hash routing gateway, and a stateless proxy. Each node is independent — no coordination, no shared state.
 
-Read replicas add explicit pull-based sync: the primary keeps a durable binary journal (`replication.journal`); followers persist their cursor to `replication_state.json` and pull entries on demand. Both survive process restarts. Gap detection returns HTTP 409 when the follower falls too far behind. No automatic background sync, no Raft.
+Read replicas add explicit pull-based sync: the primary keeps a durable binary journal (`replication.journal`); followers persist their cursor to `replication_state.json` and pull entries on demand. Both survive process restarts. Gap detection returns HTTP 409 when the follower falls too far behind.
+
+Phase 27 adds automatic background pull replication: when `--bg-sync` is set, a goroutine polls the primary every 500ms (configurable). Exponential backoff on failure, bounded jitter, `ErrSyncInProgress`→skip, `*ReplicationGapError`→terminal blocked state. Lag tracking (`lag_entries`, `lag_known`) is always accurate after any successful sync. The manual sync path is still available alongside the background worker. NOT Raft, NOT automatic failover.
 
 The ops layer adds health visibility, failure simulation (routing impact without live calls), and manual rebalance planning (key movement without data movement).
 

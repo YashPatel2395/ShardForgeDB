@@ -2,12 +2,13 @@
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer toward a real distributed system. Every phase is strictly documented, tested, and benchmarked. Every claim is audited.
 
-> **Phase 26 — Durable Replication State and Restart Recovery.** Phases 1–26 complete and locked.
+> **Phase 27 — Automatic Background Pull Replication and Lag Tracking.** Phases 1–27 complete and locked.
+> Phase 27 adds a configurable background goroutine that automatically polls the primary every 500ms (configurable), exponential backoff on failure, bounded jitter, lag tracking (`lag_entries`, `lag_known`), and terminal gap detection. No Raft, no consensus, no automatic failover.
 > Phase 26 makes replication state durable: primary binary journal (`replication.journal`) and follower cursor (`replication_state.json`) survive process restarts. Replication gap detection added (HTTP 409).
 > Phase 25 adds a reproducible leader+follower HTTP replication demo: explicit pull via `POST /replication/sync`, PUT+DELETE replication proven, idempotent pull proven, follower write-rejection proven.
 > Phase 24 adds a 3-node local cluster demo: independent HTTP nodes, stateless proxy, FNV-1a routing, data isolation proof.
 >
-> **1023 race-safe tests. 120+ reproducible benchmarks. All 26 phases complete.**
+> **1082 race-safe tests. 120+ reproducible benchmarks. All 27 phases complete.**
 
 ---
 
@@ -526,6 +527,26 @@ make node-demo-down
 - [x] 61 new tests — 31 in `internal/replnet/durable_log_test.go` + 12 in `internal/replnet/state_store_test.go` + 18 in `internal/node/replication_phase26_test.go`
 - [x] **1023 total tests (962 + 61)**
 
+**Phase 27 — Automatic Background Pull Replication and Lag Tracking** ✓ locked
+
+- [x] `docs/BACKGROUND_REPLICATION_DESIGN.md` — 17-section design doc: worker ownership, polling semantics, backoff/jitter policy, concurrent sync behavior, lag definition, terminal error classification, restart behavior, observability fields
+- [x] `internal/replnet/replicator.go` — `PullResult` struct (`Entries []Entry`, `PrimaryLatestSeq uint64`); `PullEntries` returns `PullResult`; `/replication/log` response extended with `primary_latest_seq`
+- [x] `internal/node/types.go` — `Duration` type (JSON "500ms" strings), `BackgroundSyncConfig`, `WorkerState` constants, `BackgroundSyncStatus`, extended `SyncResult` with `PrimaryLatestSeq`, `LagEntriesAfterSync`, `LagKnown`, `BackgroundSyncEnabled`
+- [x] `internal/node/config.go` — `BackgroundSyncConfig.validate()`: positive durations, max≥initial, role check
+- [x] `internal/node/background_sync.go` — `backgroundSyncWorker`: injected seams (`syncFn`, `nowFn`, `afterFn`, `jitterFn`), bounded exponential backoff, `ErrSyncInProgress`→skip, `*ReplicationGapError`→terminal blocked state, lag always known after any successful sync
+- [x] `internal/node/server.go` — `bgWorker` field; lifecycle tied to `Start`/`Close`; `Close` stops worker BEFORE closing journal/engine; `SyncFromPrimary` returns `PrimaryLatestSeq` and sets `lagKnown=true` unconditionally on success
+- [x] `internal/node/handlers.go` — `/replication/status` includes `background_sync` block; `/replication/log` includes `primary_latest_seq`; `/replication/sync` response includes lag fields
+- [x] `cmd/shardforge-node/main.go` — `--bg-sync`, `--bg-sync-interval`, `--bg-sync-request-timeout`, `--bg-sync-initial-backoff`, `--bg-sync-max-backoff`, `--bg-sync-jitter-fraction` flags
+- [x] `configs/replication/demo-background-sync.json` — Phase 27 demo config (ports 9501/9502, 500ms interval)
+- [x] `scripts/repl_auto_demo_{up,smoke,down}.sh` — 24-check smoke: health, bg enabled/running, auto PUT, lag zero, multiple keys, auto DELETE, primary stop→lag unknown, primary restart→recovery, follower restart survival
+- [x] `make repl-auto-demo-{up,smoke,down}` — Makefile targets
+- [x] `internal/node/background_sync_test.go` — 58 unit tests: config validation, lifecycle, propagation, backoff doubling/capping, success-resets-backoff, jitter bounds, `ErrSyncInProgress`-as-skip, lag known/unknown, gap terminal, Duration JSON
+- [x] `internal/node/replication_phase27_test.go` — integration tests: auto PUT/DELETE, multiple ordered mutations, empty sync, durable cursor, lag tracking, status API, manual sync coexistence, restart scenarios, `SyncResult` lag fields
+- [x] **1082 total tests (1023 + 59)**
+- [x] **NOT Raft, NOT consensus, NOT quorum, NOT automatic failover, NOT leader election**
+- [x] **Background sync is follower-only** — primary is unaffected; follower rejects writes
+- [x] **Phase 26 crash window acknowledged** — engine commit → journal append window remains
+
 ---
 
 ## Not Implemented
@@ -537,7 +558,7 @@ The following are **not** present in the current codebase and must not be claime
 | Compaction | Background compaction, automatic thresholds, leveled compaction, size-tiered compaction |
 | Consensus | Raft, Paxos, full consensus, automatic leader election, fault-tolerant quorum |
 | Distribution | Distributed sharding across nodes, shard migration, resharding, distributed transactions |
-| Replication | Automatic background replication, quorum replication, strong consistency guarantee |
+| Replication | Quorum replication, strong consistency guarantee, automatic failover |
 | Vector search | ANN, HNSW, IVF, approximate nearest-neighbour |
 | Monitoring | Production monitoring, real-time alerting, distributed operation traces |
 | Dashboard | Networked node discovery, multi-host monitoring |

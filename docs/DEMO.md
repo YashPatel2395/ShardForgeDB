@@ -334,10 +334,99 @@ The follower's replication cursor (`last_applied_seq`) is **in-memory only**.
 
 > "Networked explicit pull-based replication demo between HTTP nodes."
 
-### Still unsafe
+### Still unsafe (Phase 25)
 
 - Automatic replication, background sync
 - Raft, consensus, quorum replication
 - Persistent replication cursor
 - Leader election, automatic failover
 - Distributed transactions, distributed tracing
+
+---
+
+## Phase 27 — Automatic Background Pull Replication Demo
+
+Phase 27 adds automatic background pull replication. The follower polls the primary every 500ms without any manual operator trigger.
+
+### Scope
+
+| What it IS | What it is NOT |
+|---|---|
+| Automatic background polling (500ms interval) | Raft or consensus replication |
+| Configurable interval / backoff / jitter | Automatic failover |
+| Exponential backoff on failure | Quorum replication |
+| Terminal blocked state on gap detection | Leader election |
+| Lag tracking (`lag_entries`, `lag_known`) | Write forwarding to primary |
+| Durable cursor survives follower restart | Background compaction |
+| Manual sync still available alongside auto | Strong consistency |
+| Follower rejects writes (403) | Dynamic membership |
+
+### Quick start
+
+```bash
+make build
+make repl-auto-demo-up
+make repl-auto-demo-smoke
+make repl-auto-demo-down
+```
+
+### Manual demo sequence
+
+```bash
+# Start leader (9501) and follower with background sync (9502)
+./scripts/repl_auto_demo_up.sh
+
+# Write to leader — follower will auto-sync within ~500ms
+curl -X PUT http://127.0.0.1:9501/kv/hello \
+  -H 'Content-Type: application/json' \
+  -d '{"value":"world"}'
+
+# Wait ~1s, then check follower (no manual sync needed)
+sleep 1
+curl http://127.0.0.1:9502/kv/hello
+# → {"found":true,"key":"hello","value":"world","node_id":"follower"}
+
+# Check background sync status and lag
+curl -s http://127.0.0.1:9502/replication/status | python3 -m json.tool
+# Shows: background_sync.state=running, lag_entries=0, lag_known=true
+
+# Manual sync is still available alongside auto
+curl -X POST http://127.0.0.1:9502/replication/sync
+
+# Tear down
+./scripts/repl_auto_demo_down.sh
+```
+
+### CLI flags (Phase 27)
+
+```bash
+# Start follower with background sync
+./bin/shardforge-node \
+  --node-id follower \
+  --addr 127.0.0.1:9502 \
+  --data-dir /tmp/sfdb-follower \
+  --replication-role follower \
+  --primary-url http://127.0.0.1:9501 \
+  --bg-sync \
+  --bg-sync-interval 500ms \
+  --bg-sync-request-timeout 2s \
+  --bg-sync-initial-backoff 250ms \
+  --bg-sync-max-backoff 5s \
+  --bg-sync-jitter-fraction 0.10
+```
+
+### Lag tracking
+
+After any successful sync (even if no entries were fetched), `lag_known=true` and `lag_entries` reflects the gap between the primary's latest sequence and the follower's last applied sequence. `lag_known=false` only after a failed sync (can't reach primary).
+
+### Safe claim (Phase 27)
+
+> "Automatic background pull replication with configurable interval (500ms), exponential backoff, bounded jitter, lag tracking, and terminal gap detection. NOT Raft. NOT consensus. NOT automatic failover."
+
+### Still unsafe (Phase 27)
+
+- Raft, consensus, quorum replication
+- Leader election, automatic failover
+- Write forwarding
+- Distributed transactions, distributed tracing
+- Strong consistency (follower may lag primary)

@@ -216,7 +216,7 @@ SimulateFailure(cfg, {downNodeIDs, sampleKeys})
 | No shard migration | Keys stay on their original node. No data movement between nodes. |
 | No dynamic membership | Cluster config is static JSON loaded at startup; no join/leave |
 | No background compaction | `Compact()` must be called explicitly; no automatic thresholds |
-| No replication log persistence | `replnet.Log` is in-memory; cleared on primary restart |
+| Replication state durable (Phase 26) | Primary journal (`replication.journal`) and follower cursor (`replication_state.json`) survive restart |
 | No strong consistency | Follower reads may lag behind primary by an arbitrary number of ops |
 | Exact vector search only | O(n·d) brute-force; no HNSW, no IVF, no approximation |
 | Proxy no-retry policy | Without replication, retrying to another node would silently miss data |
@@ -312,14 +312,18 @@ New types in internal/replnet/types.go:
   ReplicationGapError ← requested_after, first_available_seq, latest_seq; HTTP 409
 
 New errors in internal/replnet/errors.go:
-  ErrReplicationGap, ErrCorruptedJournal, ErrCorruptedState, ErrInvalidSeqRegression
+  ErrReplicationGap, ErrCorruptedJournal, ErrCorruptedState, ErrInvalidSeqRegression,
+  ErrUnsupportedStateVersion, ErrFollowerIdentityMismatch, ErrPrimaryIdentityMismatch,
+  ErrPoisonedLog
 
 Changes to internal/node/server.go:
   replLog *replnet.Log  →  durableLog *replnet.DurableLog   (primary)
   + stateStore *replnet.ReplicationStateStore               (follower)
+  + syncInProgress atomic.Bool                              (concurrent-sync guard)
   Open() loads cursor from stateStore.LastAppliedSeq() on startup
   ApplyReplicationEntries() calls stateStore.AdvanceTo() after each batch
   ReplicationEntries() returns *ReplicationGapError when after+1 < firstAvailableSeq
+  SyncFromPrimary() returns ErrSyncInProgress if a sync is already in-flight
 
 Changes to internal/node/handlers.go:
   GET  /replication/log   ← returns HTTP 409 + gap struct when cursor behind journal
@@ -329,7 +333,7 @@ Changes to internal/node/handlers.go:
 Journal binary format (replication.journal):
   [4] length uint32 LE  — bytes after this field
   [4] crc32  uint32 LE  — IEEE CRC32 of payload
-  [8] seq    uint64 LE
+  [8] seq    uint64 LE  — monotonically increasing, starts at 1; 0 and MaxUint64 rejected on replay
   [1] op     uint8      — 1=put, 2=delete
   [4] keyLen uint32 LE
   [4] valLen uint32 LE
@@ -337,14 +341,31 @@ Journal binary format (replication.journal):
   [keyLen] key bytes
   [valLen] val bytes
 
-Cursor persistence (replication_state.json):
-  {"last_applied_seq":42,"checksum":1234567890}
-  checksum = CRC32 of 8-byte little-endian encoding of last_applied_seq
+Durability: each Append does write → fsync → index update. On write/sync failure, the file is
+truncated back to the pre-write offset and the truncation is synced. If rollback fails (truncate,
+seek, or sync), the log is marked poisoned and all future Appends return ErrPoisonedLog.
+
+Cursor persistence (replication_state.json) — versioned, identity-bound:
+  {
+    "version": 1,
+    "follower_node_id": "follower-1",
+    "primary_url": "http://primary:8080",
+    "last_applied_seq": 42,
+    "updated_at": "2026-06-13T12:00:00.000000000Z",
+    "checksum": 1234567890
+  }
+  checksum = CRC32 over all fields except itself (version, follower_node_id, primary_url,
+             last_applied_seq, updated_at)
   atomic write: write temp → fsync → rename
+  directory fsync: best-effort after rename (errors silently ignored; see design doc Q5)
+  identity binding: FollowerNodeID and PrimaryURL mismatch → ErrFollowerIdentityMismatch /
+                    ErrPrimaryIdentityMismatch; never silently reset to zero
 ```
 
 **Scope:** Durable state only. Replication is still pull-based and operator-triggered.
 - No Raft, no consensus, no quorum, no automatic failover, no background sync loop.
 - Primary journal is never truncated in Phase 26 (no compaction of journal).
 - Gap detection is implemented but only triggers if the journal file is externally deleted/truncated.
+- Crash window: engine.Put before journal.Append — a mutation visible in engine but not in the
+  replication log if the process crashes between the two. Journal entries ⊆ engine state.
 - `docs/REPLICATION_DURABILITY_DESIGN.md` documents all 12 design decisions.

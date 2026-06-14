@@ -49,3 +49,8 @@ var ErrFollowerIdentityMismatch = errors.New("replnet: follower identity mismatc
 // ErrPrimaryIdentityMismatch is returned when the primary URL in the state file does
 // not match the primary this follower is currently configured to use.
 var ErrPrimaryIdentityMismatch = errors.New("replnet: primary identity mismatch")
+
+// ErrPoisonedLog is returned when Append is called on a DurableLog that was rendered
+// unusable by a failed rollback (truncate, seek, or sync failed after a write or sync
+// error). The log must be closed and reopened to recover.
+var ErrPoisonedLog = errors.New("replnet: log is poisoned after rollback failure")

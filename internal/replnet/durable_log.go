@@ -36,23 +36,25 @@ type indexEntry struct {
 // file on disk. Every Append is durably synced to disk before returning.
 //
 // Durability guarantee:
-//   - Each Append writes the complete record and calls Sync before updating the
-//     in-memory index or advancing nextSeq. If either write or sync fails the record
-//     is not visible; the file is truncated back to the pre-write position so the
-//     next successful append does not leave a gap.
+//   - Each Append writes the complete record, calls Sync, then updates the in-memory
+//     index and advances nextSeq. If write or sync fails, rollback() truncates the file
+//     back to the pre-write offset (and syncs the truncation) so no partial record is
+//     left on disk. If rollback itself fails, the log is marked poisoned and all future
+//     Append calls return ErrPoisonedLog until the log is closed and reopened.
 //
 // Scope:
 //   - Primary nodes only. Followers do not hold a DurableLog.
 //   - No automatic log truncation in Phase 26.
 //   - Goroutine-safe.
 type DurableLog struct {
-	mu      sync.RWMutex
-	f       *os.File
-	index   []indexEntry // in-memory index built from replay on open
-	nextSeq uint64       // next seq to assign; starts at 1
-	closed  bool
-	path    string       // full path to journal file, for Stats()
-	syncFn  func() error // injectable for testing; defaults to f.Sync
+	mu       sync.RWMutex
+	f        *os.File
+	index    []indexEntry // in-memory index built from replay on open
+	nextSeq  uint64       // next seq to assign; starts at 1
+	closed   bool
+	poisoned bool         // true if a rollback failure has made this log unusable
+	path     string       // full path to journal file, for Stats()
+	syncFn   func() error // injectable for testing; defaults to f.Sync
 }
 
 // OpenDurableLog opens (or creates) the binary journal file in dataDir and replays
@@ -89,11 +91,17 @@ func OpenDurableLog(dataDir string) (*DurableLog, error) {
 }
 
 // replay reads all records from the journal and populates the in-memory index.
-// Rules:
+//
+// Sequence invariants enforced during replay:
+//   - seq 0 is never valid (sequences start at 1).
+//   - The first record in the journal must have seq == 1.
+//   - Each subsequent seq must equal prevSeq + 1 (no gaps, no duplicates, no regressions).
+//   - seq == math.MaxUint64 is rejected: nextSeq = seq+1 would wrap to 0.
+//
+// Partial-tail handling:
 //   - EOF at record boundary → clean stop.
-//   - io.ErrUnexpectedEOF reading length or body → partial tail, truncated.
-//   - CRC mismatch on a complete record → ErrCorruptedJournal (not safe to ignore).
-//   - Non-monotonic or duplicate sequence numbers → ErrCorruptedJournal.
+//   - io.ErrUnexpectedEOF reading length or body → partial tail, truncate and stop.
+//   - CRC mismatch on a complete record → ErrCorruptedJournal (hard error, not truncated).
 func (dl *DurableLog) replay() error {
 	if _, err := dl.f.Seek(0, io.SeekStart); err != nil {
 		return err
@@ -147,8 +155,19 @@ func (dl *DurableLog) replay() error {
 		}
 		seq := binary.LittleEndian.Uint64(payload[0:8])
 
-		// Enforce strict monotonicity: seq must equal (previous seq + 1).
-		if len(dl.index) > 0 {
+		// Sequence boundary checks.
+		if seq == 0 {
+			return fmt.Errorf("%w: sequence 0 is invalid (sequences start at 1) at offset %d",
+				ErrCorruptedJournal, offset)
+		}
+		if len(dl.index) == 0 {
+			// First record in the journal must have seq == 1.
+			if seq != 1 {
+				return fmt.Errorf("%w: first journal record has seq %d, expected 1 at offset %d",
+					ErrCorruptedJournal, seq, offset)
+			}
+		} else {
+			// Subsequent records: seq must equal prevSeq + 1.
 			prevSeq := dl.index[len(dl.index)-1].seq
 			if seq <= prevSeq {
 				return fmt.Errorf("%w: non-monotonic sequence at offset %d (got %d, previous was %d)",
@@ -160,9 +179,48 @@ func (dl *DurableLog) replay() error {
 			}
 		}
 
+		// Reject seq == MaxUint64: nextSeq = seq+1 would overflow to 0.
+		if seq == math.MaxUint64 {
+			return fmt.Errorf("%w: sequence %d at offset %d would cause nextSeq overflow to 0",
+				ErrCorruptedJournal, seq, offset)
+		}
+
 		dl.index = append(dl.index, indexEntry{seq: seq, offset: offset})
-		dl.nextSeq = seq + 1
+		dl.nextSeq = seq + 1 // safe: seq < MaxUint64, so seq+1 > 0
 	}
+}
+
+// rollback undoes a partial or unsynced Append by truncating the file back to offset
+// and syncing the truncation to make it durable.
+//
+// If truncation, seek, or sync fails, the log is marked poisoned (dl.poisoned = true)
+// and a combined error wrapping the rollback failure is returned. The caller must then
+// return this error to its own caller; future Append calls on a poisoned log return
+// ErrPoisonedLog. Closing and reopening the log clears the poisoned state.
+//
+// originalErr is included in the error message for context; it is NOT wrapped (callers
+// handle wrapping of the original error separately on the success path).
+//
+// Caller must hold dl.mu.Lock.
+func (dl *DurableLog) rollback(offset int64, originalErr error) error {
+	if err := dl.f.Truncate(offset); err != nil {
+		dl.poisoned = true
+		return fmt.Errorf("%w: truncate failed during rollback (original: %v, rollback: %v)",
+			ErrPoisonedLog, originalErr, err)
+	}
+	if _, err := dl.f.Seek(offset, io.SeekStart); err != nil {
+		dl.poisoned = true
+		return fmt.Errorf("%w: seek failed during rollback (original: %v, rollback: %v)",
+			ErrPoisonedLog, originalErr, err)
+	}
+	// Sync the truncation: if the original write landed in the page cache, the truncation
+	// must also be synced to ensure the file length update is durable before we return.
+	if err := dl.syncFn(); err != nil {
+		dl.poisoned = true
+		return fmt.Errorf("%w: sync failed during rollback (original: %v, rollback: %v)",
+			ErrPoisonedLog, originalErr, err)
+	}
+	return nil
 }
 
 // Append records a new mutation in the journal and returns the assigned Entry.
@@ -172,11 +230,12 @@ func (dl *DurableLog) replay() error {
 //  1. Encode the record.
 //  2. Capture the current file offset (for rollback on failure).
 //  3. Write the complete record (short write → rollback + error).
-//  4. Call syncFn (fsync) → on failure, truncate back to pre-write offset + error.
+//  4. Call syncFn (fsync) → on failure, rollback (truncate + sync) + error.
 //  5. Only after both write and sync succeed: update in-memory index and nextSeq.
 //  6. Return the committed Entry.
 //
 // Returns ErrClosed if the log is closed.
+// Returns ErrPoisonedLog if a previous rollback failure rendered the log unusable.
 // Returns ErrInvalidEntry if op or key is invalid.
 func (dl *DurableLog) Append(op Operation, key, value string) (Entry, error) {
 	if op != OpPut && op != OpDelete {
@@ -192,11 +251,15 @@ func (dl *DurableLog) Append(op Operation, key, value string) (Entry, error) {
 	if dl.closed {
 		return Entry{}, ErrClosed
 	}
+	if dl.poisoned {
+		return Entry{}, ErrPoisonedLog
+	}
 
-	// Guard against uint64 overflow. In practice this is unreachable, but we validate
-	// it explicitly so nextSeq never wraps to zero.
+	// Guard against uint64 overflow. nextSeq is always < MaxUint64 because:
+	//   - replay() rejects seq == MaxUint64 (would make nextSeq = 0)
+	//   - Append checks here before using nextSeq
 	if dl.nextSeq == math.MaxUint64 {
-		return Entry{}, fmt.Errorf("replnet: durable log: sequence number overflow at seq %d", dl.nextSeq)
+		return Entry{}, fmt.Errorf("replnet: durable log: sequence number overflow: nextSeq=%d", dl.nextSeq)
 	}
 
 	seq := dl.nextSeq
@@ -216,26 +279,30 @@ func (dl *DurableLog) Append(op Operation, key, value string) (Entry, error) {
 	// Step 1: write complete record.
 	n, writeErr := dl.f.Write(rec)
 	if writeErr != nil || n != len(rec) {
-		// Rollback: truncate back to pre-write position so the next append
-		// does not write after a corrupt/partial record.
-		dl.f.Truncate(offset)
-		dl.f.Seek(offset, io.SeekStart)
+		var origErr error
 		if writeErr != nil {
-			return Entry{}, fmt.Errorf("replnet: durable log: write record: %w", writeErr)
+			origErr = fmt.Errorf("replnet: durable log: write record: %w", writeErr)
+		} else {
+			origErr = fmt.Errorf("replnet: durable log: short write: wrote %d of %d bytes", n, len(rec))
 		}
-		return Entry{}, fmt.Errorf("replnet: durable log: short write: wrote %d of %d bytes", n, len(rec))
+		if rbErr := dl.rollback(offset, origErr); rbErr != nil {
+			return Entry{}, rbErr // rollback failed → log is poisoned
+		}
+		return Entry{}, origErr // rollback succeeded → return original write error
 	}
 
-	// Step 2: sync to disk. On failure, truncate to undo the write.
-	if err := dl.syncFn(); err != nil {
-		dl.f.Truncate(offset)
-		dl.f.Seek(offset, io.SeekStart)
-		return Entry{}, fmt.Errorf("replnet: durable log: sync: %w", err)
+	// Step 2: sync to disk. On failure, rollback (truncate + sync the truncation).
+	if syncErr := dl.syncFn(); syncErr != nil {
+		origErr := fmt.Errorf("replnet: durable log: sync: %w", syncErr)
+		if rbErr := dl.rollback(offset, origErr); rbErr != nil {
+			return Entry{}, rbErr // rollback failed → log is poisoned
+		}
+		return Entry{}, origErr // rollback succeeded → return original sync error
 	}
 
 	// Both write and sync succeeded — now commit to in-memory state.
 	dl.index = append(dl.index, indexEntry{seq: seq, offset: offset})
-	dl.nextSeq++
+	dl.nextSeq++ // safe: seq < MaxUint64, so nextSeq = seq+1 > 0
 
 	ts := time.Unix(0, tsNano).UTC()
 	return Entry{Seq: seq, Op: op, Key: key, Value: value, Timestamp: ts}, nil

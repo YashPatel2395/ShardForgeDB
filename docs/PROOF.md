@@ -32,7 +32,7 @@ This file records the evidence that each phase was implemented correctly and pas
 | 23 | `node/explain endpoints`, `node/client`, `shardforge explain-node` | COMPLETE | 24 new (929 total) | — | Single-node HTTP only; no cross-node trace propagation |
 | 24 | `configs/cluster/demo-3node.json`, `scripts/demo_cluster_*.sh`, `docs/DEMO.md` | COMPLETE | 13 new (942 total) | — | Local demo only; no Raft; no failover; no shard migration |
 | 25 | `configs/replication/demo-leader-follower.json`, `scripts/repl_demo_*.sh`, `SyncResult` type | COMPLETE | 20 new (962 total) | — | Explicit pull-based only; cursor was in-memory (fixed Phase 26); no Raft; no quorum |
-| 26 | `internal/replnet/durable_log.go`, `internal/replnet/state_store.go`, `scripts/repl_restart_demo_*.sh` | COMPLETE | 32 new (994 total) | — | Durable journal + cursor; gap detection (409); operator-triggered only; no Raft; no quorum |
+| 26 | `internal/replnet/durable_log.go`, `internal/replnet/state_store.go`, `internal/node/replication_phase26_test.go`, `scripts/repl_restart_demo_*.sh` | COMPLETE | 59 new (1021 total) | — | Durable binary journal (per-Append fsync, rollback-on-failure, ErrPoisonedLog), identity-bound versioned JSON cursor (CRC32 all fields), replay boundary checks (seq 0, first≠1, gap, dup, MaxUint64), gap detection (HTTP 409), concurrent-sync guard (ErrSyncInProgress); operator-triggered only; no Raft; no quorum |
 
 **Validation command (all phases):**
 ```bash
@@ -41,10 +41,10 @@ make build
 make vet
 ```
 
-**Current test pass status:** 994 tests pass across 23 packages (race detector on) on Apple M3 darwin/arm64, Go 1.26.
+**Current test pass status:** 1021 tests pass across 23 packages (race detector on) on Apple M3 darwin/arm64, Go 1.26.
 
 ```
-go test -race -count=1 -v ./... | grep -c "^--- PASS:" → 929
+go test -race -count=1 -v ./... | grep -c "^--- PASS:" → 1021
 ```
 
 ---
@@ -4407,4 +4407,47 @@ SCOPE: Explicit pull-based replication only.
   Failed: 0
 
 All checks passed. Phase 25 pull-based replication demo is working correctly.
+```
+
+---
+
+## Phase 26 — Durable Replication State and Restart Recovery
+
+**Branch:** `phase-26-durable-replication-recovery`
+**Date:** 2026-06-13
+
+### What Phase 26 adds
+
+| Item | Detail |
+|---|---|
+| `DurableLog` | Binary journal (`replication.journal`). Per-Append fsync: write → sync → index update. Rollback on write/sync failure (truncate + sync). ErrPoisonedLog if rollback itself fails. |
+| Replay boundary checks | seq 0 rejected; first seq ≠ 1 rejected; duplicate seq rejected; sequence gap rejected; regressed seq rejected; seq == MaxUint64 rejected (would wrap nextSeq to 0). |
+| `ReplicationStateStore` | Identity-bound versioned JSON cursor. Schema: `{version, follower_node_id, primary_url, last_applied_seq, updated_at, checksum}`. CRC32 covers all fields. Atomic write: tmp → fsync → rename. Directory fsync: best-effort after rename (errors silently ignored; see `REPLICATION_DURABILITY_DESIGN.md` Q5). |
+| Identity binding | FollowerNodeID and PrimaryURL stored in state file. Mismatches return `ErrFollowerIdentityMismatch` / `ErrPrimaryIdentityMismatch` — never silently reset to zero. |
+| Concurrent-sync guard | `atomic.Bool syncInProgress` in Server; `SyncFromPrimary` returns `ErrSyncInProgress` if already in-flight. |
+| Crash window (documented) | engine.Put before journal.Append — mutation visible in engine but absent from replication log if process crashes between them. Journal entries ⊆ engine state is the invariant. |
+| ErrPoisonedLog | New sentinel: if rollback (truncate/seek/sync) fails after a write/sync error, the log is marked poisoned. All future Appends return ErrPoisonedLog until close+reopen. |
+
+### Test breakdown (59 Phase 26 tests, 1021 total)
+
+| File | Tests | Coverage |
+|---|---|---|
+| `internal/replnet/durable_log_test.go` | 29 | Append/retrieve, cursor, limit, restart, firstAvailableSeq, stats, timestamp, close, invalid op, corrupt record, partial tail, file creation; syncFn injection (5); replay boundaries (7); overflow guard (1); rollback/poison (4) |
+| `internal/replnet/state_store_test.go` | 12 | Fresh start, advance+load, survives restarts, idempotent advance, regression error, corrupt checksum, missing file, atomic write, follower ID mismatch, primary URL mismatch, checksum covers all fields, persist failure error not swallowed |
+| `internal/node/replication_phase26_test.go` | 18 | Primary journal restart, follower cursor restart, resume from cursor, durable stats, state persistent flag, gap 409, gap field populated, sync gap 409, firstAvailableSeq after restart, status endpoint, state after crash, both-nodes restart, delete after restart, corrupt state visible, no auto-sync, concurrent sync rejected, idempotent sync, cursor persist failure + idempotent reapply |
+
+### Restart demo output (18 checks)
+
+```
+make repl-restart-demo-up
+make repl-restart-demo-smoke   # 18 checks: journal survives restart, cursor restored, replication resumes
+make repl-restart-demo-down
+```
+
+### Validation
+
+```
+go test -race -count=1 ./... → 1021 tests, 0 failures
+make release-check            → build + vet + test + final-smoke all pass
+make repl-restart-demo-smoke  → 18/18 checks pass
 ```

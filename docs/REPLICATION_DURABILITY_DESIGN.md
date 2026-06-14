@@ -112,7 +112,12 @@ wrong primary after an operator error.
 1. Write to `{dataDir}/replication_state.json.tmp`
 2. `fsync` the temp file (durable on all platforms)
 3. `os.Rename` temp → final (atomic on POSIX)
-4. `fsync` the parent directory (durable rename on Linux; no-op on macOS)
+4. Open the parent directory and call `Sync` on it — **best-effort**: errors from `os.Open(dir)`,
+   `dir.Sync()`, and `dir.Close()` are silently ignored. On Linux, a directory fsync is required
+   to guarantee the rename is visible after a crash; on macOS it is a no-op and cannot fail.
+   The risk of skipping it (on Linux in the rare crash case) is that the state file and the temp
+   file both appear absent after a crash, which is handled by the missing-file path (`lastAppliedSeq = 0`,
+   fresh-follower re-pull). This is an acceptable degradation for Phase 26.
 
 On load: if the state file does not exist, `lastAppliedSeq = 0` (fresh follower, pull everything).
 A corrupt checksum returns `ErrCorruptedState`. An unrecognised version field returns

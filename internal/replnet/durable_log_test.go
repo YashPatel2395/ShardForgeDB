@@ -2,11 +2,14 @@ package replnet
 
 import (
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+// ── core append / retrieve tests ───────────────────────────────────────────────
 
 func TestDurableLog_AppendAndRetrieve(t *testing.T) {
 	dir := t.TempDir()
@@ -357,7 +360,199 @@ func TestDurableLog_JournalFileCreated(t *testing.T) {
 	}
 }
 
+// ── replay sequence boundary tests ─────────────────────────────────────────────
+//
+// These tests craft raw journal records with controlled sequence numbers to verify
+// that replay() enforces the invariants stated in its doc comment.
+
+// writeRawJournal writes the given records to a new journal file in dir and returns
+// the path. Uses encodeJournalRecord so each record has a valid CRC.
+func writeRawJournal(t *testing.T, dir string, records []struct {
+	seq uint64
+	op  Operation
+	key string
+}) string {
+	t.Helper()
+	path := filepath.Join(dir, journalFileName)
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create journal: %v", err)
+	}
+	for _, r := range records {
+		rec, err := encodeJournalRecord(r.seq, r.op, r.key, "val", time.Now().UnixNano())
+		if err != nil {
+			t.Fatalf("encode seq=%d: %v", r.seq, err)
+		}
+		if _, err := f.Write(rec); err != nil {
+			t.Fatalf("write seq=%d: %v", r.seq, err)
+		}
+	}
+	f.Close()
+	return path
+}
+
+func TestDurableLog_Replay_FirstSeqZero_Rejected(t *testing.T) {
+	dir := t.TempDir()
+	writeRawJournal(t, dir, []struct {
+		seq uint64
+		op  Operation
+		key string
+	}{{seq: 0, op: OpPut, key: "k"}})
+
+	_, err := OpenDurableLog(dir)
+	if !errors.Is(err, ErrCorruptedJournal) {
+		t.Errorf("seq 0: want ErrCorruptedJournal, got %v", err)
+	}
+}
+
+func TestDurableLog_Replay_FirstSeqNotOne_Rejected(t *testing.T) {
+	dir := t.TempDir()
+	// First record has seq=5 — valid CRC but invalid as first seq.
+	writeRawJournal(t, dir, []struct {
+		seq uint64
+		op  Operation
+		key string
+	}{{seq: 5, op: OpPut, key: "k"}})
+
+	_, err := OpenDurableLog(dir)
+	if !errors.Is(err, ErrCorruptedJournal) {
+		t.Errorf("first seq=5: want ErrCorruptedJournal, got %v", err)
+	}
+}
+
+func TestDurableLog_Replay_DuplicateSeq_Rejected(t *testing.T) {
+	dir := t.TempDir()
+	// Seqs: 1, 1 — duplicate.
+	writeRawJournal(t, dir, []struct {
+		seq uint64
+		op  Operation
+		key string
+	}{
+		{seq: 1, op: OpPut, key: "k1"},
+		{seq: 1, op: OpPut, key: "k2"},
+	})
+
+	_, err := OpenDurableLog(dir)
+	if !errors.Is(err, ErrCorruptedJournal) {
+		t.Errorf("duplicate seq=1: want ErrCorruptedJournal, got %v", err)
+	}
+}
+
+func TestDurableLog_Replay_RegressedSeq_Rejected(t *testing.T) {
+	dir := t.TempDir()
+	// Seqs: 1, 2, 1 — regression.
+	writeRawJournal(t, dir, []struct {
+		seq uint64
+		op  Operation
+		key string
+	}{
+		{seq: 1, op: OpPut, key: "k1"},
+		{seq: 2, op: OpPut, key: "k2"},
+		{seq: 1, op: OpPut, key: "k3"},
+	})
+
+	_, err := OpenDurableLog(dir)
+	if !errors.Is(err, ErrCorruptedJournal) {
+		t.Errorf("regressed seq: want ErrCorruptedJournal, got %v", err)
+	}
+}
+
+func TestDurableLog_Replay_SkippedSeq_Rejected(t *testing.T) {
+	dir := t.TempDir()
+	// Seqs: 1, 3 — gap (seq 2 missing).
+	writeRawJournal(t, dir, []struct {
+		seq uint64
+		op  Operation
+		key string
+	}{
+		{seq: 1, op: OpPut, key: "k1"},
+		{seq: 3, op: OpPut, key: "k3"},
+	})
+
+	_, err := OpenDurableLog(dir)
+	if !errors.Is(err, ErrCorruptedJournal) {
+		t.Errorf("skipped seq: want ErrCorruptedJournal, got %v", err)
+	}
+}
+
+func TestDurableLog_Replay_MaxUint64Seq_Rejected(t *testing.T) {
+	dir := t.TempDir()
+	// A seq == MaxUint64 would cause nextSeq = MaxUint64+1 = 0 (overflow).
+	writeRawJournal(t, dir, []struct {
+		seq uint64
+		op  Operation
+		key string
+	}{{seq: math.MaxUint64, op: OpPut, key: "k"}})
+
+	_, err := OpenDurableLog(dir)
+	if !errors.Is(err, ErrCorruptedJournal) {
+		t.Errorf("seq MaxUint64: want ErrCorruptedJournal, got %v", err)
+	}
+}
+
+func TestDurableLog_Replay_NextSeqNeverWraps(t *testing.T) {
+	// Write a journal whose last seq is MaxUint64-1. After replay nextSeq = MaxUint64.
+	// Append must refuse rather than wrapping nextSeq to 0.
+	dir := t.TempDir()
+	// We can't write 2^64-1 sequential records, so we write a single record with
+	// seq = MaxUint64-1.  This is a crafted journal; it would never occur from normal
+	// Append calls (since the Append guard prevents seq from reaching MaxUint64-1
+	// without being caught earlier), but it ensures the replay → Append boundary holds.
+	writeRawJournal(t, dir, []struct {
+		seq uint64
+		op  Operation
+		key string
+	}{{seq: math.MaxUint64 - 1, op: OpPut, key: "k"}})
+
+	// First record has seq = MaxUint64-1, not 1 — so replay rejects it.
+	_, err := OpenDurableLog(dir)
+	if err == nil {
+		t.Fatal("expected error for first seq = MaxUint64-1 (not 1)")
+	}
+	if !errors.Is(err, ErrCorruptedJournal) {
+		t.Errorf("want ErrCorruptedJournal, got %v", err)
+	}
+	// The important property: if somehow replay allowed nextSeq = MaxUint64,
+	// the Append overflow guard would refuse. Verified by TestDurableLog_AppendOverflowGuard.
+}
+
+func TestDurableLog_AppendOverflowGuard(t *testing.T) {
+	// Directly set nextSeq = MaxUint64 to verify the guard in Append.
+	dir := t.TempDir()
+	dl, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer dl.Close()
+
+	// Bypass Append to set nextSeq artificially.
+	dl.nextSeq = math.MaxUint64
+
+	_, err = dl.Append(OpPut, "k", "v")
+	if err == nil {
+		t.Fatal("want overflow error when nextSeq=MaxUint64, got nil")
+	}
+	// Verify nextSeq was NOT advanced to 0.
+	if dl.nextSeq != math.MaxUint64 {
+		t.Errorf("nextSeq after overflow guard: want MaxUint64, got %d", dl.nextSeq)
+	}
+}
+
 // ── syncFn injection tests ─────────────────────────────────────────────────────
+
+// syncOnceFailFn returns a syncFn that fails on the first call and succeeds on all
+// subsequent calls. This lets the main-sync fail (triggering rollback) while the
+// rollback-sync succeeds (leaving the log in a clean, non-poisoned state).
+func syncOnceFailFn(failErr error) func() error {
+	calls := 0
+	return func() error {
+		calls++
+		if calls == 1 {
+			return failErr
+		}
+		return nil
+	}
+}
 
 // TestDurableLog_SyncSuccess_EntryVisible verifies that after a successful Append
 // (syncFn returns nil) the entry is visible via EntriesAfter.
@@ -389,8 +584,9 @@ func TestDurableLog_SyncSuccess_EntryVisible(t *testing.T) {
 	}
 }
 
-// TestDurableLog_SyncFailure_ReturnsError verifies that when syncFn returns an error,
-// Append propagates it to the caller.
+// TestDurableLog_SyncFailure_ReturnsError verifies that when the main syncFn fails
+// and the rollback sync succeeds (log not poisoned), Append returns the original
+// sync error.
 func TestDurableLog_SyncFailure_ReturnsError(t *testing.T) {
 	dir := t.TempDir()
 	dl, err := OpenDurableLog(dir)
@@ -400,7 +596,8 @@ func TestDurableLog_SyncFailure_ReturnsError(t *testing.T) {
 	defer dl.Close()
 
 	syncErr := errors.New("disk full (injected)")
-	dl.syncFn = func() error { return syncErr }
+	// Fail main sync; succeed rollback sync so log is not poisoned.
+	dl.syncFn = syncOnceFailFn(syncErr)
 
 	_, err = dl.Append(OpPut, "key", "val")
 	if err == nil {
@@ -411,8 +608,9 @@ func TestDurableLog_SyncFailure_ReturnsError(t *testing.T) {
 	}
 }
 
-// TestDurableLog_SyncFailure_DoesNotAdvanceNextSeq verifies that when syncFn fails,
-// nextSeq is not incremented so the next successful Append reuses the same sequence.
+// TestDurableLog_SyncFailure_DoesNotAdvanceNextSeq verifies that when the main sync
+// fails (and rollback succeeds), nextSeq is not incremented, so the next successful
+// Append reuses the same sequence number.
 func TestDurableLog_SyncFailure_DoesNotAdvanceNextSeq(t *testing.T) {
 	dir := t.TempDir()
 	dl, err := OpenDurableLog(dir)
@@ -421,13 +619,13 @@ func TestDurableLog_SyncFailure_DoesNotAdvanceNextSeq(t *testing.T) {
 	}
 	defer dl.Close()
 
-	// Fail the first sync.
-	dl.syncFn = func() error { return errors.New("sync fail") }
+	// Fail main sync (call 1); rollback sync succeeds (call 2). Log not poisoned.
+	dl.syncFn = syncOnceFailFn(errors.New("sync fail"))
 	if _, err := dl.Append(OpPut, "k", "v"); err == nil {
 		t.Fatal("expected error from failing syncFn")
 	}
 
-	// Restore good sync; next Append must get seq=1 (not seq=2).
+	// Restore real sync; next Append must get seq=1 (not seq=2).
 	dl.syncFn = dl.f.Sync
 	e, err := dl.Append(OpPut, "k", "v")
 	if err != nil {
@@ -438,8 +636,8 @@ func TestDurableLog_SyncFailure_DoesNotAdvanceNextSeq(t *testing.T) {
 	}
 }
 
-// TestDurableLog_SyncFailure_DoesNotAddToIndex verifies that when syncFn fails,
-// no entry is added to the in-memory index.
+// TestDurableLog_SyncFailure_DoesNotAddToIndex verifies that when the main sync fails
+// (and rollback succeeds), no entry is added to the in-memory index.
 func TestDurableLog_SyncFailure_DoesNotAddToIndex(t *testing.T) {
 	dir := t.TempDir()
 	dl, err := OpenDurableLog(dir)
@@ -448,7 +646,8 @@ func TestDurableLog_SyncFailure_DoesNotAddToIndex(t *testing.T) {
 	}
 	defer dl.Close()
 
-	dl.syncFn = func() error { return errors.New("sync fail") }
+	// Fail main sync; rollback sync succeeds. Log not poisoned.
+	dl.syncFn = syncOnceFailFn(errors.New("sync fail"))
 	dl.Append(OpPut, "k", "v") //nolint:errcheck — intentional failure
 
 	// Index must be empty; EntriesAfter must return nothing.
@@ -461,8 +660,9 @@ func TestDurableLog_SyncFailure_DoesNotAddToIndex(t *testing.T) {
 	}
 }
 
-// TestDurableLog_ReopenAfterSyncedAppend_EntryPreserved verifies that an entry
-// written with a successful syncFn survives a process restart.
+// TestDurableLog_ReopenAfterSyncedAppend_EntryPreserved verifies that an entry written
+// with a successful sync survives a process restart, even when a prior Append failed
+// (main sync failed, rollback sync succeeded → log not poisoned).
 func TestDurableLog_ReopenAfterSyncedAppend_EntryPreserved(t *testing.T) {
 	dir := t.TempDir()
 
@@ -470,14 +670,14 @@ func TestDurableLog_ReopenAfterSyncedAppend_EntryPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	// Fail first append (sync error + truncation).
-	failErr := errors.New("transient disk error")
-	dl1.syncFn = func() error { return failErr }
+
+	// Fail first sync; rollback sync succeeds (log not poisoned).
+	dl1.syncFn = syncOnceFailFn(errors.New("transient disk error"))
 	if _, err := dl1.Append(OpPut, "bad", "entry"); err == nil {
 		t.Fatal("expected error from failing syncFn")
 	}
 
-	// Restore sync; succeed second append.
+	// Restore real sync; succeed second append.
 	dl1.syncFn = dl1.f.Sync
 	e, err := dl1.Append(OpPut, "good", "entry")
 	if err != nil {
@@ -504,5 +704,150 @@ func TestDurableLog_ReopenAfterSyncedAppend_EntryPreserved(t *testing.T) {
 	}
 	if entries[0].Key != "good" {
 		t.Errorf("entry after reopen: want key 'good', got %q", entries[0].Key)
+	}
+}
+
+// ── rollback failure / poisoned-log tests ─────────────────────────────────────
+
+// TestDurableLog_RollbackSyncFails_PoisonsLog verifies that when the main sync fails
+// AND the rollback sync also fails (because syncFn always fails), the log is marked
+// poisoned and subsequent Append calls return ErrPoisonedLog.
+func TestDurableLog_RollbackSyncFails_PoisonsLog(t *testing.T) {
+	dir := t.TempDir()
+	dl, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer dl.Close()
+
+	// syncFn always fails: main sync fails → rollback sync also fails → log poisoned.
+	dl.syncFn = func() error { return errors.New("permanent disk error") }
+
+	_, err = dl.Append(OpPut, "k", "v")
+	if err == nil {
+		t.Fatal("Append with always-failing syncFn: want error, got nil")
+	}
+	if !errors.Is(err, ErrPoisonedLog) {
+		t.Errorf("want ErrPoisonedLog in error chain, got %v", err)
+	}
+
+	// Subsequent Append must also return ErrPoisonedLog (no matter the syncFn).
+	dl.syncFn = func() error { return nil } // restore so the check is purely on poisoned state
+	_, err = dl.Append(OpPut, "k2", "v2")
+	if !errors.Is(err, ErrPoisonedLog) {
+		t.Errorf("second Append after poison: want ErrPoisonedLog, got %v", err)
+	}
+}
+
+// TestDurableLog_WriteAndTruncateFail_PoisonsLog verifies that when Write fails and the
+// rollback Truncate also fails, the log is marked poisoned.
+//
+// Mechanism: replace dl.f with a read-only file descriptor pointing at the same path.
+//   - f.Seek(0, SeekCurrent) succeeds (seeks are position queries; no write permission needed).
+//   - f.Write(...) fails with EBADF / "write: bad file descriptor" on most platforms.
+//   - rollback calls f.Truncate(...) which also fails (truncate requires write permission).
+//   - The double failure marks the log poisoned and returns ErrPoisonedLog.
+func TestDurableLog_WriteAndTruncateFail_PoisonsLog(t *testing.T) {
+	dir := t.TempDir()
+	dl, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// DO NOT defer dl.Close() — we replace dl.f below.
+
+	// Replace dl.f with a read-only descriptor to the same file.
+	// The existing write-capable fd is closed to avoid a leak.
+	roPath := dl.path
+	dl.f.Close()
+	roFD, openErr := os.Open(roPath) // O_RDONLY
+	if openErr != nil {
+		t.Fatalf("open read-only fd: %v", openErr)
+	}
+	dl.f = roFD
+	// dl.closed is still false, dl.poisoned is still false.
+
+	_, err = dl.Append(OpPut, "k", "v")
+	if err == nil {
+		t.Fatal("Append on read-only fd: want error, got nil")
+	}
+	// The log must be poisoned because Write failed and rollback Truncate also failed.
+	if !errors.Is(err, ErrPoisonedLog) {
+		t.Errorf("want ErrPoisonedLog after write+truncate failure, got %v", err)
+	}
+
+	// Future Appends must also be refused.
+	_, err = dl.Append(OpPut, "k2", "v2")
+	if !errors.Is(err, ErrPoisonedLog) {
+		t.Errorf("second Append after poison: want ErrPoisonedLog, got %v", err)
+	}
+	roFD.Close()
+}
+
+// TestDurableLog_PoisonedLog_RejectsFutureAppend verifies that once poisoned, every
+// subsequent Append returns ErrPoisonedLog regardless of the input.
+func TestDurableLog_PoisonedLog_RejectsFutureAppend(t *testing.T) {
+	dir := t.TempDir()
+	dl, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer dl.Close()
+
+	// Directly poison the log (simulating the internal state after rollback failure).
+	dl.poisoned = true
+
+	for _, op := range []Operation{OpPut, OpDelete} {
+		_, err := dl.Append(op, "k", "v")
+		if !errors.Is(err, ErrPoisonedLog) {
+			t.Errorf("Append(%s) on poisoned log: want ErrPoisonedLog, got %v", op, err)
+		}
+	}
+}
+
+// TestDurableLog_SuccessfulRollback_AllowsSequenceReuse verifies that when the main
+// sync fails but rollback succeeds, the sequence number is correctly reused by the next
+// successful Append (i.e., no gap is introduced in the journal).
+func TestDurableLog_SuccessfulRollback_AllowsSequenceReuse(t *testing.T) {
+	dir := t.TempDir()
+	dl, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer dl.Close()
+
+	// Write seq=1 successfully.
+	if _, err := dl.Append(OpPut, "first", "val"); err != nil {
+		t.Fatalf("first append: %v", err)
+	}
+
+	// Fail main sync for seq=2; rollback succeeds.
+	dl.syncFn = syncOnceFailFn(errors.New("transient"))
+	if _, err := dl.Append(OpPut, "second-failed", "val"); err == nil {
+		t.Fatal("expected sync failure")
+	}
+
+	// Restore real sync. Next Append must be seq=2 (not seq=3).
+	dl.syncFn = dl.f.Sync
+	e, err := dl.Append(OpPut, "second-retry", "val")
+	if err != nil {
+		t.Fatalf("retry append: %v", err)
+	}
+	if e.Seq != 2 {
+		t.Errorf("seq after rollback: want 2, got %d", e.Seq)
+	}
+
+	// Journal must have exactly seq=1 and seq=2 (no gap, no dup).
+	entries, err := dl.EntriesAfter(0, 0)
+	if err != nil {
+		t.Fatalf("entries: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("want 2 entries, got %d", len(entries))
+	}
+	if entries[0].Seq != 1 || entries[1].Seq != 2 {
+		t.Errorf("seqs: want [1,2], got [%d,%d]", entries[0].Seq, entries[1].Seq)
+	}
+	if entries[1].Key != "second-retry" {
+		t.Errorf("key: want 'second-retry', got %q", entries[1].Key)
 	}
 }

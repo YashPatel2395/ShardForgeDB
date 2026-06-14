@@ -838,3 +838,99 @@ func TestPhase26_IdempotentSyncAfterRestartWithNothingNew(t *testing.T) {
 			result.Applied, result.Fetched)
 	}
 }
+
+// TestPhase26_CursorPersistFailure_ErrorPropagated_IdempotentReapply proves the
+// end-to-end behaviour when cursor persistence fails after a successful engine apply:
+//
+//  1. Engine writes succeed (WAL appends to an already-open file descriptor).
+//  2. AdvanceTo / state-file write fails (can't create the .tmp file in a read-only dir).
+//  3. SyncFromPrimary returns an error.
+//  4. The persisted cursor has NOT advanced (still at the pre-failure value).
+//  5. After restoring permissions and reopening the follower, the next sync
+//     re-applies the same entries — and idempotent apply is safe.
+func TestPhase26_CursorPersistFailure_ErrorPropagated_IdempotentReapply(t *testing.T) {
+	primary := newPhase26Primary(t)
+	if err := primary.StartBackground(); err != nil {
+		t.Fatalf("start primary: %v", err)
+	}
+	primaryURL := "http://" + primary.Addr()
+
+	// Write entries 1–2 to primary.
+	doRequest(t, primary, http.MethodPut, "/kv/k1", `{"value":"v1"}`)
+	doRequest(t, primary, http.MethodPut, "/kv/k2", `{"value":"v2"}`)
+
+	followerDir := t.TempDir()
+
+	// Open follower and sync entries 1–2. Cursor persisted at 2.
+	f1 := newPhase26Follower(t, primaryURL, followerDir)
+	r1, err := f1.SyncFromPrimary(context.Background())
+	if err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	if r1.Applied != 2 || r1.LastAppliedSeq != 2 {
+		t.Fatalf("initial sync: want applied=2 seq=2, got applied=%d seq=%d", r1.Applied, r1.LastAppliedSeq)
+	}
+	f1.Close()
+
+	// Write entries 3–4 to primary while follower is down.
+	doRequest(t, primary, http.MethodPut, "/kv/k3", `{"value":"v3"}`)
+	doRequest(t, primary, http.MethodPut, "/kv/k4", `{"value":"v4"}`)
+
+	// Reopen follower. The cursor is restored at 2.
+	f2 := newPhase26Follower(t, primaryURL, followerDir)
+	if got := f2.ReplicationStatus().LastAppliedSeq; got != 2 {
+		t.Fatalf("cursor after reopen: want 2, got %d", got)
+	}
+
+	// Make the followerDir non-writable so the state-store cannot create the .tmp file.
+	// Engine writes still succeed because the WAL file descriptor is already open.
+	if err := os.Chmod(followerDir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	// Restore permissions unconditionally so the test dir is cleaned up properly.
+	t.Cleanup(func() { os.Chmod(followerDir, 0o755) })
+
+	// SyncFromPrimary must return an error because cursor persistence fails.
+	_, syncErr := f2.SyncFromPrimary(context.Background())
+	if syncErr == nil {
+		t.Fatal("SyncFromPrimary with read-only dir: want error, got nil")
+	}
+	f2.Close()
+
+	// Restore permissions.
+	if err := os.Chmod(followerDir, 0o755); err != nil {
+		t.Fatalf("chmod restore: %v", err)
+	}
+
+	// Reopen follower: cursor must still be 2 (persistence failed — state file unchanged).
+	f3 := newPhase26Follower(t, primaryURL, followerDir)
+	defer f3.Close()
+	if got := f3.ReplicationStatus().LastAppliedSeq; got != 2 {
+		t.Errorf("cursor after persist failure + reopen: want 2, got %d", got)
+	}
+
+	// Sync again: entries 3–4 are re-fetched and re-applied. Idempotent apply is safe.
+	r3, err := f3.SyncFromPrimary(context.Background())
+	if err != nil {
+		t.Fatalf("sync after persist failure: %v", err)
+	}
+	if r3.Applied != 2 {
+		t.Errorf("re-applied after persist failure: want 2, got %d", r3.Applied)
+	}
+	if r3.LastAppliedSeq != 4 {
+		t.Errorf("last_applied_seq after re-apply: want 4, got %d", r3.LastAppliedSeq)
+	}
+
+	// Verify k3 and k4 are present on the follower (re-application was correct).
+	for _, key := range []string{"k3", "k4"} {
+		w := doRequest(t, f3, http.MethodGet, "/kv/"+key, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s: %d", key, w.Code)
+		}
+		var resp getResponse
+		json.NewDecoder(w.Body).Decode(&resp)
+		if !resp.Found {
+			t.Errorf("GET %s after re-apply: want found=true", key)
+		}
+	}
+}

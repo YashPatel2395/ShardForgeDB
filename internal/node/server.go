@@ -36,10 +36,12 @@ type Server struct {
 	// stateStore is non-nil only for follower nodes (Phase 26+: persisted cursor).
 	// replicator is non-nil only for follower nodes.
 	// lastApplied is the last replication log seq applied (follower only; authoritative is stateStore).
-	durableLog  *replnet.DurableLog
-	stateStore  *replnet.ReplicationStateStore
-	replicator  *replnet.Replicator
-	lastApplied uint64 // accessed via atomic; initialised from stateStore on Open
+	// syncInProgress prevents concurrent SyncFromPrimary calls from applying the same batch twice.
+	durableLog     *replnet.DurableLog
+	stateStore     *replnet.ReplicationStateStore
+	replicator     *replnet.Replicator
+	lastApplied    uint64      // accessed via atomic; initialised from stateStore on Open
+	syncInProgress atomic.Bool // true while a SyncFromPrimary call is in flight
 }
 
 // Open validates opts, opens (or creates) the local Engine, and wires up the HTTP mux.
@@ -80,7 +82,7 @@ func Open(opts Options) (*Server, error) {
 		s.durableLog = dl
 
 	case replnet.RoleFollower:
-		ss, err := replnet.NewReplicationStateStore(opts.DataDir)
+		ss, err := replnet.NewReplicationStateStore(opts.DataDir, opts.NodeID, opts.Replication.PrimaryBaseURL)
 		if err != nil {
 			eng.Close()
 			return nil, fmt.Errorf("node: open replication state store: %w", err)
@@ -321,6 +323,15 @@ func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 	if s.replicator == nil {
 		return SyncResult{}, fmt.Errorf("node: SyncFromPrimary called on non-follower node")
 	}
+
+	// Reject concurrent syncs. Two concurrent calls could pull the same batch and attempt
+	// to apply identical entries, causing sequence-order violations or double-persistence.
+	// Choice: reject (B) — the caller should retry after the in-flight sync completes.
+	if !s.syncInProgress.CompareAndSwap(false, true) {
+		return SyncResult{}, ErrSyncInProgress
+	}
+	defer s.syncInProgress.Store(false)
+
 	before := atomic.LoadUint64(&s.lastApplied)
 	entries, err := s.replicator.PullEntries(ctx, before, 0)
 	if err != nil {

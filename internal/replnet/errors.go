@@ -24,15 +24,28 @@ var ErrClosed = errors.New("replnet: closed")
 // earliest available journal entry. The follower cannot catch up without a reseed.
 var ErrReplicationGap = errors.New("replnet: replication gap")
 
-// ErrCorruptedJournal is returned when a journal record has a CRC mismatch or
-// is structurally invalid. The journal file should be considered unrecoverable
-// past the point of corruption.
+// ErrCorruptedJournal is returned when a journal record has a CRC mismatch,
+// is structurally invalid, or violates sequence monotonicity.
 var ErrCorruptedJournal = errors.New("replnet: corrupted journal record")
 
 // ErrCorruptedState is returned when the replication state file fails its checksum
-// verification. The follower must treat its cursor as unknown (reset to 0 or reseed).
+// verification, JSON decoding, or identity validation.
+// The follower must treat its cursor as unknown (reset to 0 or reseed).
 var ErrCorruptedState = errors.New("replnet: corrupted replication state")
 
-// ErrInvalidSeqRegression is returned when an Append is attempted with a sequence
-// number that is less than or equal to the current tail (sequence must advance).
+// ErrInvalidSeqRegression is returned when a sequence number is less than or equal
+// to the current tail (sequence must strictly advance), or when StateStore.AdvanceTo
+// is called with a seq lower than the current persisted cursor.
 var ErrInvalidSeqRegression = errors.New("replnet: invalid sequence regression")
+
+// ErrUnsupportedStateVersion is returned when the replication state file contains
+// an unrecognised version field.
+var ErrUnsupportedStateVersion = errors.New("replnet: unsupported state version")
+
+// ErrFollowerIdentityMismatch is returned when the follower node ID in the state
+// file does not match the node that is trying to load it.
+var ErrFollowerIdentityMismatch = errors.New("replnet: follower identity mismatch")
+
+// ErrPrimaryIdentityMismatch is returned when the primary URL in the state file does
+// not match the primary this follower is currently configured to use.
+var ErrPrimaryIdentityMismatch = errors.New("replnet: primary identity mismatch")

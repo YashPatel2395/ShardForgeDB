@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -465,6 +466,350 @@ func TestPhase26_FollowerState_RestoredAfterCrash(t *testing.T) {
 	}
 	if result.LastAppliedSeq != 4 {
 		t.Errorf("last_applied_seq: want 4, got %d", result.LastAppliedSeq)
+	}
+}
+
+// TestPhase26_BothNodesRestart proves that when both primary and follower restart,
+// the follower can resume from its persisted cursor and fetch only new entries.
+//
+// Real deployments restart the primary on the SAME configured address. This test
+// simulates that by capturing the ephemeral port from p1 and reusing it for p2.
+// The follower's identity-bound state file stores that URL, so the restarted
+// follower opens successfully against p2.
+func TestPhase26_BothNodesRestart(t *testing.T) {
+	primaryDir := t.TempDir()
+	followerDir := t.TempDir()
+
+	// Phase 1: open primary, get its address (which we'll reuse on restart).
+	p1, err := Open(Options{
+		NodeID:      "primary-p26",
+		Addr:        "127.0.0.1:0",
+		DataDir:     primaryDir,
+		Replication: ReplicationOptions{Role: replnet.RolePrimary},
+	})
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	if err := p1.StartBackground(); err != nil {
+		t.Fatalf("start primary: %v", err)
+	}
+	// Capture the stable "configured" address before closing.
+	primaryAddr := p1.Addr() // e.g. "127.0.0.1:51234"
+	primaryURL := "http://" + primaryAddr
+
+	doRequest(t, p1, http.MethodPut, "/kv/a", `{"value":"1"}`)
+	doRequest(t, p1, http.MethodPut, "/kv/b", `{"value":"2"}`)
+	doRequest(t, p1, http.MethodPut, "/kv/c", `{"value":"3"}`)
+
+	// Open follower and sync 3 entries. State file records primaryURL.
+	f1, err := Open(Options{
+		NodeID:  "follower-p26",
+		Addr:    "127.0.0.1:0",
+		DataDir: followerDir,
+		Replication: ReplicationOptions{
+			Role:           replnet.RoleFollower,
+			PrimaryBaseURL: primaryURL,
+		},
+	})
+	if err != nil {
+		t.Fatalf("open follower: %v", err)
+	}
+	r1, err := f1.SyncFromPrimary(context.Background())
+	if err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if r1.Applied != 3 {
+		t.Errorf("applied: want 3, got %d", r1.Applied)
+	}
+	f1.Close()
+	p1.Close() // releases primaryAddr port
+
+	// Phase 2: reopen primary on the SAME address (as a real deployment would).
+	// Go's net.Listen uses SO_REUSEADDR so the port is immediately re-bindable.
+	p2, err := Open(Options{
+		NodeID:      "primary-p26",
+		Addr:        primaryAddr, // same address as p1
+		DataDir:     primaryDir,
+		Replication: ReplicationOptions{Role: replnet.RolePrimary},
+	})
+	if err != nil {
+		t.Fatalf("reopen primary: %v", err)
+	}
+	defer p2.Close()
+	if err := p2.StartBackground(); err != nil {
+		t.Fatalf("restart primary: %v", err)
+	}
+
+	// Verify primary journal still has 3 entries.
+	stats, _ := p2.durableLog.Stats()
+	if stats.Count != 3 || stats.LastSeq != 3 {
+		t.Errorf("primary after restart: want count=3 lastSeq=3, got count=%d lastSeq=%d",
+			stats.Count, stats.LastSeq)
+	}
+
+	// Write 2 more keys on the restarted primary (seq 4 and 5).
+	doRequest(t, p2, http.MethodPut, "/kv/d", `{"value":"4"}`)
+	doRequest(t, p2, http.MethodPut, "/kv/e", `{"value":"5"}`)
+
+	// Reopen follower with same primaryURL (matches the state file).
+	f2, err := Open(Options{
+		NodeID:  "follower-p26",
+		Addr:    "127.0.0.1:0",
+		DataDir: followerDir,
+		Replication: ReplicationOptions{
+			Role:           replnet.RoleFollower,
+			PrimaryBaseURL: primaryURL, // same URL as stored in state file
+		},
+	})
+	if err != nil {
+		t.Fatalf("reopen follower: %v", err)
+	}
+	defer f2.Close()
+
+	// Follower must restore cursor=3 and fetch only entries 4 and 5.
+	if got := f2.ReplicationStatus().LastAppliedSeq; got != 3 {
+		t.Errorf("follower cursor after restart: want 3, got %d", got)
+	}
+	r2, err := f2.SyncFromPrimary(context.Background())
+	if err != nil {
+		t.Fatalf("sync after both restart: %v", err)
+	}
+	if r2.Applied != 2 {
+		t.Errorf("applied after both restart: want 2, got %d", r2.Applied)
+	}
+	if r2.LastAppliedSeq != 5 {
+		t.Errorf("last_applied_seq: want 5, got %d", r2.LastAppliedSeq)
+	}
+}
+
+// TestPhase26_DeleteAfterPrimaryRestart proves that DELETE operations written to the
+// primary after a restart are replicated correctly to the follower.
+func TestPhase26_DeleteAfterPrimaryRestart(t *testing.T) {
+	primaryDir := t.TempDir()
+
+	p1, err := Open(Options{
+		NodeID:      "primary-p26",
+		Addr:        "127.0.0.1:0",
+		DataDir:     primaryDir,
+		Replication: ReplicationOptions{Role: replnet.RolePrimary},
+	})
+	if err != nil {
+		t.Fatalf("open primary: %v", err)
+	}
+	if err := p1.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	doRequest(t, p1, http.MethodPut, "/kv/target", `{"value":"to-be-deleted"}`)
+	p1.Close()
+
+	followerDir := t.TempDir()
+
+	// Reopen primary.
+	p2, err := Open(Options{
+		NodeID:      "primary-p26",
+		Addr:        "127.0.0.1:0",
+		DataDir:     primaryDir,
+		Replication: ReplicationOptions{Role: replnet.RolePrimary},
+	})
+	if err != nil {
+		t.Fatalf("reopen primary: %v", err)
+	}
+	defer p2.Close()
+	if err := p2.StartBackground(); err != nil {
+		t.Fatalf("restart primary: %v", err)
+	}
+	primaryURL := "http://" + p2.Addr()
+
+	// Open follower and sync the initial write.
+	f1, err := Open(Options{
+		NodeID:  "follower-p26",
+		Addr:    "127.0.0.1:0",
+		DataDir: followerDir,
+		Replication: ReplicationOptions{
+			Role:           replnet.RoleFollower,
+			PrimaryBaseURL: primaryURL,
+		},
+	})
+	if err != nil {
+		t.Fatalf("open follower: %v", err)
+	}
+	r1, err := f1.SyncFromPrimary(context.Background())
+	if err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	if r1.Applied != 1 {
+		t.Fatalf("initial sync: want 1 applied, got %d", r1.Applied)
+	}
+
+	// Verify the key is present on the follower.
+	w := doRequest(t, f1, http.MethodGet, "/kv/target", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET target before delete: %d", w.Code)
+	}
+	var resp getResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if !resp.Found {
+		t.Fatal("GET target before delete: want found=true")
+	}
+
+	// Delete the key on the primary (after its restart — seq will be 2).
+	doRequest(t, p2, http.MethodDelete, "/kv/target", "")
+
+	// Sync the delete to the follower.
+	r2, err := f1.SyncFromPrimary(context.Background())
+	if err != nil {
+		t.Fatalf("sync delete: %v", err)
+	}
+	if r2.Applied != 1 {
+		t.Errorf("sync delete: want 1 applied, got %d", r2.Applied)
+	}
+
+	// Verify the key is gone on the follower.
+	w2 := doRequest(t, f1, http.MethodGet, "/kv/target", "")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("GET target after delete: %d", w2.Code)
+	}
+	var resp2 getResponse
+	json.NewDecoder(w2.Body).Decode(&resp2)
+	if resp2.Found {
+		t.Error("GET target after delete: want found=false (key should be deleted)")
+	}
+	f1.Close()
+}
+
+// TestPhase26_CorruptFollowerState_Visible proves that a corrupt replication_state.json
+// causes the follower Open() to return a visible error (ErrCorruptedState),
+// not silently reset to zero.
+func TestPhase26_CorruptFollowerState_Visible(t *testing.T) {
+	primary := newPhase26Primary(t)
+	if err := primary.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	doRequest(t, primary, http.MethodPut, "/kv/x", `{"value":"1"}`)
+	primaryURL := "http://" + primary.Addr()
+
+	followerDir := t.TempDir()
+
+	f1, err := Open(Options{
+		NodeID:  "follower-p26",
+		Addr:    "127.0.0.1:0",
+		DataDir: followerDir,
+		Replication: ReplicationOptions{
+			Role:           replnet.RoleFollower,
+			PrimaryBaseURL: primaryURL,
+		},
+	})
+	if err != nil {
+		t.Fatalf("open follower: %v", err)
+	}
+	if _, err := f1.SyncFromPrimary(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	f1.Close()
+
+	// Corrupt the state file by flipping bytes in the JSON body.
+	statePath := followerDir + "/replication_state.json"
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state file: %v", err)
+	}
+	data[10] ^= 0xFF
+	if err := os.WriteFile(statePath, data, 0o644); err != nil {
+		t.Fatalf("write corrupted state: %v", err)
+	}
+
+	// Reopening with a corrupt state file must return an error.
+	_, err = Open(Options{
+		NodeID:  "follower-p26",
+		Addr:    "127.0.0.1:0",
+		DataDir: followerDir,
+		Replication: ReplicationOptions{
+			Role:           replnet.RoleFollower,
+			PrimaryBaseURL: primaryURL,
+		},
+	})
+	if err == nil {
+		t.Fatal("Open with corrupt state file: want error, got nil")
+	}
+	if !errors.Is(err, replnet.ErrCorruptedState) {
+		t.Errorf("Open with corrupt state file: want ErrCorruptedState in chain, got %v", err)
+	}
+}
+
+// TestPhase26_NoAutoSyncAfterFollowerRestart proves that restarting the follower does NOT
+// automatically apply new entries from the primary. The operator must call SyncFromPrimary.
+func TestPhase26_NoAutoSyncAfterFollowerRestart(t *testing.T) {
+	primary := newPhase26Primary(t)
+	if err := primary.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	doRequest(t, primary, http.MethodPut, "/kv/first", `{"value":"1"}`)
+	primaryURL := "http://" + primary.Addr()
+
+	followerDir := t.TempDir()
+
+	// Sync the first write.
+	f1 := newPhase26Follower(t, primaryURL, followerDir)
+	if _, err := f1.SyncFromPrimary(context.Background()); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	f1.Close()
+
+	// Write a second key while the follower is down.
+	doRequest(t, primary, http.MethodPut, "/kv/second", `{"value":"2"}`)
+
+	// Reopen follower. No sync call yet.
+	f2 := newPhase26Follower(t, primaryURL, followerDir)
+	defer f2.Close()
+
+	// The second key must NOT be present on the follower yet (no auto-sync).
+	w := doRequest(t, f2, http.MethodGet, "/kv/second", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET second: %d", w.Code)
+	}
+	var resp getResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp.Found {
+		t.Error("GET second before manual sync: want found=false (no auto-sync)")
+	}
+
+	// Cursor must still be 1 (only the first write was synced).
+	if got := f2.ReplicationStatus().LastAppliedSeq; got != 1 {
+		t.Errorf("cursor after restart (no sync): want 1, got %d", got)
+	}
+
+	// Now sync manually and verify the second key appears.
+	if _, err := f2.SyncFromPrimary(context.Background()); err != nil {
+		t.Fatalf("manual sync: %v", err)
+	}
+	w2 := doRequest(t, f2, http.MethodGet, "/kv/second", "")
+	var resp2 getResponse
+	json.NewDecoder(w2.Body).Decode(&resp2)
+	if !resp2.Found {
+		t.Error("GET second after manual sync: want found=true")
+	}
+}
+
+// TestPhase26_ConcurrentSync_Rejected proves that a second SyncFromPrimary call
+// while one is already in-flight is rejected with ErrSyncInProgress (not silently
+// dropped or allowed to apply the same batch twice).
+func TestPhase26_ConcurrentSync_Rejected(t *testing.T) {
+	primary := newPhase26Primary(t)
+	if err := primary.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	doRequest(t, primary, http.MethodPut, "/kv/k", `{"value":"v"}`)
+	primaryURL := "http://" + primary.Addr()
+
+	follower := newPhase26Follower(t, primaryURL, t.TempDir())
+
+	// Mark sync as already in progress.
+	follower.syncInProgress.Store(true)
+	defer follower.syncInProgress.Store(false)
+
+	_, err := follower.SyncFromPrimary(context.Background())
+	if !errors.Is(err, ErrSyncInProgress) {
+		t.Errorf("concurrent sync: want ErrSyncInProgress, got %v", err)
 	}
 }
 

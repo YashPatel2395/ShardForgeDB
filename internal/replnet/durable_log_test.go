@@ -356,3 +356,153 @@ func TestDurableLog_JournalFileCreated(t *testing.T) {
 		t.Errorf("journal file not created: %v", err)
 	}
 }
+
+// ── syncFn injection tests ─────────────────────────────────────────────────────
+
+// TestDurableLog_SyncSuccess_EntryVisible verifies that after a successful Append
+// (syncFn returns nil) the entry is visible via EntriesAfter.
+func TestDurableLog_SyncSuccess_EntryVisible(t *testing.T) {
+	dir := t.TempDir()
+	dl, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer dl.Close()
+
+	// Override syncFn with a no-op that always succeeds.
+	dl.syncFn = func() error { return nil }
+
+	e, err := dl.Append(OpPut, "key", "val")
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if e.Seq != 1 {
+		t.Errorf("seq: want 1, got %d", e.Seq)
+	}
+
+	entries, err := dl.EntriesAfter(0, 0)
+	if err != nil {
+		t.Fatalf("entries after: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Key != "key" {
+		t.Errorf("entries: want [{key}], got %v", entries)
+	}
+}
+
+// TestDurableLog_SyncFailure_ReturnsError verifies that when syncFn returns an error,
+// Append propagates it to the caller.
+func TestDurableLog_SyncFailure_ReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	dl, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer dl.Close()
+
+	syncErr := errors.New("disk full (injected)")
+	dl.syncFn = func() error { return syncErr }
+
+	_, err = dl.Append(OpPut, "key", "val")
+	if err == nil {
+		t.Fatal("Append with failing syncFn: want error, got nil")
+	}
+	if !errors.Is(err, syncErr) {
+		t.Errorf("Append error: want to wrap syncErr, got %v", err)
+	}
+}
+
+// TestDurableLog_SyncFailure_DoesNotAdvanceNextSeq verifies that when syncFn fails,
+// nextSeq is not incremented so the next successful Append reuses the same sequence.
+func TestDurableLog_SyncFailure_DoesNotAdvanceNextSeq(t *testing.T) {
+	dir := t.TempDir()
+	dl, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer dl.Close()
+
+	// Fail the first sync.
+	dl.syncFn = func() error { return errors.New("sync fail") }
+	if _, err := dl.Append(OpPut, "k", "v"); err == nil {
+		t.Fatal("expected error from failing syncFn")
+	}
+
+	// Restore good sync; next Append must get seq=1 (not seq=2).
+	dl.syncFn = dl.f.Sync
+	e, err := dl.Append(OpPut, "k", "v")
+	if err != nil {
+		t.Fatalf("second append: %v", err)
+	}
+	if e.Seq != 1 {
+		t.Errorf("seq after sync failure: want 1, got %d", e.Seq)
+	}
+}
+
+// TestDurableLog_SyncFailure_DoesNotAddToIndex verifies that when syncFn fails,
+// no entry is added to the in-memory index.
+func TestDurableLog_SyncFailure_DoesNotAddToIndex(t *testing.T) {
+	dir := t.TempDir()
+	dl, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer dl.Close()
+
+	dl.syncFn = func() error { return errors.New("sync fail") }
+	dl.Append(OpPut, "k", "v") //nolint:errcheck — intentional failure
+
+	// Index must be empty; EntriesAfter must return nothing.
+	entries, err := dl.EntriesAfter(0, 0)
+	if err != nil {
+		t.Fatalf("entries after failed append: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("index after sync failure: want 0 entries, got %d", len(entries))
+	}
+}
+
+// TestDurableLog_ReopenAfterSyncedAppend_EntryPreserved verifies that an entry
+// written with a successful syncFn survives a process restart.
+func TestDurableLog_ReopenAfterSyncedAppend_EntryPreserved(t *testing.T) {
+	dir := t.TempDir()
+
+	dl1, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// Fail first append (sync error + truncation).
+	failErr := errors.New("transient disk error")
+	dl1.syncFn = func() error { return failErr }
+	if _, err := dl1.Append(OpPut, "bad", "entry"); err == nil {
+		t.Fatal("expected error from failing syncFn")
+	}
+
+	// Restore sync; succeed second append.
+	dl1.syncFn = dl1.f.Sync
+	e, err := dl1.Append(OpPut, "good", "entry")
+	if err != nil {
+		t.Fatalf("second append: %v", err)
+	}
+	if e.Seq != 1 {
+		t.Errorf("seq: want 1, got %d", e.Seq)
+	}
+	dl1.Close()
+
+	// Reopen: only the successfully synced entry must be present.
+	dl2, err := OpenDurableLog(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer dl2.Close()
+
+	entries, err := dl2.EntriesAfter(0, 0)
+	if err != nil {
+		t.Fatalf("entries after reopen: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries after reopen: want 1, got %d", len(entries))
+	}
+	if entries[0].Key != "good" {
+		t.Errorf("entry after reopen: want key 'good', got %q", entries[0].Key)
+	}
+}

@@ -85,25 +85,42 @@ explicitly. Do not attempt write-ahead semantics for the journal in Phase 26.
 
 ## Q5. How does the follower persist its replication cursor?
 
-The follower writes a single JSON file `{dataDir}/replication_state.json`:
+The follower writes a versioned, identity-bound JSON file `{dataDir}/replication_state.json`:
 
 ```json
 {
+  "version": 1,
+  "follower_node_id": "follower-1",
+  "primary_url": "http://primary:8080",
   "last_applied_seq": 42,
+  "updated_at": "2026-06-13T12:00:00.000000000Z",
   "checksum": 1234567890
 }
 ```
 
-`checksum` is the IEEE CRC32 of the 8-byte little-endian encoding of `last_applied_seq`.
-This lets us detect a half-written state file without external dependencies.
+`checksum` is the IEEE CRC32 over all fields except itself:
+`checksumState(version, follower_node_id, primary_url, last_applied_seq, updated_at)`.
+This lets us detect a half-written or tampered state file without external dependencies.
+
+**Identity binding:** the state file is bound to a specific follower node ID and primary URL.
+On load, both are validated against the current node's configuration. Mismatches return
+`ErrFollowerIdentityMismatch` or `ErrPrimaryIdentityMismatch` — never silently reset to zero.
+This prevents a follower accidentally loading state from a different node or pointing at the
+wrong primary after an operator error.
 
 **Atomic write protocol:**
 1. Write to `{dataDir}/replication_state.json.tmp`
-2. `fsync` the temp file
-3. `os.Rename` temp → final (rename is atomic on POSIX)
+2. `fsync` the temp file (durable on all platforms)
+3. `os.Rename` temp → final (atomic on POSIX)
+4. `fsync` the parent directory (durable rename on Linux; no-op on macOS)
 
 On load: if the state file does not exist, `lastAppliedSeq = 0` (fresh follower, pull everything).
-If the checksum is wrong, return `ErrCorruptedState`.
+A corrupt checksum returns `ErrCorruptedState`. An unrecognised version field returns
+`ErrUnsupportedStateVersion`.
+
+**Sequence monotonicity:** `AdvanceTo(newSeq)` returns `ErrInvalidSeqRegression` if `newSeq` is
+strictly less than the current cursor. Equal is idempotent (safe on replay). This prevents
+silent cursor rollbacks from logic errors in the caller.
 
 ---
 

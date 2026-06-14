@@ -14,6 +14,10 @@ var ErrInvalidOptions = errors.New("node: invalid options")
 // ErrClosed is returned when an operation is attempted on a closed Server.
 var ErrClosed = errors.New("node: closed")
 
+// ErrSyncInProgress is returned by SyncFromPrimary when a sync is already running.
+// Concurrent syncs are rejected to prevent double-application of the same batch.
+var ErrSyncInProgress = errors.New("node: sync already in progress")
+
 // validate checks that required Options fields are set and the DataDir can be created.
 func (o Options) validate() error {
 	if o.NodeID == "" {

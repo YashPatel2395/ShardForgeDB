@@ -318,9 +318,11 @@ func TestPhase25_ReplDemoConfig_ReplicationCursorIsInMemory(t *testing.T) {
 	}
 	_ = follower1.Close()
 
-	// Re-open follower from same dir. Phase 26: cursor is RESTORED from disk (not reset to 0).
+	// Re-open follower from same dir with the SAME NodeID. Phase 26: cursor is RESTORED from
+	// disk (not reset to 0). The state file is identity-bound to the node ID; a different
+	// node ID would return ErrFollowerIdentityMismatch.
 	follower2, err := Open(Options{
-		NodeID:  "follower-2",
+		NodeID:  "follower-1", // must match the state file written by follower1
 		Addr:    "127.0.0.1:0",
 		DataDir: followerDir,
 		Replication: ReplicationOptions{

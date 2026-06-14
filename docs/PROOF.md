@@ -33,7 +33,7 @@ This file records the evidence that each phase was implemented correctly and pas
 | 24 | `configs/cluster/demo-3node.json`, `scripts/demo_cluster_*.sh`, `docs/DEMO.md` | COMPLETE | 13 new (942 total) | — | Local demo only; no Raft; no failover; no shard migration |
 | 25 | `configs/replication/demo-leader-follower.json`, `scripts/repl_demo_*.sh`, `SyncResult` type | COMPLETE | 20 new (962 total) | — | Explicit pull-based only; cursor was in-memory (fixed Phase 26); no Raft; no quorum |
 | 26 | `internal/replnet/durable_log.go`, `internal/replnet/state_store.go`, `internal/node/replication_phase26_test.go`, `scripts/repl_restart_demo_*.sh` | COMPLETE | 61 new (1023 total) | — | Durable binary journal (per-Append fsync, rollback-on-failure, ErrPoisonedLog), identity-bound versioned JSON cursor (CRC32 all fields), replay boundary checks (seq 0, first≠1, gap, dup, MaxUint64), gap detection (HTTP 409), concurrent-sync guard (ErrSyncInProgress); operator-triggered only; no Raft; no quorum |
-| 27 | `internal/node/background_sync.go`, `internal/node/background_sync_test.go`, `internal/node/replication_phase27_test.go`, `internal/node/types.go`, `scripts/repl_auto_demo_*.sh`, `configs/replication/demo-background-sync.json`, `docs/BACKGROUND_REPLICATION_DESIGN.md` | COMPLETE | 59 new (1082 total) | — | Automatic background goroutine (configurable interval/backoff/jitter); `ErrSyncInProgress`→skip; `*ReplicationGapError`→terminal; `lag_entries`/`lag_known` always set on success; `PullResult` from replnet carries `PrimaryLatestSeq`; worker stopped before engine close; NOT Raft; NOT automatic failover |
+| 27 | `internal/node/background_sync.go`, `internal/node/background_sync_test.go`, `internal/node/replication_phase27_test.go`, `internal/node/types.go`, `internal/node/config.go` (ErrAlreadyStarted, NaN/Inf jitter guard), `internal/node/server.go` (lifecycle state machine, race-safe start), `internal/node/handlers.go` (HTTP 409 ErrSyncInProgress), `internal/node/client.go` (ReplicationStatus), `internal/replnet/replicator.go` (PrimaryLatestSeqKnown), `scripts/repl_auto_demo_*.sh` (24 checks), `configs/replication/demo-background-sync.json`, `docs/BACKGROUND_REPLICATION_DESIGN.md` | COMPLETE | 72 new (1096 total) | — | Automatic background goroutine (configurable interval/backoff/jitter); `ErrSyncInProgress`→skip (resets backoff); `*ReplicationGapError`→WorkerStateBlocked (clears Running/CurrentBackoffMs/NextRetryAt); `lag_entries`/`lag_known` from `PrimaryLatestSeqKnown`; UTC timestamps; server single-use lifecycle (`ErrAlreadyStarted`); worker CAS idempotency; shutdown cancellation not counted as failure; HTTP 409 on sync conflict; typed `ReplicationStatusResponse` client; 24-check smoke demo; NOT Raft; NOT automatic failover. Test breakdown: 46 unit (`background_sync_test.go`) + 26 integration (`replication_phase27_test.go`) = 72 |
 
 **Validation command (all phases):**
 ```bash
@@ -42,10 +42,10 @@ make build
 make vet
 ```
 
-**Current test pass status:** 1082 tests pass across 23 packages (race detector on) on Apple M3 darwin/arm64, Go 1.26.
+**Current test pass status:** 1096 tests pass across 23 packages (race detector on) on Apple M3 darwin/arm64, Go 1.26.
 
 ```
-go test -race -count=1 -v ./... | grep -c "^--- PASS:" → 1082
+go test -race -count=1 -v ./... | grep -c "^--- PASS:" → 1096
 ```
 
 ---

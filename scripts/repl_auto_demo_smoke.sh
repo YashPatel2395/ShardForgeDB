@@ -13,22 +13,22 @@
 #   6.  Poll follower until key1 appears (NO /replication/sync call)
 #   7.  Follower replication status shows last_applied_seq > 0
 #   8.  Lag is known (lag_known=true) and lag_entries=0
-#   9.  Write 5 more keys to leader
-#   10. Poll follower until all 5 keys appear automatically
-#   11. DELETE key1 on leader
-#   12. Poll follower until key1 is gone (automatic DELETE propagation)
-#   13. Stop leader — verify follower enters backoff/failure state
+#   9.  Write 5 more keys to leader — all 5 propagate automatically
+#   10. DELETE key1 on leader — propagates automatically
+#   11. Follower enters backing_off state after primary stopped
+#   12. total_sync_failures > 0 while primary is stopped
+#   13. next_retry_at is set while follower is backing_off
 #   14. Follower lag_known becomes false (primary unreachable = stale lag)
-#   15. Restart leader (same addr+dir)
-#   16. Leader /healthz → ok after restart
-#   17. Follower background sync recovers automatically
-#   18. Follower lag_known becomes true again after recovery
-#   19. Write key_after_restart to leader
-#   20. Poll follower until key_after_restart appears
+#   15. Leader /healthz → ok after restart
+#   16. Follower background sync recovers automatically (lag_known=true)
+#   17. current_backoff_ms=0 after recovery (backoff fully reset)
+#   18. next_retry_at=null after recovery
+#   19. background_sync.state=running after recovery
+#   20. Write key_after_restart to leader — propagates automatically
 #   21. Restart follower (same addr+dir) — prove durable cursor survives
 #   22. Follower /healthz → ok after restart
-#   23. Write key_after_follower_restart to leader
-#   24. Follower receives it automatically (no manual sync)
+#   23. Follower last_applied_seq > 0 immediately after restart (cursor restored from state file)
+#   24. Follower receives key_after_follower_restart automatically (no manual sync)
 set -eu
 
 LEADER="http://127.0.0.1:9501"
@@ -257,7 +257,7 @@ print(d.get('found','true'))
   sleep 0.3
 done
 
-# ── 13-14. Primary stop → follower enters backoff, lag becomes unknown ─────────
+# ── 11-14. Primary stop → follower enters backoff, lag becomes unknown ─────────
 echo ""
 echo "-- Stop primary — follower should enter backoff / lag becomes unknown"
 
@@ -268,7 +268,57 @@ if [ -n "$LEADER_PID" ]; then
   echo "  killed leader pid $LEADER_PID"
 fi
 
-# Wait for follower to detect primary is down (may take up to 3× backoff).
+# Check 11: Poll for backing_off state.
+BG_STATE_AFTER_KILL="unknown"
+BACKING_OFF_BGST=""
+for I in $(seq 1 40); do
+  BGST=$(curl -sf "$FOLLOWER/replication/status" 2>/dev/null || true)
+  BG_STATE_AFTER_KILL=$(echo "$BGST" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+bg=d.get('background_sync',{})
+print(bg.get('background_sync_state','unknown'))
+" 2>/dev/null || echo "unknown")
+  if [ "$BG_STATE_AFTER_KILL" = "backing_off" ]; then
+    BACKING_OFF_BGST="$BGST"
+    break
+  fi
+  sleep 0.3
+done
+if [ "$BG_STATE_AFTER_KILL" = "backing_off" ]; then
+  ok "follower enters backing_off state after primary stopped"
+else
+  fail "background_sync.state=$BG_STATE_AFTER_KILL (want backing_off)"
+fi
+
+# Check 12: total_sync_failures > 0.
+TOTAL_FAILURES=$(echo "$BACKING_OFF_BGST" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+bg=d.get('background_sync',{})
+print(bg.get('total_sync_failures',0))
+" 2>/dev/null || echo "0")
+if [ "$TOTAL_FAILURES" != "0" ] && [ "$TOTAL_FAILURES" != "?" ]; then
+  ok "total_sync_failures=$TOTAL_FAILURES > 0 while backing_off"
+else
+  fail "total_sync_failures=$TOTAL_FAILURES (should be > 0 after primary stopped)"
+fi
+
+# Check 13: next_retry_at is present.
+NEXT_RETRY=$(echo "$BACKING_OFF_BGST" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+bg=d.get('background_sync',{})
+v=bg.get('next_retry_at',None)
+print('present' if v is not None else 'absent')
+" 2>/dev/null || echo "absent")
+if [ "$NEXT_RETRY" = "present" ]; then
+  ok "next_retry_at is set while follower is backing_off"
+else
+  fail "next_retry_at absent while backing_off (should be set)"
+fi
+
+# Check 14: lag_known becomes false after primary is unreachable.
 LAG_UNKNOWN=false
 for I in $(seq 1 30); do
   BGST=$(curl -sf "$FOLLOWER/replication/status" 2>/dev/null || true)
@@ -290,7 +340,7 @@ else
   fail "lag_known still true after primary stopped (should be false/stale)"
 fi
 
-# ── 15-18. Restart primary — follower recovers automatically ──────────────────
+# ── 15-19. Restart primary — follower recovers automatically ──────────────────
 echo ""
 echo "-- Restart primary — follower should recover automatically"
 
@@ -303,14 +353,16 @@ echo "-- Restart primary — follower should recover automatically"
 NEW_LEADER_PID=$!
 echo "  restarted leader pid $NEW_LEADER_PID"
 
+# Check 15: leader /healthz → ok after restart.
 if wait_for_health "leader" "$LEADER"; then
   ok "leader /healthz → ok after restart"
 else
   fail "leader did not recover within 12s"
 fi
 
-# Wait for follower to recover (lag_known becomes true again).
+# Check 16: Wait for follower to recover (lag_known becomes true again).
 LAG_RECOVERED=false
+RECOVERY_BGST=""
 for I in $(seq 1 40); do
   BGST=$(curl -sf "$FOLLOWER/replication/status" 2>/dev/null || true)
   LAG_KNOWN=$(echo "$BGST" | python3 -c "
@@ -321,6 +373,7 @@ print(bg.get('lag_known','false'))
 " 2>/dev/null || echo "false")
   if [ "$LAG_KNOWN" = "True" ] || [ "$LAG_KNOWN" = "true" ]; then
     LAG_RECOVERED=true
+    RECOVERY_BGST="$BGST"
     break
   fi
   sleep 0.4
@@ -331,20 +384,63 @@ else
   fail "follower did not recover: lag_known still false after 16s"
 fi
 
-BGST=$(curl -sf "$FOLLOWER/replication/status" 2>/dev/null || true)
-BG_STATE=$(echo "$BGST" | python3 -c "
+# Check 17: current_backoff_ms=0 after recovery (backoff fully reset).
+# current_backoff_ms is json:"...,omitempty" so the field is ABSENT when 0.
+# Use None as default and treat absent (None) the same as explicit 0.
+BACKOFF_MS=$(echo "$RECOVERY_BGST" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+bg=d.get('background_sync',{})
+v=bg.get('current_backoff_ms', None)
+print(0 if v is None else v)
+" 2>/dev/null || echo "?")
+if [ "$BACKOFF_MS" = "0" ]; then
+  ok "current_backoff_ms=0 after recovery (backoff reset)"
+else
+  fail "current_backoff_ms=$BACKOFF_MS after recovery (want 0)"
+fi
+
+# Check 18: next_retry_at=null after recovery.
+NEXT_RETRY_AFTER=$(echo "$RECOVERY_BGST" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+bg=d.get('background_sync',{})
+v=bg.get('next_retry_at',None)
+print('present' if v is not None else 'absent')
+" 2>/dev/null || echo "present")
+if [ "$NEXT_RETRY_AFTER" = "absent" ]; then
+  ok "next_retry_at=null after recovery"
+else
+  fail "next_retry_at still set after recovery (should be null)"
+fi
+
+# Check 19: background_sync.state=running after recovery.
+RECOVERY_STATE=$(echo "$RECOVERY_BGST" | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
 bg=d.get('background_sync',{})
 print(bg.get('background_sync_state','unknown'))
 " 2>/dev/null || echo "unknown")
-if [ "$BG_STATE" = "running" ]; then
+if [ "$RECOVERY_STATE" = "running" ]; then
   ok "background_sync.state=running after recovery (backoff reset)"
 else
-  fail "background_sync.state=$BG_STATE (want running after recovery)"
+  # State may still be transitioning; re-check once.
+  sleep 1
+  BGST=$(curl -sf "$FOLLOWER/replication/status" 2>/dev/null || true)
+  RECOVERY_STATE=$(echo "$BGST" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+bg=d.get('background_sync',{})
+print(bg.get('background_sync_state','unknown'))
+" 2>/dev/null || echo "unknown")
+  if [ "$RECOVERY_STATE" = "running" ]; then
+    ok "background_sync.state=running after recovery (backoff reset)"
+  else
+    fail "background_sync.state=$RECOVERY_STATE (want running after recovery)"
+  fi
 fi
 
-# ── 19-20. New key after restart propagates ───────────────────────────────────
+# ── 20. New key after restart propagates ─────────────────────────────────────
 echo ""
 echo "-- Write after primary restart propagates automatically"
 
@@ -360,7 +456,7 @@ else
   fail "key after restart did not propagate within 12s"
 fi
 
-# ── 21-22. Follower restart — durable cursor survives ─────────────────────────
+# ── 21-24. Follower restart — durable cursor survives ─────────────────────────
 echo ""
 echo "-- Restart follower — durable cursor must survive"
 
@@ -387,13 +483,29 @@ fi
 NEW_FOLLOWER_PID=$!
 echo "  restarted follower pid $NEW_FOLLOWER_PID"
 
+# Check 22: follower /healthz → ok after restart.
 if wait_for_health "follower" "$FOLLOWER"; then
   ok "follower /healthz → ok after restart"
 else
   fail "follower did not recover within 12s"
 fi
 
-# ── 23-24. New key after follower restart propagates automatically ─────────────
+# Check 23: last_applied_seq > 0 immediately after restart (cursor restored from state file,
+# before the background worker has a chance to sync new entries).
+RESTART_SEQ=$(curl -sf "$FOLLOWER/replication/status" 2>/dev/null \
+  | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+r=d.get('replication',{})
+print(r.get('last_applied_seq',0))
+" 2>/dev/null || echo "0")
+if [ "$RESTART_SEQ" != "0" ] && [ "$RESTART_SEQ" != "?" ]; then
+  ok "follower last_applied_seq=$RESTART_SEQ > 0 immediately after restart (cursor restored from state file)"
+else
+  fail "follower last_applied_seq=$RESTART_SEQ after restart (should be > 0 — cursor not restored)"
+fi
+
+# ── 24. New key after follower restart propagates automatically ────────────────
 echo ""
 echo "-- Write after follower restart propagates automatically"
 
@@ -409,12 +521,13 @@ else
   fail "key after follower restart did not propagate within 12s"
 fi
 
-# Final: verify manual sync endpoint still available.
-SYNC_RESP=$(curl -sf -X POST "$FOLLOWER/replication/sync" 2>/dev/null || true)
-if echo "$SYNC_RESP" | grep -qE '"ok":(true|false)'; then
-  ok "POST /replication/sync still available alongside background sync"
+# Bonus: verify manual sync endpoint still available (returns 200 OK or 409 if bg-worker busy).
+# Uses -w "%{http_code}" so that a 409 (ErrSyncInProgress) is accepted as valid behavior.
+SYNC_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$FOLLOWER/replication/sync" 2>/dev/null || echo "000")
+if [ "$SYNC_HTTP" = "200" ] || [ "$SYNC_HTTP" = "409" ]; then
+  ok "POST /replication/sync returns $SYNC_HTTP (200=sync'd, 409=bg-worker busy — both valid)"
 else
-  fail "POST /replication/sync unexpected response: $SYNC_RESP"
+  fail "POST /replication/sync unexpected status $SYNC_HTTP"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -434,9 +547,9 @@ echo "  - Phase 26 crash window: engine commit → journal append"
 echo ""
 
 if [ "$FAIL" -eq 0 ]; then
-  echo "All checks passed. Phase 27 automatic background pull replication is working correctly."
+  echo "All $PASS checks passed. Phase 27 automatic background pull replication is working correctly."
   exit 0
 else
-  echo "Some checks failed. Review output above."
+  echo "$FAIL check(s) failed. Review output above."
   exit 1
 fi

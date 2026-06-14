@@ -445,6 +445,16 @@ func (s *Server) handleReplicationSync(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.SyncFromPrimary(r.Context())
 	if err != nil {
+		// ErrSyncInProgress: a concurrent sync (background worker or another manual call)
+		// is already in flight. Return 409 Conflict so the caller can retry.
+		if errors.Is(err, ErrSyncInProgress) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"ok":      false,
+				"node_id": s.opts.NodeID,
+				"error":   err.Error(),
+			})
+			return
+		}
 		var gapErr *replnet.ReplicationGapError
 		if errors.As(err, &gapErr) {
 			writeJSON(w, http.StatusConflict, map[string]any{

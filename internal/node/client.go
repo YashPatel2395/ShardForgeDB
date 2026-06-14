@@ -122,6 +122,17 @@ func (c *Client) Compact(ctx context.Context) error {
 	return nil
 }
 
+// ReplicationStatus calls GET /replication/status and returns a typed snapshot of
+// the node's replication and background-sync state.
+// Prefer this over Client.Do + map[string]any when inspecting worker state, lag, or counters.
+func (c *Client) ReplicationStatus(ctx context.Context) (ReplicationStatusResponse, error) {
+	var resp ReplicationStatusResponse
+	if err := c.doJSON(ctx, http.MethodGet, "/replication/status", nil, &resp); err != nil {
+		return ReplicationStatusResponse{}, fmt.Errorf("node client: replication status: %w", err)
+	}
+	return resp, nil
+}
+
 // SyncReplication calls POST /replication/sync on a follower node, triggering an
 // explicit pull from the configured primary. Returns the SyncResult with fetched,
 // applied, and last_applied_seq counts.

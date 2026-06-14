@@ -38,18 +38,24 @@ type PullResult struct {
 	// Entries are the log entries returned by the primary, in ascending Seq order.
 	Entries []Entry
 	// PrimaryLatestSeq is the primary's highest sequence number at the time of the pull.
-	// Used for operation-count lag computation on the follower. Zero means the primary
-	// has no entries yet (or the response did not include the field).
+	// Only meaningful when PrimaryLatestSeqKnown is true.
 	PrimaryLatestSeq uint64
+	// PrimaryLatestSeqKnown is true when the primary included primary_latest_seq in
+	// its response. When false the field was absent (e.g. Phase-26-style primary)
+	// and callers must not interpret PrimaryLatestSeq=0 as "primary is empty".
+	// This distinction prevents false zero-lag readings against older primaries.
+	PrimaryLatestSeqKnown bool
 }
 
 // logResponse is the JSON structure returned by GET /replication/log.
+// PrimaryLatestSeq is a pointer so json.Unmarshal can distinguish an explicit
+// zero ("primary_latest_seq": 0) from a missing field (older primary software).
 type logResponse struct {
 	NodeID           string  `json:"node_id"`
 	After            uint64  `json:"after"`
 	Count            int     `json:"count"`
 	Entries          []Entry `json:"entries"`
-	PrimaryLatestSeq uint64  `json:"primary_latest_seq"`
+	PrimaryLatestSeq *uint64 `json:"primary_latest_seq"`
 }
 
 // gapResponse is the JSON structure returned by GET /replication/log when HTTP 409.
@@ -102,8 +108,14 @@ func (r *Replicator) PullEntries(ctx context.Context, after uint64, limit int) (
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return PullResult{}, fmt.Errorf("replnet: decode log response: %w", err)
 	}
+	var pls uint64
+	known := body.PrimaryLatestSeq != nil
+	if known {
+		pls = *body.PrimaryLatestSeq
+	}
 	return PullResult{
-		Entries:          body.Entries,
-		PrimaryLatestSeq: body.PrimaryLatestSeq,
+		Entries:               body.Entries,
+		PrimaryLatestSeq:      pls,
+		PrimaryLatestSeqKnown: known,
 	}, nil
 }

@@ -298,6 +298,15 @@ type SyncResult struct {
 	Gap *replnet.ReplicationGapError `json:"gap,omitempty"`
 }
 
+// ReplicationStatusResponse is returned by GET /replication/status and
+// Client.ReplicationStatus(). It gives callers a typed view of the replication
+// and background-sync state without having to decode map[string]any.
+type ReplicationStatusResponse struct {
+	NodeID         string                `json:"node_id"`
+	Replication    replnet.ReplicaStatus `json:"replication"`
+	BackgroundSync BackgroundSyncStatus  `json:"background_sync"`
+}
+
 // ExplainPutResponse is the JSON body returned by POST /explain/put.
 type ExplainPutResponse struct {
 	NodeID    string       `json:"node_id"`

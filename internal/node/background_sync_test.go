@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,13 +27,21 @@ func minBgSyncCfg() BackgroundSyncConfig {
 }
 
 // newTestWorker creates a worker with a controllable timer and fake clock.
-// syncFn is the injected sync function; call startWorker to start it.
+// syncFn is the injected sync function; call mustStartWorker to start it.
 func newTestWorker(t *testing.T, cfg BackgroundSyncConfig, syncFn func(ctx context.Context) (SyncResult, error)) *backgroundSyncWorker {
 	t.Helper()
 	w := newBackgroundSyncWorker(cfg, syncFn)
 	// Disable jitter for deterministic tests.
 	w.jitterFn = func(_ float64, _ time.Duration) time.Duration { return 0 }
 	return w
+}
+
+// mustStartWorker calls w.start() and fails the test on error.
+func mustStartWorker(t *testing.T, w *backgroundSyncWorker) {
+	t.Helper()
+	if err := w.start(); err != nil {
+		t.Fatalf("worker.start(): %v", err)
+	}
 }
 
 // controlledTimer provides a timer channel that the test drives manually.
@@ -222,6 +231,30 @@ func TestBackgroundSync_Config_JitterOutOfRange_Rejected(t *testing.T) {
 	}
 }
 
+func TestBackgroundSync_Config_NaNJitter_Rejected(t *testing.T) {
+	cfg := minBgSyncCfg()
+	cfg.JitterFraction = math.NaN()
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("expected error: JitterFraction = NaN (NaN comparisons return false, must be explicitly guarded)")
+	}
+}
+
+func TestBackgroundSync_Config_InfJitter_Rejected(t *testing.T) {
+	cfg := minBgSyncCfg()
+	cfg.JitterFraction = math.Inf(1) // +Inf
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("expected error: JitterFraction = +Inf")
+	}
+
+	cfg.JitterFraction = math.Inf(-1) // -Inf
+	err = cfg.validate()
+	if err == nil {
+		t.Fatal("expected error: JitterFraction = -Inf")
+	}
+}
+
 func TestBackgroundSync_Config_Disabled_ValidatesOK(t *testing.T) {
 	cfg := BackgroundSyncConfig{Enabled: false}
 	// All other fields zero: should pass since Enabled=false.
@@ -259,13 +292,75 @@ func TestBackgroundSync_Worker_StartsOnce(t *testing.T) {
 		return SyncResult{LastAppliedSeq: 1, PrimaryLatestSeq: 1, LagKnown: true}, nil
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	// Wait for the initial sync to complete.
 	waitForSuccesses(t, w, 1)
 	if w.Status().State != WorkerStateRunning {
 		t.Errorf("expected running state, got %q", w.Status().State)
+	}
+}
+
+func TestBackgroundSync_Worker_StartTwice_ReturnsAlreadyStarted(t *testing.T) {
+	cfg := minBgSyncCfg()
+	cfg.Interval = Duration{10 * time.Second}
+
+	w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
+		return SyncResult{}, nil
+	})
+
+	mustStartWorker(t, w)
+	defer w.stop()
+
+	// Second start must return ErrAlreadyStarted and must not launch another goroutine.
+	err := w.start()
+	if !errors.Is(err, ErrAlreadyStarted) {
+		t.Errorf("second start() returned %v, want ErrAlreadyStarted", err)
+	}
+}
+
+func TestBackgroundSync_Worker_StopBeforeStart_Safe(t *testing.T) {
+	cfg := minBgSyncCfg()
+	w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
+		return SyncResult{}, nil
+	})
+	// stop() before start() must be a silent no-op (not panic, not deadlock).
+	w.stop()
+}
+
+func TestBackgroundSync_Worker_StopTwice_Safe(t *testing.T) {
+	cfg := minBgSyncCfg()
+	cfg.Interval = Duration{10 * time.Second}
+
+	w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
+		return SyncResult{}, nil
+	})
+	mustStartWorker(t, w)
+	waitForSuccesses(t, w, 1)
+
+	w.stop() // first stop
+	w.stop() // second stop: must be a silent no-op (not panic, not deadlock)
+	if w.Status().State != WorkerStateStopped {
+		t.Errorf("state after double stop = %q, want stopped", w.Status().State)
+	}
+}
+
+func TestBackgroundSync_Worker_StartAfterStop_Rejected(t *testing.T) {
+	cfg := minBgSyncCfg()
+	cfg.Interval = Duration{10 * time.Second}
+
+	w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
+		return SyncResult{}, nil
+	})
+	mustStartWorker(t, w)
+	waitForSuccesses(t, w, 1)
+	w.stop()
+
+	// start() after stop() must return ErrAlreadyStarted (worker is single-use).
+	err := w.start()
+	if !errors.Is(err, ErrAlreadyStarted) {
+		t.Errorf("start() after stop() returned %v, want ErrAlreadyStarted", err)
 	}
 }
 
@@ -277,7 +372,7 @@ func TestBackgroundSync_Worker_StopsOnClose(t *testing.T) {
 		return SyncResult{}, nil
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	waitForSuccesses(t, w, 1)
 
 	w.stop() // must return promptly
@@ -300,7 +395,11 @@ func TestBackgroundSync_Worker_NoGoroutineLeak(t *testing.T) {
 
 	var stopped atomic.Bool
 	go func() {
-		w.start()
+		if err := w.start(); err != nil {
+			t.Errorf("start: %v", err)
+			close(doneCh)
+			return
+		}
 		waitForSuccesses(t, w, 1)
 		w.stop()
 		stopped.Store(true)
@@ -327,7 +426,7 @@ func TestBackgroundSync_Worker_CancellationInterruptsWait(t *testing.T) {
 	})
 	w.afterFn = ct.afterFn
 
-	w.start()
+	mustStartWorker(t, w)
 	waitForSuccesses(t, w, 1) // initial sync done; now waiting for timer
 
 	// Cancel before the timer fires.
@@ -348,13 +447,16 @@ func TestBackgroundSync_Worker_CancellationInterruptsInFlightRequest(t *testing.
 
 	started := make(chan struct{})
 	w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
-		close(started)
+		select {
+		case started <- struct{}{}:
+		default:
+		}
 		// Block until context is cancelled.
 		<-ctx.Done()
 		return SyncResult{}, ctx.Err()
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	<-started // sync is in-flight
 
 	start := time.Now()
@@ -363,6 +465,45 @@ func TestBackgroundSync_Worker_CancellationInterruptsInFlightRequest(t *testing.
 
 	if elapsed > 3*time.Second {
 		t.Errorf("stop with in-flight request took %v; expected < 3s", elapsed)
+	}
+}
+
+func TestBackgroundSync_ShutdownCancellation_NotCountedAsFailure(t *testing.T) {
+	cfg := minBgSyncCfg()
+	cfg.Interval = Duration{10 * time.Second}
+	cfg.RequestTimeout = Duration{30 * time.Second}
+
+	// syncFn blocks until its context is cancelled; returns context error.
+	inFlight := make(chan struct{}, 1)
+	w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
+		select {
+		case inFlight <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return SyncResult{}, ctx.Err()
+	})
+
+	mustStartWorker(t, w)
+
+	select {
+	case <-inFlight:
+	case <-time.After(5 * time.Second):
+		t.Fatal("syncFn not called within 5s")
+	}
+
+	w.stop()
+
+	st := w.Status()
+	// Cancellation due to worker shutdown must not be counted as a failure.
+	if st.TotalFailures != 0 {
+		t.Errorf("TotalFailures = %d, want 0 (shutdown cancellation is not a failure)", st.TotalFailures)
+	}
+	if st.ConsecutiveFailures != 0 {
+		t.Errorf("ConsecutiveFailures = %d, want 0", st.ConsecutiveFailures)
+	}
+	if st.LastError != "" {
+		t.Errorf("LastError = %q, want empty (shutdown is not an error)", st.LastError)
 	}
 }
 
@@ -381,7 +522,7 @@ func TestBackgroundSync_Worker_InitialSyncImmediate(t *testing.T) {
 		return SyncResult{LastAppliedSeq: 1, PrimaryLatestSeq: 1, LagKnown: true}, nil
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	select {
@@ -405,7 +546,7 @@ func TestBackgroundSync_Worker_SuccessUpdatesStatus(t *testing.T) {
 		}, nil
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForSuccesses(t, w, 1)
@@ -440,7 +581,7 @@ func TestBackgroundSync_Worker_EmptySuccessRemainsHealthy(t *testing.T) {
 		}, nil
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForSuccesses(t, w, 1)
@@ -474,7 +615,7 @@ func TestBackgroundSync_Worker_TemporaryFailureEntersBackoff(t *testing.T) {
 	})
 	w.afterFn = ct.afterFn
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	// Wait for initial sync to fail.
@@ -526,7 +667,7 @@ func TestBackgroundSync_Worker_BackoffDoublesAndCaps(t *testing.T) {
 	})
 	w.afterFn = ct.afterFn
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	// Wait for initial sync failure.
@@ -589,7 +730,7 @@ func TestBackgroundSync_Worker_SuccessResetsBackoff(t *testing.T) {
 	})
 	w.afterFn = ct.afterFn
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	// Wait for initial sync failure.
@@ -655,7 +796,7 @@ func TestBackgroundSync_ErrSyncInProgress_TreatedAsSkip(t *testing.T) {
 	})
 	w.afterFn = ct.afterFn
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForSuccesses(t, w, 1) // initial success
@@ -689,6 +830,70 @@ func TestBackgroundSync_ErrSyncInProgress_TreatedAsSkip(t *testing.T) {
 	}
 }
 
+func TestBackgroundSync_ErrSyncInProgress_AfterBackoff_ResetsCurrentBackoff(t *testing.T) {
+	// Prove: when ErrSyncInProgress is returned after a prior temporary failure
+	// (which set currentBackoff > 0), the backoff is reset to 0 so the next wait
+	// uses the normal Interval rather than the accumulated backoff.
+	ct := &controlledTimer{}
+	cfg := minBgSyncCfg()
+	cfg.InitialBackoff = Duration{200 * time.Millisecond}
+	cfg.MaxBackoff = Duration{2 * time.Second}
+
+	call := int64(0)
+	w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
+		n := atomic.AddInt64(&call, 1)
+		if n == 1 {
+			return SyncResult{}, errors.New("temporary failure — sets backoff")
+		}
+		return SyncResult{}, ErrSyncInProgress
+	})
+	w.afterFn = ct.afterFn
+
+	mustStartWorker(t, w)
+	defer w.stop()
+
+	// Wait for first failure (backoff > 0).
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if w.Status().TotalFailures >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if w.Status().TotalFailures == 0 {
+		t.Fatal("timeout waiting for first failure")
+	}
+
+	// Fire backoff timer → 2nd call returns ErrSyncInProgress → currentBackoff reset to 0.
+	ct.fireNext(t)
+
+	// Wait for the skip to be counted.
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if w.Status().TotalSkippedBusy >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if w.Status().TotalSkippedBusy == 0 {
+		t.Fatal("timeout waiting for skip to be counted")
+	}
+
+	// After the skip, run() re-enters the loop top and should see currentBackoff==0
+	// → WorkerStateRunning (not backing_off) and CurrentBackoffMs==0.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		st := w.Status()
+		if st.CurrentBackoffMs == 0 && st.State == WorkerStateRunning {
+			return // test passes
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	st := w.Status()
+	t.Errorf("after ErrSyncInProgress: CurrentBackoffMs=%d State=%q, want 0 and running (backoff reset)",
+		st.CurrentBackoffMs, st.State)
+}
+
 func TestBackgroundSync_StatusRead_RaceSafe(t *testing.T) {
 	cfg := minBgSyncCfg()
 	cfg.Interval = Duration{5 * time.Millisecond}
@@ -699,7 +904,7 @@ func TestBackgroundSync_StatusRead_RaceSafe(t *testing.T) {
 		return SyncResult{LastAppliedSeq: 1, PrimaryLatestSeq: 1, LagKnown: true}, nil
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	// Concurrently read status while the worker runs.
@@ -731,7 +936,7 @@ func TestBackgroundSync_Lag_KnownAfterSuccess(t *testing.T) {
 		}, nil
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForSuccesses(t, w, 1)
@@ -763,7 +968,7 @@ func TestBackgroundSync_Lag_ZeroWhenCaughtUp(t *testing.T) {
 		}, nil
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForSuccesses(t, w, 1)
@@ -792,7 +997,7 @@ func TestBackgroundSync_Lag_UnknownAfterFailure(t *testing.T) {
 	})
 	w.afterFn = ct.afterFn
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForSuccesses(t, w, 1) // lag is known
@@ -827,7 +1032,7 @@ func TestBackgroundSync_Lag_NegativeClampedToZero(t *testing.T) {
 		}, nil
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForSuccesses(t, w, 1)
@@ -847,7 +1052,7 @@ func TestBackgroundSync_Lag_NotReportedAsZeroWhenUnknown(t *testing.T) {
 		return SyncResult{}, errors.New("unreachable")
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForAttempts(t, w, 1)
@@ -872,7 +1077,7 @@ func TestBackgroundSync_ReplicationGap_EntersBlockedState(t *testing.T) {
 		return SyncResult{}, gapErr
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForState(t, w, WorkerStateBlocked)
@@ -907,7 +1112,7 @@ func TestBackgroundSync_ReplicationGap_DoesNotRetry(t *testing.T) {
 		return SyncResult{}, gapErr
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForState(t, w, WorkerStateBlocked)
@@ -931,7 +1136,7 @@ func TestBackgroundSync_ReplicationGap_GapMetadataAvailable(t *testing.T) {
 		return SyncResult{}, gapErr
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForState(t, w, WorkerStateBlocked)
@@ -945,6 +1150,93 @@ func TestBackgroundSync_ReplicationGap_GapMetadataAvailable(t *testing.T) {
 	}
 	if st.Gap.LatestSeq != 25 {
 		t.Errorf("Gap.LatestSeq = %d, want 25", st.Gap.LatestSeq)
+	}
+}
+
+func TestBackgroundSync_BlockedState_FieldsClearedAndRunningFalse(t *testing.T) {
+	// Prove: entering blocked state clears Running, CurrentBackoffMs, and NextRetryAt.
+	// To exercise a non-zero NextRetryAt before the gap, we trigger a temporary failure
+	// first (which sets backoff), then fire the timer to trigger the gap error.
+	ct := &controlledTimer{}
+	cfg := minBgSyncCfg()
+	cfg.InitialBackoff = Duration{500 * time.Millisecond}
+	cfg.Interval = Duration{10 * time.Second}
+
+	call := int64(0)
+	w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
+		n := atomic.AddInt64(&call, 1)
+		if n == 1 {
+			return SyncResult{}, errors.New("temporary failure — populates backoff fields")
+		}
+		return SyncResult{}, &replnet.ReplicationGapError{
+			RequestedAfter: 1, FirstAvailableSeq: 5, LatestSeq: 10,
+		}
+	})
+	w.afterFn = ct.afterFn
+
+	mustStartWorker(t, w)
+	defer w.stop()
+
+	// Wait for first failure (which sets backoff and NextRetryAt).
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if w.Status().TotalFailures >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Fire backoff timer → 2nd call returns gap → blocked.
+	ct.fireNext(t)
+	waitForState(t, w, WorkerStateBlocked)
+
+	st := w.Status()
+	if st.Running {
+		t.Error("Running should be false in blocked state (no future sync loop will execute)")
+	}
+	if st.CurrentBackoffMs != 0 {
+		t.Errorf("CurrentBackoffMs = %d in blocked state, want 0", st.CurrentBackoffMs)
+	}
+	if st.NextRetryAt != nil {
+		t.Error("NextRetryAt should be nil in blocked state (no future retry)")
+	}
+}
+
+// ── Timestamp UTC tests ────────────────────────────────────────────────────────
+
+func TestBackgroundSync_Timestamps_AreUTC(t *testing.T) {
+	cfg := minBgSyncCfg()
+	cfg.Interval = Duration{10 * time.Second}
+
+	w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
+		return SyncResult{LastAppliedSeq: 1, PrimaryLatestSeq: 1, LagKnown: true}, nil
+	})
+	// Production nowFn returns UTC; verify that timestamps reflect this.
+	// newTestWorker inherits the production nowFn from newBackgroundSyncWorker.
+
+	mustStartWorker(t, w)
+	defer w.stop()
+
+	waitForSuccesses(t, w, 1)
+	st := w.Status()
+
+	if st.LastAttemptAt == nil {
+		t.Fatal("LastAttemptAt not set after first sync attempt")
+	}
+	if st.LastAttemptAt.Location() != time.UTC {
+		t.Errorf("LastAttemptAt.Location() = %v, want UTC", st.LastAttemptAt.Location())
+	}
+	if st.LastSuccessAt == nil {
+		t.Fatal("LastSuccessAt not set after success")
+	}
+	if st.LastSuccessAt.Location() != time.UTC {
+		t.Errorf("LastSuccessAt.Location() = %v, want UTC", st.LastSuccessAt.Location())
+	}
+	if st.LagObservedAt == nil {
+		t.Fatal("LagObservedAt not set after success with LagKnown=true")
+	}
+	if st.LagObservedAt.Location() != time.UTC {
+		t.Errorf("LagObservedAt.Location() = %v, want UTC", st.LagObservedAt.Location())
 	}
 }
 

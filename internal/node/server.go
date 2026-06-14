@@ -23,14 +23,15 @@ import (
 //     background pull when BackgroundSync is enabled on a follower node).
 //   - Each Server is an independent single-process node.
 type Server struct {
-	opts   Options
-	eng    *engine.Engine
-	mux    *http.ServeMux
-	srv    *http.Server
-	ln     net.Listener
-	mu     sync.Mutex
-	closed bool
-	start  time.Time
+	opts    Options
+	eng     *engine.Engine
+	mux     *http.ServeMux
+	srv     *http.Server
+	ln      net.Listener
+	mu      sync.Mutex
+	started bool // protected by mu; true after first Start/StartBackground call
+	closed  bool // protected by mu; true after Close
+	start   time.Time
 
 	// Replication state.
 	// durableLog is non-nil only for primary nodes (Phase 26+: persisted binary journal).
@@ -132,12 +133,19 @@ func (s *Server) Addr() string {
 
 // Start binds the configured Addr and begins serving HTTP requests.
 // It blocks until the server is stopped via Close or an error occurs.
-// If background sync is configured on a follower, the worker is started after binding.
+// Returns ErrClosed if the server has already been closed.
+// Returns ErrAlreadyStarted if Start or StartBackground has already been called.
+// If background sync is configured on a follower, the worker is started atomically
+// with the listener bind (under the server lock) to prevent Close from racing.
 func (s *Server) Start() error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return ErrClosed
+	}
+	if s.started {
+		s.mu.Unlock()
+		return ErrAlreadyStarted
 	}
 	ln, err := net.Listen("tcp", s.opts.Addr)
 	if err != nil {
@@ -147,12 +155,18 @@ func (s *Server) Start() error {
 	s.ln = ln
 	srv := &http.Server{Handler: s.mux}
 	s.srv = srv
-	s.mu.Unlock()
-
-	// Start the background sync worker after the listener is bound.
+	s.started = true
+	// Start the background sync worker while holding the lock so Close cannot
+	// observe a not-yet-started worker and stop a nil-cancel, allowing a subsequent
+	// start() call to launch against already-closed resources.
 	if s.bgWorker != nil {
-		s.bgWorker.start()
+		if err := s.bgWorker.start(); err != nil {
+			// Worker was already started externally (should not happen in correct use).
+			s.mu.Unlock()
+			return fmt.Errorf("node: start background worker: %w", err)
+		}
 	}
+	s.mu.Unlock()
 
 	// Serve blocks; ErrServerClosed is normal on shutdown.
 	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -164,12 +178,19 @@ func (s *Server) Start() error {
 // StartBackground binds and starts the server in a goroutine.
 // It waits until the listener is bound before returning so callers can
 // immediately use Addr(). Returns any bind error synchronously.
-// If background sync is configured on a follower, the worker is started after binding.
+// Returns ErrClosed if the server has already been closed.
+// Returns ErrAlreadyStarted if Start or StartBackground has already been called.
+// If background sync is configured on a follower, the worker is started atomically
+// with the listener bind (under the server lock) to prevent Close from racing.
 func (s *Server) StartBackground() error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return ErrClosed
+	}
+	if s.started {
+		s.mu.Unlock()
+		return ErrAlreadyStarted
 	}
 	ln, err := net.Listen("tcp", s.opts.Addr)
 	if err != nil {
@@ -179,17 +200,20 @@ func (s *Server) StartBackground() error {
 	s.ln = ln
 	srv := &http.Server{Handler: s.mux}
 	s.srv = srv
-	s.mu.Unlock()
-
+	s.started = true
+	// Launch the HTTP server goroutine while still holding the lock so srv is
+	// visible to Close, which reads it after acquiring the lock.
 	go func() {
 		_ = srv.Serve(ln)
 	}()
-
-	// Start the background sync worker after the listener is bound.
+	// Start the background sync worker while holding the lock (see Start() for rationale).
 	if s.bgWorker != nil {
-		s.bgWorker.start()
+		if err := s.bgWorker.start(); err != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("node: start background worker: %w", err)
+		}
 	}
-
+	s.mu.Unlock()
 	return nil
 }
 
@@ -424,11 +448,13 @@ func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 		}
 	}
 
-	// Compute operation-count lag. After a successful pull we always know the
-	// primary's latest seq (even if 0 means primary is empty). Clamp defensively.
-	lagKnown := true
+	// Compute operation-count lag. Lag is only known when the primary reported
+	// primary_latest_seq (PrimaryLatestSeqKnown). A uint64 field value of 0 cannot
+	// distinguish "primary is empty" from "older primary that omits the field"; the
+	// PrimaryLatestSeqKnown flag makes this unambiguous.
+	lagKnown := pr.PrimaryLatestSeqKnown
 	var lagEntries int64
-	if pr.PrimaryLatestSeq >= lastSeq {
+	if lagKnown && pr.PrimaryLatestSeq >= lastSeq {
 		lagEntries = int64(pr.PrimaryLatestSeq - lastSeq)
 	}
 

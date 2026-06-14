@@ -43,9 +43,9 @@ The project is not a production database. It is an explainable, deeply documente
 | 24 | `configs/cluster/`, `scripts/demo_cluster_*.sh`, `docs/DEMO.md`, `internal/cluster/demo_test.go` | Reproducible local 3-node cluster demo: up/smoke/down scripts, key placement proof, data isolation proof, 13 new cluster tests | 13 | — |
 | 25 | `configs/replication/`, `scripts/repl_demo_*.sh`, `internal/node` (SyncResult, Client.SyncReplication), `internal/node/replication_phase25_test.go`, `internal/cluster/replication_demo_test.go` | Networked pull-based replication demo: leader+follower HTTP nodes, explicit pull via POST /replication/sync, PUT+DELETE replication, idempotent pull, role enforcement, 20 new tests | 20 | — |
 | 26 | `internal/replnet/durable_log.go`, `internal/replnet/state_store.go`, `internal/node/replication_phase26_test.go`, `scripts/repl_restart_demo_*.sh`, `docs/REPLICATION_DURABILITY_DESIGN.md` | Durable replication state: binary journal for primary (`replication.journal` — per-Append fsync, rollback-on-failure, ErrPoisonedLog on rollback failure, replay boundary checks); identity-bound versioned JSON cursor for follower (`replication_state.json` — version+follower_node_id+primary_url+last_applied_seq+updated_at+checksum, CRC32 over all fields, directory fsync best-effort); gap detection (HTTP 409); sequence monotonicity enforcement; concurrent sync guard (`ErrSyncInProgress`); crash window documented; restart recovery demo (18 checks). Test breakdown: 31 DurableLog + 12 StateStore + 18 Phase26_node = 61 Phase 26 tests | 61 | — |
-| 27 | `internal/node/background_sync.go`, `internal/node/background_sync_test.go`, `internal/node/replication_phase27_test.go`, `internal/node/types.go` (Duration, BackgroundSyncConfig, WorkerState, BackgroundSyncStatus), `internal/replnet/replicator.go` (PullResult), `cmd/shardforge-node/main.go` (bg-sync flags), `scripts/repl_auto_demo_*.sh`, `configs/replication/demo-background-sync.json`, `docs/BACKGROUND_REPLICATION_DESIGN.md` | Automatic background pull replication with lag tracking: configurable goroutine polls primary every 500ms; exponential backoff (initial→max) with bounded jitter (fraction); ErrSyncInProgress→skip (no failure counter); *ReplicationGapError→WorkerStateBlocked (terminal); lag_entries/lag_known always set after successful sync; PullResult carries PrimaryLatestSeq from /replication/log with no extra round-trip; worker stopped before engine/journal close (use-after-free prevention); CLI flags (--bg-sync, --bg-sync-interval, --bg-sync-request-timeout, --bg-sync-initial-backoff, --bg-sync-max-backoff, --bg-sync-jitter-fraction); 24-check smoke demo; NOT Raft; NOT automatic failover. Test breakdown: 58 unit + 1 integration file = 59 Phase 27 tests | 59 | — |
+| 27 | `internal/node/background_sync.go`, `internal/node/background_sync_test.go`, `internal/node/replication_phase27_test.go`, `internal/node/types.go` (Duration, BackgroundSyncConfig, WorkerState, BackgroundSyncStatus, ReplicationStatusResponse), `internal/node/config.go` (ErrAlreadyStarted, NaN/Inf jitter guard), `internal/node/server.go` (single-use lifecycle, race-safe start under mutex), `internal/node/handlers.go` (HTTP 409 ErrSyncInProgress), `internal/node/client.go` (ReplicationStatus typed method), `internal/replnet/replicator.go` (PullResult.PrimaryLatestSeqKnown, *uint64 logResponse), `cmd/shardforge-node/main.go` (bg-sync flags), `scripts/repl_auto_demo_*.sh` (24 checks), `configs/replication/demo-background-sync.json`, `docs/BACKGROUND_REPLICATION_DESIGN.md` | Automatic background pull replication with lag tracking: configurable goroutine polls primary every 500ms; exponential backoff (initial→max) with bounded jitter (fraction); ErrSyncInProgress→skip (resets backoff to 0, no failure counter); *ReplicationGapError→WorkerStateBlocked (clears Running/CurrentBackoffMs/NextRetryAt); lag_entries/lag_known propagated from PrimaryLatestSeqKnown (*uint64 pointer in logResponse); UTC timestamps (nowFn); server single-use lifecycle (ErrAlreadyStarted sentinel, started+closed bool under mu); worker CAS idempotency (atomic.Bool CompareAndSwap); shutdown cancellation not counted as failure (w.ctx.Err() guard); HTTP 409 for manual sync conflict; typed ReplicationStatusResponse client; 24-check smoke demo; NOT Raft; NOT automatic failover. Test breakdown: 46 unit (background_sync_test.go) + 26 integration (replication_phase27_test.go) = 72 Phase 27 tests | 72 | — |
 
-**Total tests:** 1082
+**Total tests:** 1096
 **Total benchmarks:** 120+
 **Packages with tests:** 23 of 27
 
@@ -128,7 +128,7 @@ The trace system works only because each `Explain*` method mirrors the exact exe
 
 ## Release status
 
-All 26 phases complete. `make release-check` passes. `make final-smoke` passes 36/36. `go test -race -count=1 ./...` → 1008 tests pass across 23 packages.
+All 27 phases complete. `go test -race -count=1 ./...` → 1096 tests pass across 23 packages. Smoke demos: cluster (25/25), repl (16/16), repl-restart (16/16), repl-auto (24/24).
 
 **Phase 26 fix pass hardening** (not a new phase — correctness fixes to Phase 26 before PR acceptance):
 - Journal fsync before index update; rollback on failure (injectable `syncFn` for deterministic tests)
@@ -138,5 +138,20 @@ All 26 phases complete. `make release-check` passes. `make final-smoke` passes 3
 - Sequence monotonicity enforced in `replay()` (`seq == prevSeq+1`)
 - `ErrSyncInProgress` guard prevents concurrent `SyncFromPrimary` calls
 - Crash window documented explicitly: engine write before journal append; mutation visible in engine but absent from journal if crash occurs between the two
+
+**Phase 27 production-contract hardening** (correctness and lifecycle fixes before PR acceptance):
+- `ErrAlreadyStarted` sentinel: server single-use lifecycle (`started bool` under mutex); double-Start or Start-after-Close returns typed error
+- Race-safe worker start: `bgWorker.start()` called while holding `s.mu` so `Close()` cannot race between lock release and worker launch
+- Worker CAS idempotency: `started atomic.Bool` with `CompareAndSwap`; `stop()` is also idempotent (nil-cancel safe, stop-before-start safe, stop-twice safe)
+- Shutdown not counted as failure: `w.ctx.Err()` guard in `doSync` prevents cancelled-context errors from incrementing `TotalFailures`
+- `ErrSyncInProgress` resets backoff: `*currentBackoff = 0` so next wait uses normal interval
+- `PrimaryLatestSeqKnown`: `*uint64` pointer in `logResponse` distinguishes "primary empty (field present, value 0)" from "older primary (field absent)"; propagates through `PullResult.PrimaryLatestSeqKnown` → `SyncResult.LagKnown`
+- HTTP 409 for manual sync conflict: `handleReplicationSync` returns 409 when `errors.Is(err, ErrSyncInProgress)`
+- Typed client: `ReplicationStatusResponse` + `Client.ReplicationStatus()`
+- UTC timestamps: `nowFn: func() time.Time { return time.Now().UTC() }` in worker
+- Blocked state cleanup: `WorkerStateBlocked` clears `Running=false`, `CurrentBackoffMs=0`, `NextRetryAt=nil`
+- NaN/Inf jitter guard: `math.IsNaN || math.IsInf` before range check in `ValidateBackgroundSyncConfig`
+- Smoke script: 18→24 checks; `current_backoff_ms` omitempty handled correctly; manual sync accepts 200 or 409
+- Test race fix: `TestPhase27_FollowerRestart_CursorRestoredBeforeWorkerStart` polls `FollowerLastAppliedSeq >= 3` (not stale `waitForBgZeroLag`) before reading cursor
 
 The project is suitable for portfolio presentation, technical interviews, and as a reference implementation for database internals education. It is not suitable for production use.

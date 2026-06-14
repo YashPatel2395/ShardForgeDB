@@ -3,6 +3,7 @@ package node
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 
 	"github.com/YashPatel2395/ShardForgeDB/internal/replnet"
@@ -13,6 +14,10 @@ var ErrInvalidOptions = errors.New("node: invalid options")
 
 // ErrClosed is returned when an operation is attempted on a closed Server.
 var ErrClosed = errors.New("node: closed")
+
+// ErrAlreadyStarted is returned by Start/StartBackground when called more than once,
+// and by backgroundSyncWorker.start() when the worker goroutine has already been launched.
+var ErrAlreadyStarted = errors.New("node: server already started")
 
 // ErrSyncInProgress is returned by SyncFromPrimary when a sync is already running.
 // Concurrent syncs are rejected to prevent double-application of the same batch.
@@ -73,7 +78,10 @@ func (c BackgroundSyncConfig) validate() error {
 		return fmt.Errorf("BackgroundSync.MaxBackoff (%v) must be >= InitialBackoff (%v)",
 			c.MaxBackoff.Duration, c.InitialBackoff.Duration)
 	}
-	if c.JitterFraction < 0 || c.JitterFraction > 1.0 {
+	// math.IsNaN and math.IsInf must be checked explicitly: NaN comparisons always
+	// return false, so `NaN < 0` and `NaN > 1.0` are both false, meaning NaN would
+	// pass the range check without the explicit guard.
+	if math.IsNaN(c.JitterFraction) || math.IsInf(c.JitterFraction, 0) || c.JitterFraction < 0 || c.JitterFraction > 1.0 {
 		return fmt.Errorf("BackgroundSync.JitterFraction must be in [0.0, 1.0] (got %v)", c.JitterFraction)
 	}
 	return nil

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -308,7 +309,7 @@ func TestPhase27_Lag_UnknownAfterPrimaryFailure(t *testing.T) {
 	})
 	w.afterFn = ct.afterFn
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForSuccesses(t, w, 1) // lag known after first success
@@ -334,7 +335,7 @@ func TestPhase27_Lag_NeverFalselyZeroWhenUnknown(t *testing.T) {
 		return SyncResult{}, errors.New("always fails")
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForAttempts(t, w, 1)
@@ -347,32 +348,74 @@ func TestPhase27_Lag_NeverFalselyZeroWhenUnknown(t *testing.T) {
 // ── Replication-gap terminal handling ──────────────────────────────────────────
 
 func TestPhase27_ReplicationGap_BlockedState_ManualSyncStillReturnsGap(t *testing.T) {
-	// Use a primary that deliberately produces a gap (artificially by providing a
-	// corrupted after param — simpler to test at the worker level).
+	// Use a real Server with a fake primary that always returns HTTP 409 (gap).
+	// Once the bg worker enters blocked state, verify that a manual POST /replication/sync
+	// also returns HTTP 409 with gap details and that the cursor is unchanged.
 	gapErr := &replnet.ReplicationGapError{
 		RequestedAfter:    2,
 		FirstAvailableSeq: 5,
 		LatestSeq:         10,
 	}
-	cfg := bgIntegrationCfg()
-	w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
-		return SyncResult{}, gapErr
+	fakePrimary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/replication/log") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": gapErr.Error(),
+				"gap":   gapErr,
+			})
+			return
+		}
+		// /healthz, /replication/status etc. return 200.
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fakePrimary.Close()
+
+	follower, err := Open(Options{
+		NodeID:  "gap-test-follower",
+		Addr:    "127.0.0.1:0",
+		DataDir: t.TempDir(),
+		Replication: ReplicationOptions{
+			Role:           replnet.RoleFollower,
+			PrimaryBaseURL: fakePrimary.URL,
+			BackgroundSync: bgIntegrationCfg(),
+		},
 	})
-
-	w.start()
-	defer w.stop()
-
-	waitForState(t, w, WorkerStateBlocked)
-
-	st := w.Status()
-	if st.BlockedReason != "replication_gap" {
-		t.Errorf("BlockedReason = %q, want %q", st.BlockedReason, "replication_gap")
+	if err != nil {
+		t.Fatalf("open: %v", err)
 	}
-	if st.Gap == nil {
-		t.Error("Gap must be non-nil in blocked state")
+	t.Cleanup(func() { follower.Close() })
+	if err := follower.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
 	}
-	// Cursor must not have been reset.
-	// (Cursor reset would require the server to write a new state file — not the worker.)
+
+	// Wait for bg worker to enter blocked state.
+	waitForBgWorkerState(t, follower, WorkerStateBlocked)
+
+	// Cursor must be 0 (never advanced: gap on first sync).
+	cursorBefore := follower.BackgroundSyncStatus().FollowerLastAppliedSeq
+
+	// POST /replication/sync must also return 409 with gap info.
+	rec := p27Req(t, follower, http.MethodPost, "/replication/sync", "")
+	if rec.Code != http.StatusConflict {
+		t.Errorf("POST /replication/sync = %d, want 409 Conflict when gap exists", rec.Code)
+	}
+
+	var body struct {
+		Gap   *replnet.ReplicationGapError `json:"gap"`
+		Error string                       `json:"error"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode gap response: %v", err)
+	}
+	if body.Gap == nil {
+		t.Error("gap field must be present in 409 response")
+	}
+
+	// Cursor must not have changed.
+	if follower.BackgroundSyncStatus().FollowerLastAppliedSeq != cursorBefore {
+		t.Errorf("cursor changed from %d after gap error (must be unchanged)", cursorBefore)
+	}
 }
 
 func TestPhase27_ReplicationGap_DoesNotRetryInBackground(t *testing.T) {
@@ -387,7 +430,7 @@ func TestPhase27_ReplicationGap_DoesNotRetryInBackground(t *testing.T) {
 		}
 	})
 
-	w.start()
+	mustStartWorker(t, w)
 	defer w.stop()
 
 	waitForState(t, w, WorkerStateBlocked)
@@ -478,27 +521,23 @@ func TestPhase27_ManualSync_StillWorksWithBgEnabled(t *testing.T) {
 }
 
 func TestPhase27_ManualSync_ResponseIncludesBgEnabled(t *testing.T) {
+	// Stop the background worker before calling manual sync so there is no race
+	// on syncInProgress; the bgWorker field remains non-nil so BackgroundSyncEnabled
+	// is correctly reported as true in the SyncResult.
 	primary := openBgPrimary(t)
 	follower := openBgFollower(t, primary.Addr(), t.TempDir())
 	waitForBgWorkerState(t, follower, WorkerStateRunning)
+	waitForBgLagKnown(t, follower)
 
-	// Retry a few times to get a successful manual sync (bg may be racing).
-	for i := 0; i < 10; i++ {
-		rec := p27Req(t, follower, http.MethodPost, "/replication/sync", "")
-		if rec.Code == http.StatusOK {
-			var result struct {
-				BackgroundSyncEnabled bool `json:"background_sync_enabled"`
-			}
-			if err := json.NewDecoder(rec.Body).Decode(&result); err == nil {
-				if !result.BackgroundSyncEnabled {
-					t.Error("manual sync response must include background_sync_enabled=true")
-				}
-			}
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
+	follower.bgWorker.stop() // quiesce background; bgWorker is still non-nil
+
+	result, err := follower.SyncFromPrimary(context.Background())
+	if err != nil {
+		t.Fatalf("SyncFromPrimary: %v", err)
 	}
-	t.Skip("could not get successful manual sync response (bg always racing)")
+	if !result.BackgroundSyncEnabled {
+		t.Error("BackgroundSyncEnabled must be true when bgWorker is configured, even after worker is stopped")
+	}
 }
 
 // ── Restart behavior ───────────────────────────────────────────────────────────
@@ -540,6 +579,85 @@ func TestPhase27_FollowerRestart_ResumesFromDurableCursor(t *testing.T) {
 	// New keys should arrive automatically.
 	waitForKeyOnFollower(t, follower2, "post-rst-4")
 	waitForKeyOnFollower(t, follower2, "post-rst-5")
+}
+
+func TestPhase27_FollowerRestart_CursorRestoredBeforeWorkerStart(t *testing.T) {
+	// Prove the durable cursor is restored from the state file at Open() time,
+	// before StartBackground() is called. The in-memory cursor must equal the
+	// persisted cursor before the background worker fires a single sync.
+	primary := openBgPrimary(t)
+	followerDir := t.TempDir()
+
+	// Sync through N entries.
+	follower := openBgFollower(t, primary.Addr(), followerDir)
+	p27Req(t, primary, http.MethodPut, "/kv/cursor-proof-1", `{"value":"a"}`)
+	p27Req(t, primary, http.MethodPut, "/kv/cursor-proof-2", `{"value":"b"}`)
+	p27Req(t, primary, http.MethodPut, "/kv/cursor-proof-3", `{"value":"c"}`)
+	waitForKeyOnFollower(t, follower, "cursor-proof-3")
+
+	// Poll until the background sync STATUS reflects FollowerLastAppliedSeq >= 3.
+	// The status is updated in doSync AFTER ApplyReplicationEntries returns (which saves
+	// the state file). Polling the status field — rather than waitForBgZeroLag — avoids
+	// a window where waitForBgZeroLag returns on stale lag=0 from a previous sync cycle
+	// while the current sync is between the engine write and the status update.
+	var cursorN uint64
+	{
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			cursorN = follower.BackgroundSyncStatus().FollowerLastAppliedSeq
+			if cursorN >= 3 {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if cursorN < 3 {
+			t.Fatalf("timeout: FollowerLastAppliedSeq=%d, want >= 3 (state file must be saved)", cursorN)
+		}
+	}
+	follower.Close()
+
+	// Write N+1 and N+2 while follower is down.
+	p27Req(t, primary, http.MethodPut, "/kv/cursor-proof-4", `{"value":"d"}`)
+	p27Req(t, primary, http.MethodPut, "/kv/cursor-proof-5", `{"value":"e"}`)
+
+	// Open follower WITHOUT starting (worker not yet running).
+	follower2, err := Open(Options{
+		NodeID:  "p27-follower",
+		Addr:    "127.0.0.1:0",
+		DataDir: followerDir,
+		Replication: ReplicationOptions{
+			Role:           replnet.RoleFollower,
+			PrimaryBaseURL: "http://" + primary.Addr(),
+			BackgroundSync: bgIntegrationCfg(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("reopen follower: %v", err)
+	}
+	t.Cleanup(func() { follower2.Close() })
+
+	// Verify in-memory cursor == cursorN before any sync (restored from state file).
+	inMemCursor := atomic.LoadUint64(&follower2.lastApplied)
+	if inMemCursor != cursorN {
+		t.Errorf("cursor after Open (before Start) = %d, want %d (must be restored from state store)",
+			inMemCursor, cursorN)
+	}
+
+	// Now start (which starts the bg worker).
+	if err := follower2.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Worker should fetch only N+1 and N+2.
+	waitForKeyOnFollower(t, follower2, "cursor-proof-4")
+	waitForKeyOnFollower(t, follower2, "cursor-proof-5")
+	waitForBgZeroLag(t, follower2)
+
+	finalCursor := follower2.BackgroundSyncStatus().FollowerLastAppliedSeq
+	if finalCursor != cursorN+2 {
+		t.Errorf("final cursor = %d, want %d (exactly 2 new entries applied)",
+			finalCursor, cursorN+2)
+	}
 }
 
 func TestPhase27_DeleteAfterRestart_PropagatesAutomatically(t *testing.T) {
@@ -701,26 +819,76 @@ func TestPhase27_SyncFromPrimary_ResultIncludesLagFields(t *testing.T) {
 }
 
 func TestPhase27_SyncFromPrimary_BgEnabled_ReportedInResult(t *testing.T) {
+	// Stop the background worker so manual sync doesn't race on syncInProgress;
+	// bgWorker is still non-nil so BackgroundSyncEnabled is reported as true.
 	primary := openBgPrimary(t)
 	follower := openBgFollower(t, primary.Addr(), t.TempDir())
 	waitForBgWorkerState(t, follower, WorkerStateRunning)
+	waitForBgLagKnown(t, follower)
 
-	// Retry manual sync a few times to get one while bg is not racing.
-	for i := 0; i < 10; i++ {
-		result, err := follower.SyncFromPrimary(context.Background())
-		if err == nil {
-			if !result.BackgroundSyncEnabled {
-				t.Error("BackgroundSyncEnabled should be true when bgWorker is configured")
-			}
+	follower.bgWorker.stop() // quiesce; bgWorker field stays non-nil
+
+	result, err := follower.SyncFromPrimary(context.Background())
+	if err != nil {
+		t.Fatalf("SyncFromPrimary: %v", err)
+	}
+	if !result.BackgroundSyncEnabled {
+		t.Error("BackgroundSyncEnabled should be true when bgWorker is configured")
+	}
+}
+
+// ── Phase-26 compatibility: absent primary_latest_seq ─────────────────────────
+
+func TestPhase27_PrimaryLatestSeq_AbsentMeansLagUnknown(t *testing.T) {
+	// Simulate a Phase-26-style primary whose /replication/log response omits
+	// primary_latest_seq. SyncFromPrimary must set LagKnown=false in the result
+	// rather than falsely inferring "lag=0" from the zero value.
+	fakePrimary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/replication/log") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			// Intentionally omit primary_latest_seq (Phase-26 style).
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"node_id": "old-primary",
+				"after":   0,
+				"count":   0,
+				"entries": []any{},
+			})
 			return
 		}
-		if errors.Is(err, ErrSyncInProgress) {
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-		t.Fatalf("unexpected error: %v", err)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fakePrimary.Close()
+
+	follower, err := Open(Options{
+		NodeID:  "p27-compat-follower",
+		Addr:    "127.0.0.1:0",
+		DataDir: t.TempDir(),
+		Replication: ReplicationOptions{
+			Role:           replnet.RoleFollower,
+			PrimaryBaseURL: fakePrimary.URL,
+		},
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
 	}
-	t.Skip("could not get non-racing manual sync")
+	t.Cleanup(func() { follower.Close() })
+	if err := follower.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Manual sync against Phase-26-style primary.
+	result, err := follower.SyncFromPrimary(context.Background())
+	if err != nil {
+		t.Fatalf("SyncFromPrimary: %v", err)
+	}
+	// When primary omits primary_latest_seq, LagKnown must be false.
+	if result.LagKnown {
+		t.Error("LagKnown should be false when primary_latest_seq is absent (Phase-26 compat)")
+	}
+	if result.PrimaryLatestSeq != 0 {
+		t.Errorf("PrimaryLatestSeq = %d, want 0 when field is absent", result.PrimaryLatestSeq)
+	}
 }
 
 // ── follower without bg sync reports disabled ──────────────────────────────────
@@ -775,5 +943,60 @@ func TestPhase27_ReplicationLog_IncludesPrimaryLatestSeq(t *testing.T) {
 	}
 	if body.Count == 0 {
 		t.Error("count should be > 0 after a PUT")
+	}
+}
+
+// ── Typed client ──────────────────────────────────────────────────────────────
+
+func TestPhase27_ReplicationStatus_TypedClient(t *testing.T) {
+	primary := openBgPrimary(t)
+	follower := openBgFollower(t, primary.Addr(), t.TempDir())
+	waitForBgWorkerState(t, follower, WorkerStateRunning)
+
+	c := NewClient("http://"+follower.Addr(), 5*time.Second)
+	resp, err := c.ReplicationStatus(context.Background())
+	if err != nil {
+		t.Fatalf("ReplicationStatus: %v", err)
+	}
+	if resp.NodeID == "" {
+		t.Error("NodeID should be non-empty")
+	}
+	if !resp.BackgroundSync.Enabled {
+		t.Error("BackgroundSync.Enabled should be true for follower with bg sync")
+	}
+	if resp.BackgroundSync.State == WorkerStateDisabled {
+		t.Errorf("BackgroundSync.State = %q, want non-disabled", resp.BackgroundSync.State)
+	}
+	if resp.Replication.Role != replnet.RoleFollower {
+		t.Errorf("Replication.Role = %q, want %q", resp.Replication.Role, replnet.RoleFollower)
+	}
+}
+
+// ── UTC timestamp verification ────────────────────────────────────────────────
+
+func TestPhase27_WorkerTimestamps_AreUTC(t *testing.T) {
+	primary := openBgPrimary(t)
+	follower := openBgFollower(t, primary.Addr(), t.TempDir())
+	waitForBgLagKnown(t, follower)
+
+	st := follower.BackgroundSyncStatus()
+
+	if st.LastSuccessAt == nil {
+		t.Fatal("LastSuccessAt not set after successful sync")
+	}
+	if st.LastSuccessAt.Location() != time.UTC {
+		t.Errorf("LastSuccessAt.Location() = %v, want UTC", st.LastSuccessAt.Location())
+	}
+	if st.LagObservedAt == nil {
+		t.Fatal("LagObservedAt not set after successful sync with LagKnown=true")
+	}
+	if st.LagObservedAt.Location() != time.UTC {
+		t.Errorf("LagObservedAt.Location() = %v, want UTC", st.LagObservedAt.Location())
+	}
+	if st.LastAttemptAt == nil {
+		t.Fatal("LastAttemptAt not set after sync attempt")
+	}
+	if st.LastAttemptAt.Location() != time.UTC {
+		t.Errorf("LastAttemptAt.Location() = %v, want UTC", st.LastAttemptAt.Location())
 	}
 }

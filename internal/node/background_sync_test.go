@@ -894,6 +894,43 @@ func TestBackgroundSync_ErrSyncInProgress_AfterBackoff_ResetsCurrentBackoff(t *t
 		st.CurrentBackoffMs, st.State)
 }
 
+func TestBackgroundSync_Worker_ConcurrentStartStop(t *testing.T) {
+	// Prove: concurrent start() + stop() never deadlocks and the goroutine always exits
+	// cleanly (no leak). The lifecycleMu in start() ensures wg.Add(1) happens-before
+	// stop()'s wg.Wait(), so the WaitGroup is always balanced regardless of scheduling.
+	for i := 0; i < 100; i++ {
+		cfg := minBgSyncCfg()
+		cfg.Interval = Duration{10 * time.Second}
+
+		w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
+			return SyncResult{}, nil
+		})
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = w.start()
+		}()
+		go func() {
+			defer wg.Done()
+			w.stop()
+		}()
+		wg.Wait()
+
+		// Drain: if start() won the race, the goroutine is running; stop it.
+		w.stop()
+
+		// Final state: either the goroutine never started (state = disabled or starting),
+		// or it started and has now been stopped (state = stopped).
+		// In no case should we deadlock or leak a goroutine.
+		state := w.Status().State
+		if state != WorkerStateStopped && state != WorkerStateDisabled && state != WorkerStateStarting {
+			t.Errorf("iteration %d: unexpected final state %q after concurrent start+stop", i, state)
+		}
+	}
+}
+
 func TestBackgroundSync_StatusRead_RaceSafe(t *testing.T) {
 	cfg := minBgSyncCfg()
 	cfg.Interval = Duration{5 * time.Millisecond}

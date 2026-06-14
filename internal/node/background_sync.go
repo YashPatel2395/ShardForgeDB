@@ -39,6 +39,13 @@ type backgroundSyncWorker struct {
 	// start() ensures the goroutine is launched at most once.
 	started atomic.Bool
 
+	// lifecycleMu serialises the cancel-assignment + wg.Add(1) + goroutine-launch
+	// sequence in start() with the cancel-read sequence in stop(). Without this lock
+	// a concurrent stop() could observe cancel != nil (after the mu.Unlock in start())
+	// but before wg.Add(1) has been called, causing wg.Wait() to return before the
+	// goroutine exits (or even before it starts).
+	lifecycleMu sync.Mutex
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -86,14 +93,18 @@ func (w *backgroundSyncWorker) start() error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 
+	// Hold lifecycleMu across cancel-assignment + wg.Add(1) + goroutine-launch so
+	// that stop(), which reads cancel under lifecycleMu, can guarantee that by the
+	// time it observes cancel != nil, wg.Add(1) has already been called.
+	w.lifecycleMu.Lock()
 	w.mu.Lock()
 	w.ctx = ctx
 	w.cancel = cancel
 	w.status.State = WorkerStateStarting
 	w.mu.Unlock()
-
 	w.wg.Add(1)
 	go w.run()
+	w.lifecycleMu.Unlock()
 	return nil
 }
 
@@ -102,12 +113,18 @@ func (w *backgroundSyncWorker) start() error {
 // (no-op because context is idempotent and wg is already at zero), or
 // concurrently from multiple goroutines.
 func (w *backgroundSyncWorker) stop() {
-	// Capture cancel under RLock to avoid racing with start().
+	// Synchronise with start(): hold lifecycleMu briefly while reading cancel.
+	// This ensures that if cancel is non-nil when we observe it, start() has
+	// already called wg.Add(1), so our subsequent wg.Wait() will always find a
+	// matching Done() from the goroutine.
+	w.lifecycleMu.Lock()
 	w.mu.RLock()
 	cancel := w.cancel
 	w.mu.RUnlock()
+	w.lifecycleMu.Unlock()
+
 	if cancel == nil {
-		// start() was never called; nothing to stop.
+		// start() was never called (or hasn't set cancel yet); nothing to stop.
 		return
 	}
 

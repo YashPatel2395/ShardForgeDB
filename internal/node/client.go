@@ -137,11 +137,56 @@ func (c *Client) ReplicationStatus(ctx context.Context) (ReplicationStatusRespon
 // explicit pull from the configured primary. Returns the SyncResult with fetched,
 // applied, and last_applied_seq counts.
 //
+// If the server returns HTTP 409 with code "sync_in_progress" (a concurrent sync is
+// already in flight), the returned error wraps ErrSyncInProgress so callers can use
+// errors.Is(err, ErrSyncInProgress). A 409 replication-gap response does NOT match
+// ErrSyncInProgress.
+//
 // Scope: explicit operator-triggered pull only. No background loop, no Raft, no quorum.
 func (c *Client) SyncReplication(ctx context.Context) (*SyncResult, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/replication/sync", nil)
+	if err != nil {
+		return nil, fmt.Errorf("node client: sync replication: build request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("node client: sync replication: %w", ctx.Err())
+		}
+		return nil, fmt.Errorf("node client: sync replication: node unavailable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("node client: sync replication: read body: %w", err)
+	}
+
+	// HTTP 409 with code "sync_in_progress": a concurrent background or manual sync
+	// is already in flight. Return a wrapped ErrSyncInProgress so callers can use
+	// errors.Is. A 409 for a replication gap has a different code and does NOT match.
+	if resp.StatusCode == http.StatusConflict {
+		var coded struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal(body, &coded) == nil && coded.Code == "sync_in_progress" {
+			return nil, fmt.Errorf("node client: sync replication: %w", ErrSyncInProgress)
+		}
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var errResp errorResponse
+		if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
+			return nil, fmt.Errorf("node client: sync replication: server error %d: %s", resp.StatusCode, errResp.Error)
+		}
+		return nil, fmt.Errorf("node client: sync replication: unexpected status %d: %s", resp.StatusCode, string(body))
+	}
+
 	var result SyncResult
-	if err := c.doJSON(ctx, http.MethodPost, "/replication/sync", nil, &result); err != nil {
-		return nil, fmt.Errorf("node client: sync replication: %w", err)
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("node client: sync replication: invalid JSON: %w", err)
 	}
 	return &result, nil
 }

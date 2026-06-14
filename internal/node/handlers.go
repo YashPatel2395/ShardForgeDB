@@ -450,6 +450,7 @@ func (s *Server) handleReplicationSync(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, ErrSyncInProgress) {
 			writeJSON(w, http.StatusConflict, map[string]any{
 				"ok":      false,
+				"code":    "sync_in_progress",
 				"node_id": s.opts.NodeID,
 				"error":   err.Error(),
 			})

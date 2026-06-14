@@ -8,7 +8,7 @@ An **explainable** Go database engine for key-value and vector search workloads,
 > Phase 25 adds a reproducible leader+follower HTTP replication demo: explicit pull via `POST /replication/sync`, PUT+DELETE replication proven, idempotent pull proven, follower write-rejection proven.
 > Phase 24 adds a 3-node local cluster demo: independent HTTP nodes, stateless proxy, FNV-1a routing, data isolation proof.
 >
-> **1096 race-safe tests. 120+ reproducible benchmarks. All 27 phases complete.**
+> **1106 race-safe tests. 120+ reproducible benchmarks. All 27 phases complete.**
 
 ---
 
@@ -540,9 +540,11 @@ make node-demo-down
 - [x] `configs/replication/demo-background-sync.json` — Phase 27 demo config (ports 9501/9502, 500ms interval)
 - [x] `scripts/repl_auto_demo_{up,smoke,down}.sh` — 24-check smoke: health, bg enabled/running, auto PUT, lag zero, multiple keys, auto DELETE, primary stop→lag unknown, primary restart→recovery, follower restart survival
 - [x] `make repl-auto-demo-{up,smoke,down}` — Makefile targets
-- [x] `internal/node/background_sync_test.go` — 46 unit tests: config validation, lifecycle (start/stop idempotency, ErrAlreadyStarted, stop-before-start, start-after-stop), propagation, backoff doubling/capping, success-resets-backoff, jitter bounds (NaN/Inf guard), `ErrSyncInProgress`-as-skip (resets backoff), lag known/unknown, gap terminal (clears Running/CurrentBackoffMs/NextRetryAt), UTC timestamps, shutdown-not-failure, Duration JSON
+- [x] `internal/node/background_sync_test.go` — 47 unit tests: config validation, lifecycle (start/stop idempotency, ErrAlreadyStarted, stop-before-start, start-after-stop, concurrent-start-stop race), propagation, backoff doubling/capping, success-resets-backoff, jitter bounds (NaN/Inf guard), `ErrSyncInProgress`-as-skip (resets backoff), lag known/unknown, gap terminal (clears Running/CurrentBackoffMs/NextRetryAt), UTC timestamps, shutdown-not-failure, Duration JSON
 - [x] `internal/node/replication_phase27_test.go` — 26 integration tests: auto PUT/DELETE, multiple ordered mutations, empty sync, durable cursor (cursor verified before worker fires), lag tracking, PrimaryLatestSeq absent→LagKnown=false, status API typed client, manual sync coexistence (HTTP 409 ErrSyncInProgress), blocked state+manual sync (real Server), restart scenarios, UTC timestamps, `SyncResult` lag fields
-- [x] **1096 total tests (1023 + 73 Phase 27 net-new)**
+- [x] `internal/node/server_lifecycle_test.go` — 9 lifecycle+client tests: double-StartBackground (standalone/primary/follower), StartBackground after Close, Close without Start then StartBackground, concurrent StartBackground+Close (50-iteration race loop), follower bg worker started exactly once, `Client.SyncReplication` HTTP 409 sync_in_progress→wrapped ErrSyncInProgress, 502 does not match ErrSyncInProgress
+- [x] `internal/replnet/replicator_test.go` — 1 Phase-27 test: PrimaryLatestSeq_Reported (verifies *uint64 pointer propagation)
+- [x] **1106 total tests (1023 + 83 Phase 27 net-new: 47 background_sync + 26 phase27_integration + 9 server_lifecycle + 1 replnet = 83)**
 - [x] **NOT Raft, NOT consensus, NOT quorum, NOT automatic failover, NOT leader election**
 - [x] **Background sync is follower-only** — primary is unaffected; follower rejects writes
 - [x] **Phase 26 crash window acknowledged** — engine commit → journal append window remains

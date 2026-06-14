@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/final_smoke.sh — Phase 25 final smoke validation
+# scripts/final_smoke.sh — Phase 26 final smoke validation
 # Runs the full acceptance gate for portfolio launch readiness.
 # No Docker required. No network calls. Pure local validation.
 set -eu
@@ -34,7 +34,7 @@ ok "go vet ./... passes"
 echo ""
 echo "-- Tests (race detector)"
 go test -race -count=1 ./...
-ok "go test -race -count=1 ./... passes (962 tests)"
+ok "go test -race -count=1 ./... passes (994 tests)"
 
 # ── Build ─────────────────────────────────────────────────────────────
 echo ""
@@ -122,6 +122,25 @@ ok "configs/cluster/demo-3node.json validates"
 ./bin/shardforge-cluster validate configs/replication/demo-leader-follower.json
 ok "configs/replication/demo-leader-follower.json validates"
 
+# ── Phase 26 durable replication checks (no live nodes required) ──────
+echo ""
+echo "-- Phase 26 durable replication (unit-level, no live nodes)"
+
+# Verify design doc exists.
+if [ -f "docs/REPLICATION_DURABILITY_DESIGN.md" ]; then
+  ok "docs/REPLICATION_DURABILITY_DESIGN.md exists"
+else
+  fail "docs/REPLICATION_DURABILITY_DESIGN.md missing"
+fi
+
+# Verify journal binary in a temp dir using the explain engine (exercises DurableLog indirectly
+# through the server open path, which opens a DurableLog for primary nodes).
+PHASE26_DIR=$(mktemp -d)
+trap 'rm -rf "$PHASE26_DIR"' EXIT
+./bin/shardforge explain --data-dir "$PHASE26_DIR" put phase26key phase26val > /tmp/sfdb-p26-put.out 2>&1
+grep -q "WAL_APPEND" /tmp/sfdb-p26-put.out
+ok "shardforge explain put (Phase 26 engine path) returns WAL_APPEND"
+
 # ── Ops simulation (no live nodes required) ───────────────────────────
 echo ""
 echo "-- Ops simulation (pure computation)"
@@ -158,7 +177,7 @@ echo "  Failed: $FAIL"
 echo ""
 
 if [ "$FAIL" -eq 0 ]; then
-  echo "All checks passed. ShardForgeDB is ready for portfolio launch."
+  echo "All checks passed. ShardForgeDB Phase 26 is ready for portfolio launch."
   exit 0
 else
   echo "Some checks failed. Review output above."

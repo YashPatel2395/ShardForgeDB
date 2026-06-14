@@ -16,7 +16,7 @@ CLUSTER_CMD      := ./cmd/shardforge-cluster
 GO               := go
 GOFLAGS          :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-replnet bench-ops bench-trace bench-report dashboard node node-demo node-demo-down replica-demo replica-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example replica-config-demo replica-status-demo ops-health-demo ops-simulate-failure-demo ops-rebalance-plan-demo smoke demo release-check final-smoke cluster-demo-up cluster-demo-smoke cluster-demo-down repl-demo-up repl-demo-smoke repl-demo-down help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-replnet bench-ops bench-trace bench-report dashboard node node-demo node-demo-down replica-demo replica-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example replica-config-demo replica-status-demo ops-health-demo ops-simulate-failure-demo ops-rebalance-plan-demo smoke demo release-check final-smoke cluster-demo-up cluster-demo-smoke cluster-demo-down repl-demo-up repl-demo-smoke repl-demo-down repl-restart-demo-up repl-restart-demo-smoke repl-restart-demo-down help
 
 all: fmt vet build
 
@@ -230,6 +230,18 @@ repl-demo-smoke:
 ## repl-demo-down: Phase 25 — stop replication demo processes and remove demo data directories
 repl-demo-down:
 	./scripts/repl_demo_down.sh
+
+## repl-restart-demo-up: Phase 26 — start durable replication demo (leader+follower, persisted journal+cursor)
+repl-restart-demo-up:
+	./scripts/repl_restart_demo_up.sh
+
+## repl-restart-demo-smoke: Phase 26 — run restart recovery smoke test (proves journal+cursor survive restarts)
+repl-restart-demo-smoke:
+	./scripts/repl_restart_demo_smoke.sh
+
+## repl-restart-demo-down: Phase 26 — stop restart demo processes and remove demo data directories
+repl-restart-demo-down:
+	./scripts/repl_restart_demo_down.sh
 
 ## clean: remove build artifacts
 clean:

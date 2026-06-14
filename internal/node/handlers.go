@@ -2,6 +2,7 @@ package node
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -97,8 +98,10 @@ func (s *Server) handleKVPut(w http.ResponseWriter, r *http.Request, key []byte)
 		s.writeError(w, http.StatusInternalServerError, "put failed: "+err.Error())
 		return
 	}
-	if s.replLog != nil {
-		s.replLog.Append(replnet.OpPut, string(key), req.Value)
+	// Write-after-commit: engine write succeeds first, then append to durable journal.
+	// Crash window between these two is documented in REPLICATION_DURABILITY_DESIGN.md.
+	if s.durableLog != nil {
+		s.durableLog.Append(replnet.OpPut, string(key), req.Value)
 	}
 	writeJSON(w, http.StatusOK, putResponse{OK: true, NodeID: s.opts.NodeID})
 }
@@ -126,8 +129,9 @@ func (s *Server) handleKVDelete(w http.ResponseWriter, r *http.Request, key []by
 		s.writeError(w, http.StatusInternalServerError, "delete failed: "+err.Error())
 		return
 	}
-	if s.replLog != nil {
-		s.replLog.Append(replnet.OpDelete, string(key), "")
+	// Write-after-commit: engine write succeeds first, then append to durable journal.
+	if s.durableLog != nil {
+		s.durableLog.Append(replnet.OpDelete, string(key), "")
 	}
 	writeJSON(w, http.StatusOK, deleteResponse{OK: true, NodeID: s.opts.NodeID})
 }
@@ -231,6 +235,15 @@ func (s *Server) handleReplicationLog(w http.ResponseWriter, r *http.Request) {
 	}
 	entries, err := s.ReplicationEntries(after, limit)
 	if err != nil {
+		var gapErr *replnet.ReplicationGapError
+		if errors.As(err, &gapErr) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":   gapErr.Error(),
+				"gap":     gapErr,
+				"node_id": s.opts.NodeID,
+			})
+			return
+		}
 		s.writeError(w, http.StatusInternalServerError, "replication log: "+err.Error())
 		return
 	}
@@ -421,6 +434,22 @@ func (s *Server) handleReplicationSync(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.SyncFromPrimary(r.Context())
 	if err != nil {
+		var gapErr *replnet.ReplicationGapError
+		if errors.As(err, &gapErr) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"ok":               false,
+				"node_id":          s.opts.NodeID,
+				"source_node":      result.SourceNode,
+				"follower_node":    result.FollowerNode,
+				"fetched":          result.Fetched,
+				"applied":          result.Applied,
+				"last_applied_seq": result.LastAppliedSeq,
+				"replication":      result.Replication,
+				"gap":              gapErr,
+				"error":            err.Error(),
+			})
+			return
+		}
 		writeJSON(w, http.StatusBadGateway, map[string]any{
 			"ok":               false,
 			"node_id":          s.opts.NodeID,

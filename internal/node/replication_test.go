@@ -84,7 +84,7 @@ func TestPrimary_Put_AppendsToLog(t *testing.T) {
 	doRequest(t, primary, http.MethodPut, "/kv/k1", `{"value":"v1"}`)
 	doRequest(t, primary, http.MethodPut, "/kv/k2", `{"value":"v2"}`)
 
-	stats, err := primary.replLog.Stats()
+	stats, err := primary.durableLog.Stats()
 	if err != nil {
 		t.Fatalf("log.Stats: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestPrimary_Delete_AppendsToLog(t *testing.T) {
 	doRequest(t, primary, http.MethodPut, "/kv/k1", `{"value":"v1"}`)
 	doRequest(t, primary, http.MethodDelete, "/kv/k1", "")
 
-	stats, _ := primary.replLog.Stats()
+	stats, _ := primary.durableLog.Stats()
 	if stats.Count != 2 {
 		t.Errorf("log count = %d, want 2 (put+delete)", stats.Count)
 	}
@@ -107,8 +107,8 @@ func TestPrimary_Delete_AppendsToLog(t *testing.T) {
 func TestStandalone_Put_NoLog(t *testing.T) {
 	s := newTestServer(t, "standalone")
 	doRequest(t, s, http.MethodPut, "/kv/k1", `{"value":"v1"}`)
-	if s.replLog != nil {
-		t.Error("standalone node should have nil replLog")
+	if s.durableLog != nil {
+		t.Error("standalone node should have nil durableLog")
 	}
 }
 

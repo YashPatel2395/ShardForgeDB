@@ -42,8 +42,9 @@ The project is not a production database. It is an explainable, deeply documente
 | 23 | `internal/node`, `cmd/shardforge` | HTTP explain endpoints, `node.Client` explain methods, `shardforge explain-node` CLI | 24 | — |
 | 24 | `configs/cluster/`, `scripts/demo_cluster_*.sh`, `docs/DEMO.md`, `internal/cluster/demo_test.go` | Reproducible local 3-node cluster demo: up/smoke/down scripts, key placement proof, data isolation proof, 13 new cluster tests | 13 | — |
 | 25 | `configs/replication/`, `scripts/repl_demo_*.sh`, `internal/node` (SyncResult, Client.SyncReplication), `internal/node/replication_phase25_test.go`, `internal/cluster/replication_demo_test.go` | Networked pull-based replication demo: leader+follower HTTP nodes, explicit pull via POST /replication/sync, PUT+DELETE replication, idempotent pull, role enforcement, 20 new tests | 20 | — |
+| 26 | `internal/replnet/durable_log.go`, `internal/replnet/state_store.go`, `internal/node/replication_phase26_test.go`, `scripts/repl_restart_demo_*.sh`, `docs/REPLICATION_DURABILITY_DESIGN.md` | Durable replication state: binary journal for primary (`replication.journal` — per-Append fsync, rollback-on-failure, ErrPoisonedLog on rollback failure, replay boundary checks); identity-bound versioned JSON cursor for follower (`replication_state.json` — version+follower_node_id+primary_url+last_applied_seq+updated_at+checksum, CRC32 over all fields, directory fsync best-effort); gap detection (HTTP 409); sequence monotonicity enforcement; concurrent sync guard (`ErrSyncInProgress`); crash window documented; restart recovery demo (18 checks). Test breakdown: 31 DurableLog + 12 StateStore + 18 Phase26_node = 61 Phase 26 tests | 61 | — |
 
-**Total tests:** 962
+**Total tests:** 1023
 **Total benchmarks:** 120+
 **Packages with tests:** 23 of 27
 
@@ -57,7 +58,7 @@ The vector store uses the engine as its persistence layer and maintains an in-me
 
 The networked layer adds real HTTP/JSON nodes, a client-side consistent-hash routing gateway, and a stateless proxy. Each node is independent — no coordination, no shared state.
 
-Read replicas add explicit pull-based sync: the primary keeps an in-memory mutation log; followers pull entries on demand. No automatic background sync, no Raft.
+Read replicas add explicit pull-based sync: the primary keeps a durable binary journal (`replication.journal`); followers persist their cursor to `replication_state.json` and pull entries on demand. Both survive process restarts. Gap detection returns HTTP 409 when the follower falls too far behind. No automatic background sync, no Raft.
 
 The ops layer adds health visibility, failure simulation (routing impact without live calls), and manual rebalance planning (key movement without data movement).
 
@@ -117,13 +118,22 @@ The trace system works only because each `Explain*` method mirrors the exact exe
 - No block cache (full SSTable reads on every access)
 - No distributed tracing (traces cover one node only; no cross-node propagation)
 - Exact vector search only (O(n·d) brute-force; no HNSW, no IVF)
-- In-memory replication log (lost on primary restart)
+- Primary journal is durable per-Append (fsync before index update; crash window between engine.Put and journal.Append is documented — a mutation applied to the engine but lost before journal.Append is invisible to replication)
 - Follower reads may lag by arbitrary number of ops
 
 ---
 
 ## Release status
 
-All 25 phases complete. `make release-check` passes. `make final-smoke` passes 34/34. `go test -race -count=1 ./...` → 962 tests pass across 23 packages.
+All 26 phases complete. `make release-check` passes. `make final-smoke` passes 36/36. `go test -race -count=1 ./...` → 1008 tests pass across 23 packages.
+
+**Phase 26 fix pass hardening** (not a new phase — correctness fixes to Phase 26 before PR acceptance):
+- Journal fsync before index update; rollback on failure (injectable `syncFn` for deterministic tests)
+- Identity-bound follower state file (`version`, `follower_node_id`, `primary_url`, `updated_at`; CRC32 covers all fields)
+- Directory fsync after state file rename (no-op on macOS; durable on Linux)
+- `AdvanceTo` returns `ErrInvalidSeqRegression` for backward cursor moves (not silent)
+- Sequence monotonicity enforced in `replay()` (`seq == prevSeq+1`)
+- `ErrSyncInProgress` guard prevents concurrent `SyncFromPrimary` calls
+- Crash window documented explicitly: engine write before journal append; mutation visible in engine but absent from journal if crash occurs between the two
 
 The project is suitable for portfolio presentation, technical interviews, and as a reference implementation for database internals education. It is not suitable for production use.

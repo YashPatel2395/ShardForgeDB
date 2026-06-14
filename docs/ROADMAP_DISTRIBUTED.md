@@ -1,6 +1,6 @@
 # ShardForgeDB — Distributed Roadmap
 
-**Phase 21 — Truth Lock edition**
+**Phase 26 — Durable Replication State and Restart Recovery edition**
 
 This document defines the phases required to evolve ShardForgeDB from its current explainable single-node + HTTP-node foundation into a real distributed database. Each phase is narrow, honest, and fully testable before the next begins.
 
@@ -8,7 +8,7 @@ The final target: **ShardForgeDB — a real explainable distributed database eng
 
 ---
 
-## Current state (Phases 1–19 complete)
+## Current state (Phases 1–26 complete)
 
 | Component | Status |
 |---|---|
@@ -23,7 +23,7 @@ The final target: **ShardForgeDB — a real explainable distributed database eng
 | Client-side consistent-hash routing gateway | Implemented (`internal/gateway`) |
 | Stateless HTTP routing proxy | Implemented (`internal/proxy`) |
 | Static cluster metadata | Implemented (`internal/cluster`) |
-| Explicit pull-based read replicas v1 | Implemented (`internal/replnet`) |
+| Explicit pull-based read replicas with durable state | Implemented (`internal/replnet` — DurableLog, ReplicationStateStore, gap detection) |
 | Ops simulation (health, failure sim, rebalance plan) | Implemented (`internal/ops`) |
 
 **Not yet implemented (required for real distributed claims):**

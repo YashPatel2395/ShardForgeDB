@@ -155,6 +155,9 @@ type SyncResult struct {
 	LastAppliedSeq uint64 `json:"last_applied_seq"`
 	// Replication is the full replica status snapshot after the sync.
 	Replication replnet.ReplicaStatus `json:"replication"`
+	// Gap is non-nil when the primary returned HTTP 409 (replication gap).
+	// The follower's cursor is behind the primary's earliest retained entry.
+	Gap *replnet.ReplicationGapError `json:"gap,omitempty"`
 }
 
 // ExplainPutResponse is the JSON body returned by POST /explain/put.

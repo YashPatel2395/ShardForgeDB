@@ -35,7 +35,7 @@ func TestPhase25_FollowerSync_AppliesDelete(t *testing.T) {
 	doRequest(t, primary, http.MethodDelete, "/kv/delete-me", "")
 
 	// Verify primary log has 2 entries (put + delete).
-	stats, err := primary.replLog.Stats()
+	stats, err := primary.durableLog.Stats()
 	if err != nil {
 		t.Fatalf("log stats: %v", err)
 	}
@@ -284,8 +284,9 @@ func TestPhase25_LeaderAndFollower_DistinctDataDirs(t *testing.T) {
 }
 
 func TestPhase25_ReplDemoConfig_ReplicationCursorIsInMemory(t *testing.T) {
-	// The replication cursor (lastApplied) is in-memory only.
-	// Verify it resets to 0 after a new Server is opened.
+	// Phase 26 update: the replication cursor is now DURABLE (persisted to
+	// replication_state.json). After a follower restart the cursor is restored.
+	// This test has been updated to verify the new durable behaviour.
 	primary := newPrimaryServer(t)
 	if err := primary.StartBackground(); err != nil {
 		t.Fatalf("start primary: %v", err)
@@ -317,9 +318,11 @@ func TestPhase25_ReplDemoConfig_ReplicationCursorIsInMemory(t *testing.T) {
 	}
 	_ = follower1.Close()
 
-	// Re-open follower from same dir. Cursor must reset to 0 (in-memory only).
+	// Re-open follower from same dir with the SAME NodeID. Phase 26: cursor is RESTORED from
+	// disk (not reset to 0). The state file is identity-bound to the node ID; a different
+	// node ID would return ErrFollowerIdentityMismatch.
 	follower2, err := Open(Options{
-		NodeID:  "follower-2",
+		NodeID:  "follower-1", // must match the state file written by follower1
 		Addr:    "127.0.0.1:0",
 		DataDir: followerDir,
 		Replication: ReplicationOptions{
@@ -332,8 +335,8 @@ func TestPhase25_ReplDemoConfig_ReplicationCursorIsInMemory(t *testing.T) {
 	}
 	defer follower2.Close()
 
-	// Cursor resets to 0 — this is the documented in-memory-only behavior.
-	if seq := follower2.ReplicationStatus().LastAppliedSeq; seq != 0 {
-		t.Errorf("LastAppliedSeq after re-open = %d, want 0 (in-memory cursor, not persistent)", seq)
+	// Phase 26: cursor survives restart — must be restored to 1, not 0.
+	if seq := follower2.ReplicationStatus().LastAppliedSeq; seq != 1 {
+		t.Errorf("LastAppliedSeq after re-open = %d, want 1 (durable cursor, Phase 26)", seq)
 	}
 }

@@ -210,6 +210,205 @@ func TestServer_Lifecycle_FollowerBgWorker_StartedOnce(t *testing.T) {
 	}
 }
 
+// ── Blocking Start() lifecycle path ─────────────────────────────────────────
+
+// waitForBind polls s.Addr() until it returns a resolved address (i.e. a port
+// other than the wildcard :0 suffix). This is the deterministic synchronisation
+// point: Server.Start() sets s.ln inside s.mu.Lock() before releasing the lock
+// and calling srv.Serve, so once Addr() returns a non-wildcard address we know
+// started=true is set and the second-call path is reachable.
+func waitForBind(t *testing.T, s *Server, wildcardAddr string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if addr := s.Addr(); addr != wildcardAddr {
+			return addr
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timeout: server did not bind within 5s")
+	return ""
+}
+
+// TestServer_Lifecycle_StartTwice_ErrAlreadyStarted proves that calling Start()
+// a second time on an already-started server returns ErrAlreadyStarted, does not
+// create a second listener, and that the original Start goroutine exits cleanly
+// after Close().
+func TestServer_Lifecycle_StartTwice_ErrAlreadyStarted(t *testing.T) {
+	s := openStandaloneForLifecycle(t)
+
+	// First Start() in a goroutine because it blocks.
+	startErrCh := make(chan error, 1)
+	go func() { startErrCh <- s.Start() }()
+
+	// Wait until the listener is bound.
+	firstAddr := waitForBind(t, s, "127.0.0.1:0")
+
+	// Second Start() must be rejected before binding a new listener.
+	err := s.Start()
+	if !errors.Is(err, ErrAlreadyStarted) {
+		t.Errorf("second Start() = %v, want ErrAlreadyStarted", err)
+	}
+
+	// Address must be unchanged — no second listener was created.
+	if got := s.Addr(); got != firstAddr {
+		t.Errorf("Addr() changed after rejected Start(): got %s, want %s", got, firstAddr)
+	}
+
+	// Shut down and verify the original Start goroutine exits cleanly (nil error).
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case startErr := <-startErrCh:
+		if startErr != nil {
+			t.Errorf("Start goroutine returned non-nil after Close: %v", startErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout: Start goroutine did not exit after Close")
+	}
+}
+
+// TestServer_Lifecycle_StartThenStartBackground_ErrAlreadyStarted proves that
+// calling StartBackground() after a blocking Start() is in progress returns
+// ErrAlreadyStarted and does not create a second listener.
+func TestServer_Lifecycle_StartThenStartBackground_ErrAlreadyStarted(t *testing.T) {
+	s := openStandaloneForLifecycle(t)
+
+	startErrCh := make(chan error, 1)
+	go func() { startErrCh <- s.Start() }()
+
+	firstAddr := waitForBind(t, s, "127.0.0.1:0")
+
+	// StartBackground must be rejected while Start() is blocking.
+	err := s.StartBackground()
+	if !errors.Is(err, ErrAlreadyStarted) {
+		t.Errorf("StartBackground after Start() = %v, want ErrAlreadyStarted", err)
+	}
+
+	// No second listener: address unchanged.
+	if got := s.Addr(); got != firstAddr {
+		t.Errorf("Addr() changed after rejected StartBackground(): got %s, want %s", got, firstAddr)
+	}
+
+	// Close and join the Start goroutine.
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case startErr := <-startErrCh:
+		if startErr != nil {
+			t.Errorf("Start goroutine returned non-nil after Close: %v", startErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout: Start goroutine did not exit after Close")
+	}
+}
+
+// TestServer_Lifecycle_StartBackgroundThenStart_ErrAlreadyStarted proves that
+// calling the blocking Start() after StartBackground() has already bound the
+// listener returns ErrAlreadyStarted immediately and the address is unchanged.
+func TestServer_Lifecycle_StartBackgroundThenStart_ErrAlreadyStarted(t *testing.T) {
+	s := openStandaloneForLifecycle(t)
+
+	if err := s.StartBackground(); err != nil {
+		t.Fatalf("StartBackground: %v", err)
+	}
+	firstAddr := s.Addr()
+
+	// Start() must return ErrAlreadyStarted — it must not block.
+	err := s.Start()
+	if !errors.Is(err, ErrAlreadyStarted) {
+		t.Errorf("Start() after StartBackground() = %v, want ErrAlreadyStarted", err)
+	}
+
+	// Address unchanged: no second listener was created.
+	if got := s.Addr(); got != firstAddr {
+		t.Errorf("Addr() changed after rejected Start(): got %s, want %s", got, firstAddr)
+	}
+
+	// Close cleanly.
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestServer_Lifecycle_StartAfterClose_ErrClosed proves that calling the
+// blocking Start() on a closed server returns ErrClosed immediately (does not
+// bind, does not block).
+func TestServer_Lifecycle_StartAfterClose_ErrClosed(t *testing.T) {
+	s := openStandaloneForLifecycle(t)
+
+	// Close without ever starting.
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Start() must return ErrClosed immediately, not block.
+	done := make(chan error, 1)
+	go func() { done <- s.Start() }()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("Start() after Close returned %v, want ErrClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start() blocked for > 2s after Close — expected immediate ErrClosed")
+	}
+}
+
+// TestServer_Lifecycle_ConcurrentStartAndClose_NoPanicOrDeadlock races the
+// blocking Start() against Close() for 50 iterations. Acceptable outcomes for
+// each Start call:
+//   - nil (Start won, served briefly, then Close shut it down)
+//   - ErrClosed (Close won before Start could bind)
+//
+// Neither goroutine may panic or deadlock; a final Close must always be safe.
+func TestServer_Lifecycle_ConcurrentStartAndClose_NoPanicOrDeadlock(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		s, err := Open(Options{
+			NodeID:  "lc-start-race",
+			Addr:    "127.0.0.1:0",
+			DataDir: t.TempDir(),
+		})
+		if err != nil {
+			t.Fatalf("Open iteration %d: %v", i, err)
+		}
+
+		startErrCh := make(chan error, 1)
+		closeErrCh := make(chan error, 1)
+
+		go func() { startErrCh <- s.Start() }()
+		go func() { closeErrCh <- s.Close() }()
+
+		// Both goroutines must terminate.
+		select {
+		case startErr := <-startErrCh:
+			// Acceptable: nil (bound + served + shut down) or ErrClosed (Close won).
+			if startErr != nil && !errors.Is(startErr, ErrClosed) {
+				t.Errorf("iteration %d: Start() returned unexpected error: %v", i, startErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: Start() goroutine did not exit within 5s", i)
+		}
+
+		select {
+		case closeErr := <-closeErrCh:
+			if closeErr != nil {
+				t.Errorf("iteration %d: Close() returned error: %v", i, closeErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: Close() goroutine did not exit within 5s", i)
+		}
+
+		// Final Close: must be a safe no-op (idempotent).
+		if err := s.Close(); err != nil {
+			t.Errorf("iteration %d: final Close returned error: %v", i, err)
+		}
+	}
+}
+
 // ── Client.SyncReplication typed error ──────────────────────────────────────
 
 // TestServer_Client_SyncReplication_409SyncInProgress_ReturnsWrappedErrSyncInProgress

@@ -35,15 +35,22 @@ type backgroundSyncWorker struct {
 	// fraction is in [0.0, 1.0]; base is the current backoff duration.
 	jitterFn func(fraction float64, base time.Duration) time.Duration
 
+	// preLaunchHook is called inside start() while holding lifecycleMu, after cancel
+	// has been assigned but before wg.Add(1) and goroutine launch. Test seam only;
+	// nil in production.
+	preLaunchHook func()
+
 	// started guards against duplicate start() calls. CompareAndSwap(false, true) in
-	// start() ensures the goroutine is launched at most once.
+	// start() ensures the goroutine is launched at most once. The CAS is performed
+	// inside lifecycleMu so that if stop() wins the mutex first (observes cancel==nil),
+	// start() has NOT consumed the CAS slot and a subsequent call to start() will
+	// still succeed.
 	started atomic.Bool
 
-	// lifecycleMu serialises the cancel-assignment + wg.Add(1) + goroutine-launch
-	// sequence in start() with the cancel-read sequence in stop(). Without this lock
-	// a concurrent stop() could observe cancel != nil (after the mu.Unlock in start())
-	// but before wg.Add(1) has been called, causing wg.Wait() to return before the
-	// goroutine exits (or even before it starts).
+	// lifecycleMu serialises the CAS + cancel-assignment + wg.Add(1) + goroutine-launch
+	// sequence in start() with the cancel-read sequence in stop(). This makes start()
+	// linearizable: either stop() completes before start() begins (no-op, CAS unused),
+	// or start() runs to completion before stop() can read cancel.
 	lifecycleMu sync.Mutex
 
 	ctx    context.Context
@@ -88,23 +95,36 @@ func newBackgroundSyncWorker(cfg BackgroundSyncConfig, syncFn func(ctx context.C
 // Safe to call while holding an outer lock (the function is non-blocking: it only
 // initialises state and launches a goroutine, then returns immediately).
 func (w *backgroundSyncWorker) start() error {
+	// Hold lifecycleMu for the entire start sequence: CAS → cancel-assignment →
+	// preLaunchHook → wg.Add(1) → goroutine launch.
+	//
+	// This makes start() linearizable with respect to stop():
+	//   • If stop() acquires lifecycleMu first: it sees cancel==nil, returns no-op,
+	//     and the CAS has NOT been consumed — a subsequent start() will still succeed.
+	//   • If start() acquires lifecycleMu first: stop() blocks until wg.Add(1) has
+	//     been called and the goroutine is launched, guaranteeing wg.Wait() always
+	//     has a matching Done().
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
+
 	if !w.started.CompareAndSwap(false, true) {
 		return ErrAlreadyStarted
 	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Hold lifecycleMu across cancel-assignment + wg.Add(1) + goroutine-launch so
-	// that stop(), which reads cancel under lifecycleMu, can guarantee that by the
-	// time it observes cancel != nil, wg.Add(1) has already been called.
-	w.lifecycleMu.Lock()
 	w.mu.Lock()
 	w.ctx = ctx
 	w.cancel = cancel
 	w.status.State = WorkerStateStarting
 	w.mu.Unlock()
+
+	if w.preLaunchHook != nil {
+		w.preLaunchHook()
+	}
+
 	w.wg.Add(1)
 	go w.run()
-	w.lifecycleMu.Unlock()
 	return nil
 }
 

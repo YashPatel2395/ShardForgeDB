@@ -33,13 +33,13 @@ The following are accurate, honest descriptions of what exists in the codebase w
 | Manual rebalance planning (no data movement) | `internal/ops.PlanManualRebalance` — key movement plan, operator steps, pure computation |
 | Runtime operation trace mode (single-node) | `internal/engine.ExplainGet/Put/Delete/Scan`, `internal/vector.ExplainUpsert/Search/Delete` — real execution-path traces, JSON output, `shardforge explain` CLI; no fabricated steps |
 | Networked single-node trace API (HTTP) | `internal/node` — `POST /explain/put`, `GET /explain/get`, `DELETE /explain/delete`, `GET /explain/scan` call real `engine.Explain*` paths; `node.Client.ExplainGet/Put/Delete/Scan`; `shardforge explain-node` CLI; single-node HTTP only |
-| 1111 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 1111 passing tests, 23 packages with test files, 4 packages with no test files (`cmd/shardforge-bench`, `cmd/shardforge-dashboard`, `cmd/shardforge-node`, `internal/storage`) |
+| 1112 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 1112 passing tests, 23 packages with test files, 4 packages with no test files (`cmd/shardforge-bench`, `cmd/shardforge-dashboard`, `cmd/shardforge-node`, `internal/storage`) |
 | Reproducible benchmarks | `make bench-*` targets, results in `docs/BENCHMARKS.md` |
 | Reproducible local three-node HTTP cluster demo with static routing | `scripts/demo_cluster_{up,smoke,down}.sh` — 3 independent HTTP nodes + stateless proxy, FNV-1a routing, separate data dirs, data isolation proven; `configs/cluster/demo-3node.json`; `make cluster-demo-{up,smoke,down}`; see `docs/DEMO.md` |
 | Networked explicit pull-based replication demo between HTTP nodes | `scripts/repl_demo_{up,smoke,down}.sh` — leader (primary) + follower (replica) as real HTTP processes; explicit pull via `POST /replication/sync`; PUT+DELETE replication proven; idempotent pull proven; follower write-rejection proven; `configs/replication/demo-leader-follower.json`; `make repl-demo-{up,smoke,down}` |
 | Durable replication restart recovery demo | `scripts/repl_restart_demo_{up,smoke,down}.sh` — 18 checks: primary journal survives restart, follower cursor restored after restart, replication resumes from correct position, idempotent pull; `make repl-restart-demo-{up,smoke,down}` |
 | Automatic background pull replication with lag tracking | `internal/node/background_sync.go` — configurable background goroutine (interval, backoff, jitter), polls primary every 500ms, exponential backoff on failure, `ErrSyncInProgress`→skip, `*ReplicationGapError`→terminal blocked state, `lag_entries`/`lag_known` always set after any successful sync; `--bg-sync` CLI flags; `GET /replication/status` includes `background_sync` block; `scripts/repl_auto_demo_{up,smoke,down}.sh` — 24 checks; `make repl-auto-demo-{up,smoke,down}` |
-| 1111 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 1111 passing tests |
+| 1112 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 1112 passing tests |
 
 ---
 

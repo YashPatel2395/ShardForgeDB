@@ -894,40 +894,136 @@ func TestBackgroundSync_ErrSyncInProgress_AfterBackoff_ResetsCurrentBackoff(t *t
 		st.CurrentBackoffMs, st.State)
 }
 
-func TestBackgroundSync_Worker_ConcurrentStartStop(t *testing.T) {
-	// Prove: concurrent start() + stop() never deadlocks and the goroutine always exits
-	// cleanly (no leak). The lifecycleMu in start() ensures wg.Add(1) happens-before
-	// stop()'s wg.Wait(), so the WaitGroup is always balanced regardless of scheduling.
-	for i := 0; i < 100; i++ {
-		cfg := minBgSyncCfg()
-		cfg.Interval = Duration{10 * time.Second}
+func TestBackgroundSync_Worker_StopWaitsForConcurrentStart(t *testing.T) {
+	// Prove that stop() blocks on lifecycleMu until start() has finished setting
+	// cancel, called wg.Add(1), and launched the goroutine — even when stop() is
+	// called while start() is paused mid-execution.
+	//
+	// Without the fix (CAS outside lifecycleMu), stop() could observe cancel==nil
+	// while start() had already consumed the CAS slot, causing the goroutine to
+	// run indefinitely with no way to stop it.
+	cfg := minBgSyncCfg()
+	cfg.Interval = Duration{10 * time.Second}
 
-		w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
-			return SyncResult{}, nil
-		})
+	hookEntered := make(chan struct{})
+	hookRelease := make(chan struct{})
 
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			_ = w.start()
-		}()
-		go func() {
-			defer wg.Done()
-			w.stop()
-		}()
-		wg.Wait()
+	w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
+		return SyncResult{}, nil
+	})
 
-		// Drain: if start() won the race, the goroutine is running; stop it.
+	// Install hook: pause inside lifecycleMu after cancel is set, before wg.Add(1).
+	w.preLaunchHook = func() {
+		close(hookEntered) // signal: start() is paused, holding lifecycleMu
+		<-hookRelease      // block until test releases it
+	}
+
+	startErrCh := make(chan error, 1)
+	go func() { startErrCh <- w.start() }()
+
+	// Wait until start() is paused inside the hook (holding lifecycleMu).
+	select {
+	case <-hookEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout: preLaunchHook was never entered")
+	}
+
+	// Launch stop() concurrently — it must block on lifecycleMu.
+	stopDone := make(chan struct{})
+	go func() {
 		w.stop()
+		close(stopDone)
+	}()
 
-		// Final state: either the goroutine never started (state = disabled or starting),
-		// or it started and has now been stopped (state = stopped).
-		// In no case should we deadlock or leak a goroutine.
-		state := w.Status().State
-		if state != WorkerStateStopped && state != WorkerStateDisabled && state != WorkerStateStarting {
-			t.Errorf("iteration %d: unexpected final state %q after concurrent start+stop", i, state)
+	// Give the stop() goroutine time to reach lifecycleMu and block.
+	time.Sleep(20 * time.Millisecond)
+
+	// Verify stop() has NOT returned while start() still holds lifecycleMu.
+	select {
+	case <-stopDone:
+		t.Fatal("stop() returned before start() released lifecycleMu — lifecycle race not fixed")
+	default:
+		// correct: stop() is blocked
+	}
+
+	// Release start(): it will call wg.Add(1) and launch the goroutine, then unlock.
+	close(hookRelease)
+
+	// start() must return nil.
+	select {
+	case err := <-startErrCh:
+		if err != nil {
+			t.Fatalf("start() returned unexpected error: %v", err)
 		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for start() to return")
+	}
+
+	// stop() must now complete (cancel was set, wg.Add(1) was called).
+	select {
+	case <-stopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for stop() to return")
+	}
+
+	// No second stop() needed — the goroutine must already be stopped.
+	if state := w.Status().State; state != WorkerStateStopped {
+		t.Errorf("final state = %q, want %q", state, WorkerStateStopped)
+	}
+
+	// syncFn context must have been cancelled.
+	w.mu.RLock()
+	ctx := w.ctx
+	w.mu.RUnlock()
+	if ctx.Err() == nil {
+		t.Error("worker ctx is still live after stop() — context was not cancelled")
+	}
+}
+
+func TestBackgroundSync_Worker_StopBeforeStart_StartStillSucceeds(t *testing.T) {
+	// Prove that calling stop() before start() is a no-op AND does not consume the
+	// CAS slot — a subsequent start() must still succeed.
+	//
+	// With the new code the CAS is inside lifecycleMu, so the invariant is:
+	// if stop() wins lifecycleMu first (cancel==nil), the CAS slot is untouched
+	// and start() will succeed.
+	cfg := minBgSyncCfg()
+	cfg.Interval = Duration{10 * time.Second}
+
+	successCh := make(chan struct{}, 1)
+	w := newTestWorker(t, cfg, func(ctx context.Context) (SyncResult, error) {
+		select {
+		case successCh <- struct{}{}:
+		default:
+		}
+		return SyncResult{LastAppliedSeq: 1, PrimaryLatestSeq: 1, LagKnown: true}, nil
+	})
+
+	// stop() before any start() — must be a no-op.
+	w.stop()
+	if state := w.Status().State; state != WorkerStateDisabled {
+		t.Errorf("after premature stop(): state = %q, want %q", state, WorkerStateDisabled)
+	}
+
+	// start() must still succeed (CAS slot was not consumed).
+	if err := w.start(); err != nil {
+		t.Fatalf("start() after premature stop() returned error: %v", err)
+	}
+
+	// Worker must reach running state and execute at least one sync.
+	select {
+	case <-successCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout: syncFn was never called after start()")
+	}
+	if state := w.Status().State; state != WorkerStateRunning {
+		t.Errorf("after first sync: state = %q, want %q", state, WorkerStateRunning)
+	}
+
+	// Clean shutdown.
+	w.stop()
+	if state := w.Status().State; state != WorkerStateStopped {
+		t.Errorf("after final stop(): state = %q, want %q", state, WorkerStateStopped)
 	}
 }
 

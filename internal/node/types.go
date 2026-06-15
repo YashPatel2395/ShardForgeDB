@@ -7,11 +7,132 @@
 package node
 
 import (
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/YashPatel2395/ShardForgeDB/internal/replnet"
 	"github.com/YashPatel2395/ShardForgeDB/internal/trace"
 )
+
+// Duration is a time.Duration that marshals/unmarshals as a Go duration string (e.g. "500ms").
+// Used in BackgroundSyncConfig so JSON config files can use human-readable durations.
+type Duration struct {
+	time.Duration
+}
+
+// MarshalJSON encodes the duration as a quoted string (e.g. "500ms").
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(d.Duration.String())
+}
+
+// UnmarshalJSON decodes a quoted duration string (e.g. "500ms") into d.
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return fmt.Errorf("node: duration must be a string (e.g. \"500ms\"): %w", err)
+	}
+	dur, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("node: invalid duration %q: %w", s, err)
+	}
+	d.Duration = dur
+	return nil
+}
+
+// BackgroundSyncConfig configures the optional background pull-replication worker.
+// Valid only for follower nodes. Ignored (and rejected) for primary and standalone nodes.
+//
+// Scope: automatic pull-replication only. No push, no Raft, no consensus, no failover.
+type BackgroundSyncConfig struct {
+	// Enabled controls whether the background worker is active.
+	// Default: false. Must be false for primary and standalone nodes.
+	Enabled bool `json:"enabled"`
+
+	// Interval is the wait between a successful sync and the next poll attempt.
+	// Must be positive when Enabled is true.
+	Interval Duration `json:"interval"`
+
+	// RequestTimeout is the per-request HTTP timeout for calls to the primary.
+	// Must be positive when Enabled is true.
+	RequestTimeout Duration `json:"request_timeout"`
+
+	// InitialBackoff is the delay after the first consecutive failure.
+	// Must be positive when Enabled is true.
+	InitialBackoff Duration `json:"initial_backoff"`
+
+	// MaxBackoff caps the exponential backoff growth.
+	// Must be >= InitialBackoff when Enabled is true.
+	MaxBackoff Duration `json:"max_backoff"`
+
+	// JitterFraction adds a random component to backoff delays to prevent
+	// thundering-herd behavior. Range [0.0, 1.0]. 0 disables jitter.
+	JitterFraction float64 `json:"jitter_fraction"`
+}
+
+// WorkerState describes the current lifecycle state of the background sync worker.
+type WorkerState string
+
+const (
+	// WorkerStateDisabled means background sync is not configured or not applicable.
+	WorkerStateDisabled WorkerState = "disabled"
+	// WorkerStateStarting means the worker goroutine is initializing.
+	WorkerStateStarting WorkerState = "starting"
+	// WorkerStateRunning means the worker is actively syncing or waiting for the next interval.
+	WorkerStateRunning WorkerState = "running"
+	// WorkerStateBackingOff means the worker is waiting after a temporary failure.
+	WorkerStateBackingOff WorkerState = "backing_off"
+	// WorkerStateBlocked means the worker has encountered a terminal error (e.g. replication gap)
+	// and will not retry until the node is restarted or reconfigured.
+	WorkerStateBlocked WorkerState = "blocked"
+	// WorkerStateStopping means Close has been called and the worker is draining.
+	WorkerStateStopping WorkerState = "stopping"
+	// WorkerStateStopped means the worker goroutine has exited.
+	WorkerStateStopped WorkerState = "stopped"
+)
+
+// BackgroundSyncStatus is a point-in-time snapshot of the background sync worker state.
+// Included in GET /replication/status responses for follower nodes.
+type BackgroundSyncStatus struct {
+	// Lifecycle.
+	Enabled bool        `json:"background_sync_enabled"`
+	Running bool        `json:"background_sync_running"`
+	State   WorkerState `json:"background_sync_state"`
+
+	// Timing (UTC, omitted when not yet observed).
+	LastAttemptAt *time.Time `json:"last_sync_attempt_at,omitempty"`
+	LastSuccessAt *time.Time `json:"last_sync_success_at,omitempty"`
+	LastFailureAt *time.Time `json:"last_sync_failure_at,omitempty"`
+
+	// Per-attempt result (from the last successful sync).
+	LastFetched int `json:"last_sync_fetched"`
+	LastApplied int `json:"last_sync_applied"`
+
+	// Cumulative counters (since process start).
+	TotalAttempts    int64 `json:"total_sync_attempts"`
+	TotalSuccesses   int64 `json:"total_sync_successes"`
+	TotalFailures    int64 `json:"total_sync_failures"`
+	TotalSkippedBusy int64 `json:"total_sync_skipped_busy"`
+
+	// Retry / backoff state.
+	ConsecutiveFailures int        `json:"consecutive_failures"`
+	CurrentBackoffMs    int64      `json:"current_backoff_ms,omitempty"`
+	NextRetryAt         *time.Time `json:"next_retry_at,omitempty"`
+	LastError           string     `json:"last_sync_error,omitempty"`
+
+	// Lag tracking.
+	// LagKnown is false when lag has never been observed or when the primary
+	// is currently unreachable. Never interpret LagEntries as zero-lag when LagKnown is false.
+	FollowerLastAppliedSeq uint64     `json:"follower_last_applied_seq"`
+	PrimaryLatestSeq       uint64     `json:"primary_latest_seq,omitempty"`
+	LagEntries             int64      `json:"lag_entries"`
+	LagKnown               bool       `json:"lag_known"`
+	LagObservedAt          *time.Time `json:"lag_observed_at,omitempty"`
+
+	// Terminal (blocked) state.
+	BlockedReason string                       `json:"blocked_reason,omitempty"`
+	Gap           *replnet.ReplicationGapError `json:"replication_gap,omitempty"`
+}
 
 // NodeID identifies a node in the network. It is a human-readable string such as "node-1".
 type NodeID string
@@ -26,6 +147,11 @@ type ReplicationOptions struct {
 	// PrimaryBaseURL is the HTTP base URL of the primary node.
 	// Required when Role == replnet.RoleFollower; ignored otherwise.
 	PrimaryBaseURL string
+
+	// BackgroundSync configures optional automatic background pull replication.
+	// Valid only for follower nodes. Primary and standalone nodes must leave this
+	// at its zero value (Enabled: false).
+	BackgroundSync BackgroundSyncConfig
 }
 
 // Options configures a node Server.
@@ -140,7 +266,7 @@ type explainPutRequest struct {
 // It reports how many entries were fetched from the primary and how many
 // were newly applied (skipping already-applied entries).
 //
-// Scope: explicit pull-based replication only. No background sync, no quorum, no Raft.
+// Scope: explicit pull-based replication only. No quorum, no Raft.
 type SyncResult struct {
 	// SourceNode is the HTTP base URL of the primary this follower pulled from.
 	SourceNode string `json:"source_node"`
@@ -153,11 +279,32 @@ type SyncResult struct {
 	Applied int `json:"applied"`
 	// LastAppliedSeq is the follower's replication cursor after this sync.
 	LastAppliedSeq uint64 `json:"last_applied_seq"`
+	// PrimaryLatestSeq is the primary's highest sequence number at the time of pull.
+	// Used for operation-count lag computation. Zero if the primary has no entries.
+	PrimaryLatestSeq uint64 `json:"primary_latest_seq,omitempty"`
+	// LagEntriesAfterSync is the operation-count lag after this sync completes.
+	// lag = primary_latest_seq - last_applied_seq, clamped to >= 0.
+	// Only meaningful when LagKnown is true.
+	LagEntriesAfterSync int64 `json:"lag_entries_after_sync,omitempty"`
+	// LagKnown reports whether LagEntriesAfterSync is a valid value.
+	// False when the primary did not report a latest sequence.
+	LagKnown bool `json:"lag_known"`
+	// BackgroundSyncEnabled reports whether background sync is configured on this follower.
+	BackgroundSyncEnabled bool `json:"background_sync_enabled"`
 	// Replication is the full replica status snapshot after the sync.
 	Replication replnet.ReplicaStatus `json:"replication"`
 	// Gap is non-nil when the primary returned HTTP 409 (replication gap).
 	// The follower's cursor is behind the primary's earliest retained entry.
 	Gap *replnet.ReplicationGapError `json:"gap,omitempty"`
+}
+
+// ReplicationStatusResponse is returned by GET /replication/status and
+// Client.ReplicationStatus(). It gives callers a typed view of the replication
+// and background-sync state without having to decode map[string]any.
+type ReplicationStatusResponse struct {
+	NodeID         string                `json:"node_id"`
+	Replication    replnet.ReplicaStatus `json:"replication"`
+	BackgroundSync BackgroundSyncStatus  `json:"background_sync"`
 }
 
 // ExplainPutResponse is the JSON body returned by POST /explain/put.

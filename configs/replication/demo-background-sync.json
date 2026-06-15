@@ -1,0 +1,74 @@
+{
+  "version": "v1",
+  "name": "phase-27-background-replication-demo",
+  "description": "Phase 27 — Automatic Background Pull Replication Demo",
+  "routing": {
+    "algorithm": "fnv1a-consistent-hash",
+    "virtual_nodes": 128
+  },
+  "proxy": {
+    "enabled": false
+  },
+  "nodes": [
+    {
+      "id": "leader",
+      "base_url": "http://127.0.0.1:9501",
+      "addr": "127.0.0.1:9501",
+      "data_dir": "/tmp/sfdb-auto-leader",
+      "weight": 1,
+      "replication": {
+        "enabled": true,
+        "role": "primary"
+      }
+    },
+    {
+      "id": "follower",
+      "base_url": "http://127.0.0.1:9502",
+      "addr": "127.0.0.1:9502",
+      "data_dir": "/tmp/sfdb-auto-follower",
+      "weight": 1,
+      "replication": {
+        "enabled": true,
+        "role": "follower",
+        "primary": "leader",
+        "background_sync": {
+          "enabled": true,
+          "interval": "500ms",
+          "request_timeout": "2s",
+          "initial_backoff": "250ms",
+          "max_backoff": "5s",
+          "jitter_fraction": 0.10
+        }
+      }
+    }
+  ],
+  "scope": {
+    "static_config_only": true,
+    "no_dynamic_membership": true,
+    "no_discovery": true,
+    "no_consensus": true,
+    "no_raft": true,
+    "no_replication": false,
+    "no_background_sync": false,
+    "no_quorum_replication": true,
+    "no_failover": true,
+    "no_automatic_failover": true,
+    "no_leader_election": true,
+    "no_shard_migration": true,
+    "no_distributed_txns": true
+  },
+  "phase_27_claims": {
+    "automatic_background_pull": true,
+    "configurable_interval": true,
+    "exponential_backoff": true,
+    "bounded_jitter": true,
+    "operation_count_lag_tracking": true,
+    "durable_restart_recovery": true,
+    "terminal_gap_detection": true,
+    "explicit_sync_still_available": true,
+    "no_raft": true,
+    "no_consensus": true,
+    "no_automatic_failover": true,
+    "crash_window_acknowledged": true
+  }
+}

@@ -12,7 +12,14 @@ import (
 )
 
 // fakeLogServer returns a test HTTP server that simulates a primary's /replication/log endpoint.
+// primaryLatestSeq is included in the response (0 means empty primary).
 func fakeLogServer(t *testing.T, entries []replnet.Entry) *httptest.Server {
+	t.Helper()
+	return fakeLogServerWithLatest(t, entries, uint64(len(entries)))
+}
+
+// fakeLogServerWithLatest is like fakeLogServer but allows an explicit primary_latest_seq.
+func fakeLogServerWithLatest(t *testing.T, entries []replnet.Entry, primaryLatestSeq uint64) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/replication/log" {
@@ -21,10 +28,11 @@ func fakeLogServer(t *testing.T, entries []replnet.Entry) *httptest.Server {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"node_id": "primary",
-			"after":   0,
-			"count":   len(entries),
-			"entries": entries,
+			"node_id":            "primary",
+			"after":              0,
+			"count":              len(entries),
+			"entries":            entries,
+			"primary_latest_seq": primaryLatestSeq,
 		})
 	}))
 }
@@ -38,18 +46,22 @@ func TestReplicator_PullEntries_ReturnsEntries(t *testing.T) {
 	defer srv.Close()
 
 	r := replnet.NewReplicator(srv.URL, 0)
-	got, err := r.PullEntries(context.Background(), 0, 0)
+	res, err := r.PullEntries(context.Background(), 0, 0)
 	if err != nil {
 		t.Fatalf("PullEntries: %v", err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("got %d entries, want 2", len(got))
+	if len(res.Entries) != 2 {
+		t.Fatalf("got %d entries, want 2", len(res.Entries))
 	}
-	if got[0].Key != "a" || got[0].Op != replnet.OpPut {
-		t.Errorf("entry[0] unexpected: %+v", got[0])
+	if res.Entries[0].Key != "a" || res.Entries[0].Op != replnet.OpPut {
+		t.Errorf("entry[0] unexpected: %+v", res.Entries[0])
 	}
-	if got[1].Key != "b" || got[1].Op != replnet.OpDelete {
-		t.Errorf("entry[1] unexpected: %+v", got[1])
+	if res.Entries[1].Key != "b" || res.Entries[1].Op != replnet.OpDelete {
+		t.Errorf("entry[1] unexpected: %+v", res.Entries[1])
+	}
+	// PrimaryLatestSeq is included in response.
+	if res.PrimaryLatestSeq != 2 {
+		t.Errorf("PrimaryLatestSeq = %d, want 2", res.PrimaryLatestSeq)
 	}
 }
 
@@ -58,12 +70,29 @@ func TestReplicator_PullEntries_EmptyLog_ReturnsEmpty(t *testing.T) {
 	defer srv.Close()
 
 	r := replnet.NewReplicator(srv.URL, 0)
-	got, err := r.PullEntries(context.Background(), 0, 0)
+	res, err := r.PullEntries(context.Background(), 0, 0)
 	if err != nil {
 		t.Fatalf("PullEntries: %v", err)
 	}
-	if len(got) != 0 {
-		t.Errorf("got %d entries, want 0", len(got))
+	if len(res.Entries) != 0 {
+		t.Errorf("got %d entries, want 0", len(res.Entries))
+	}
+}
+
+func TestReplicator_PullEntries_PrimaryLatestSeq_Reported(t *testing.T) {
+	entries := []replnet.Entry{
+		{Seq: 1, Op: replnet.OpPut, Key: "x", Value: "v", Timestamp: time.Now()},
+	}
+	srv := fakeLogServerWithLatest(t, entries, 42)
+	defer srv.Close()
+
+	r := replnet.NewReplicator(srv.URL, 0)
+	res, err := r.PullEntries(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatalf("PullEntries: %v", err)
+	}
+	if res.PrimaryLatestSeq != 42 {
+		t.Errorf("PrimaryLatestSeq = %d, want 42", res.PrimaryLatestSeq)
 	}
 }
 

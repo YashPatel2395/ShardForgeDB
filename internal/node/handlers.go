@@ -190,6 +190,7 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleReplicationStatus serves GET /replication/status.
+// Phase 27+: includes background_sync status for follower nodes.
 func (s *Server) handleReplicationStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
@@ -197,8 +198,9 @@ func (s *Server) handleReplicationStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node_id":     s.opts.NodeID,
-		"replication": s.ReplicationStatus(),
+		"node_id":         s.opts.NodeID,
+		"replication":     s.ReplicationStatus(),
+		"background_sync": s.BackgroundSyncStatus(),
 	})
 }
 
@@ -250,11 +252,20 @@ func (s *Server) handleReplicationLog(w http.ResponseWriter, r *http.Request) {
 	if entries == nil {
 		entries = []replnet.Entry{}
 	}
+	// Include primary_latest_seq so followers can compute operation-count lag without
+	// an extra round-trip. Source: the durable log's current LastSeq.
+	var primaryLatestSeq uint64
+	if s.durableLog != nil {
+		if st, stErr := s.durableLog.Stats(); stErr == nil {
+			primaryLatestSeq = st.LastSeq
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node_id": s.opts.NodeID,
-		"after":   after,
-		"count":   len(entries),
-		"entries": entries,
+		"node_id":            s.opts.NodeID,
+		"after":              after,
+		"count":              len(entries),
+		"entries":            entries,
+		"primary_latest_seq": primaryLatestSeq,
 	})
 }
 
@@ -434,43 +445,66 @@ func (s *Server) handleReplicationSync(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.SyncFromPrimary(r.Context())
 	if err != nil {
+		// ErrSyncInProgress: a concurrent sync (background worker or another manual call)
+		// is already in flight. Return 409 Conflict so the caller can retry.
+		if errors.Is(err, ErrSyncInProgress) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"ok":      false,
+				"code":    "sync_in_progress",
+				"node_id": s.opts.NodeID,
+				"error":   err.Error(),
+			})
+			return
+		}
 		var gapErr *replnet.ReplicationGapError
 		if errors.As(err, &gapErr) {
 			writeJSON(w, http.StatusConflict, map[string]any{
-				"ok":               false,
-				"node_id":          s.opts.NodeID,
-				"source_node":      result.SourceNode,
-				"follower_node":    result.FollowerNode,
-				"fetched":          result.Fetched,
-				"applied":          result.Applied,
-				"last_applied_seq": result.LastAppliedSeq,
-				"replication":      result.Replication,
-				"gap":              gapErr,
-				"error":            err.Error(),
+				"ok":                      false,
+				"node_id":                 s.opts.NodeID,
+				"source_node":             result.SourceNode,
+				"follower_node":           result.FollowerNode,
+				"fetched":                 result.Fetched,
+				"applied":                 result.Applied,
+				"last_applied_seq":        result.LastAppliedSeq,
+				"primary_latest_seq":      result.PrimaryLatestSeq,
+				"lag_entries_after_sync":  result.LagEntriesAfterSync,
+				"lag_known":               result.LagKnown,
+				"background_sync_enabled": result.BackgroundSyncEnabled,
+				"replication":             result.Replication,
+				"gap":                     gapErr,
+				"error":                   err.Error(),
 			})
 			return
 		}
 		writeJSON(w, http.StatusBadGateway, map[string]any{
-			"ok":               false,
-			"node_id":          s.opts.NodeID,
-			"source_node":      result.SourceNode,
-			"follower_node":    result.FollowerNode,
-			"fetched":          result.Fetched,
-			"applied":          result.Applied,
-			"last_applied_seq": result.LastAppliedSeq,
-			"replication":      result.Replication,
-			"error":            err.Error(),
+			"ok":                      false,
+			"node_id":                 s.opts.NodeID,
+			"source_node":             result.SourceNode,
+			"follower_node":           result.FollowerNode,
+			"fetched":                 result.Fetched,
+			"applied":                 result.Applied,
+			"last_applied_seq":        result.LastAppliedSeq,
+			"primary_latest_seq":      result.PrimaryLatestSeq,
+			"lag_entries_after_sync":  result.LagEntriesAfterSync,
+			"lag_known":               result.LagKnown,
+			"background_sync_enabled": result.BackgroundSyncEnabled,
+			"replication":             result.Replication,
+			"error":                   err.Error(),
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":               true,
-		"node_id":          s.opts.NodeID,
-		"source_node":      result.SourceNode,
-		"follower_node":    result.FollowerNode,
-		"fetched":          result.Fetched,
-		"applied":          result.Applied,
-		"last_applied_seq": result.LastAppliedSeq,
-		"replication":      result.Replication,
+		"ok":                      true,
+		"node_id":                 s.opts.NodeID,
+		"source_node":             result.SourceNode,
+		"follower_node":           result.FollowerNode,
+		"fetched":                 result.Fetched,
+		"applied":                 result.Applied,
+		"last_applied_seq":        result.LastAppliedSeq,
+		"primary_latest_seq":      result.PrimaryLatestSeq,
+		"lag_entries_after_sync":  result.LagEntriesAfterSync,
+		"lag_known":               result.LagKnown,
+		"background_sync_enabled": result.BackgroundSyncEnabled,
+		"replication":             result.Replication,
 	})
 }

@@ -1,6 +1,6 @@
 # ShardForgeDB — Distributed Roadmap
 
-**Phase 26 — Durable Replication State and Restart Recovery edition**
+**Phase 27 — Automatic Background Pull Replication and Lag Tracking edition**
 
 This document defines the phases required to evolve ShardForgeDB from its current explainable single-node + HTTP-node foundation into a real distributed database. Each phase is narrow, honest, and fully testable before the next begins.
 
@@ -8,7 +8,7 @@ The final target: **ShardForgeDB — a real explainable distributed database eng
 
 ---
 
-## Current state (Phases 1–26 complete)
+## Current state (Phases 1–27 complete)
 
 | Component | Status |
 |---|---|
@@ -24,12 +24,12 @@ The final target: **ShardForgeDB — a real explainable distributed database eng
 | Stateless HTTP routing proxy | Implemented (`internal/proxy`) |
 | Static cluster metadata | Implemented (`internal/cluster`) |
 | Explicit pull-based read replicas with durable state | Implemented (`internal/replnet` — DurableLog, ReplicationStateStore, gap detection) |
+| Automatic background pull replication with lag tracking | Implemented (`internal/node` — backgroundSyncWorker, configurable interval/backoff/jitter, lag_entries/lag_known) |
 | Ops simulation (health, failure sim, rebalance plan) | Implemented (`internal/ops`) |
 
 **Not yet implemented (required for real distributed claims):**
 - Consensus, Raft, quorum, automatic failover
 - Real distributed sharding (data actually split across nodes)
-- Automatic replication / background sync
 - Distributed transactions
 - ANN / HNSW / IVF vector search
 - Background compaction

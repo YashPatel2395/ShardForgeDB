@@ -48,6 +48,23 @@ type Server struct {
 	// Background sync (Phase 27, follower only).
 	// bgWorker is non-nil when BackgroundSync.Enabled is true.
 	bgWorker *backgroundSyncWorker
+
+	// Phase 28: write gate and promotion state.
+	// writeGate guards PUT/DELETE handlers. Writes take RLock; quiesce takes Lock.
+	// Non-nil for primary/standalone; nil for follower (already rejects writes).
+	writeGate *writeGate
+
+	// Quiesce state (primary only).
+	quiesceState  string // "active", "quiesced"
+	quiesceRecord *replnet.QuiesceRecord
+
+	// Promotion state (follower -> promoted primary).
+	promotionState  string // "", "promoting", "promoted"
+	promotionRecord *replnet.PromotionRecord
+
+	// Runtime role — may differ from opts.Replication.Role after promotion.
+	runtimeRole     string // "primary", "follower", "standalone", ""
+	localRoleSource string // "config" or "promotion_record"
 }
 
 // Open validates opts, opens (or creates) the local Engine, and wires up the HTTP mux.
@@ -78,16 +95,27 @@ func Open(opts Options) (*Server, error) {
 		start: time.Now(),
 	}
 
-	switch opts.Replication.Role {
-	case replnet.RolePrimary:
-		dl, err := replnet.OpenDurableLog(opts.DataDir)
-		if err != nil {
-			eng.Close()
-			return nil, fmt.Errorf("node: open durable log: %w", err)
-		}
-		s.durableLog = dl
+	// Phase 28: resolve runtime role from durable records before initializing
+	// replication resources. This determines whether a follower has been promoted.
+	if err := s.resolveRuntimeRole(); err != nil {
+		eng.Close()
+		return nil, fmt.Errorf("node: resolve runtime role: %w", err)
+	}
 
-	case replnet.RoleFollower:
+	switch s.runtimeRole {
+	case "primary":
+		if s.durableLog == nil {
+			// Open durable log (promoted primary already has one set by resolveRuntimeRole
+			// only if the promotion record was found; config-based primary opens here).
+			dl, err := replnet.OpenDurableLog(opts.DataDir)
+			if err != nil {
+				eng.Close()
+				return nil, fmt.Errorf("node: open durable log: %w", err)
+			}
+			s.durableLog = dl
+		}
+
+	case "follower":
 		ss, err := replnet.NewReplicationStateStore(opts.DataDir, opts.NodeID, opts.Replication.PrimaryBaseURL)
 		if err != nil {
 			eng.Close()
@@ -258,6 +286,66 @@ func (s *Server) Close() error {
 	return firstErr
 }
 
+// resolveRuntimeRole determines the effective role of this node at startup.
+// Checks for durable promotion and quiesce records that override static config.
+//
+// Precedence:
+//  1. Promotion record found -> runtimeRole = "primary" (was promoted from follower)
+//  2. Quiesce record found (config=primary) -> runtimeRole = "primary", write-fenced
+//  3. No durable records -> runtimeRole = config role
+func (s *Server) resolveRuntimeRole() error {
+	dir := s.opts.DataDir
+
+	// Check for promotion record (follower -> promoted primary).
+	if rec, err := replnet.LoadPromotionRecord(dir); err == nil {
+		if rec.NodeID != s.opts.NodeID {
+			return fmt.Errorf("promotion record node_id %q does not match config node_id %q",
+				rec.NodeID, s.opts.NodeID)
+		}
+		s.runtimeRole = "primary"
+		s.localRoleSource = "promotion_record"
+		s.promotionRecord = rec
+		s.promotionState = "promoted"
+		s.writeGate = &writeGate{}
+		s.quiesceState = "active"
+
+		// Open durable log with baseline for promoted primary.
+		dl, err := replnet.OpenDurableLog(dir)
+		if err != nil {
+			return fmt.Errorf("open durable log for promoted primary: %w", err)
+		}
+		s.durableLog = dl
+		return nil
+	} else if !errors.Is(err, replnet.ErrPromotionRecordNotFound) {
+		return fmt.Errorf("load promotion record: %w", err)
+	}
+
+	// No promotion record. Use config role.
+	s.runtimeRole = string(s.opts.Replication.Role)
+	if s.runtimeRole == "" {
+		s.runtimeRole = "standalone"
+	}
+	s.localRoleSource = "config"
+
+	if s.runtimeRole == "primary" || s.runtimeRole == "standalone" {
+		s.writeGate = &writeGate{}
+		s.quiesceState = "active"
+	}
+
+	// Check if node was quiesced (primary only).
+	if s.runtimeRole == "primary" {
+		if rec, err := replnet.LoadQuiesceRecord(dir); err == nil {
+			s.quiesceRecord = rec
+			s.quiesceState = "quiesced"
+			s.writeGate.Quiesce() // re-apply write fence
+		} else if !errors.Is(err, replnet.ErrQuiesceRecordNotFound) {
+			return fmt.Errorf("load quiesce record: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // Status returns a point-in-time snapshot of this node's state.
 func (s *Server) Status() Status {
 	stats := s.eng.Stats()
@@ -280,9 +368,10 @@ func (s *Server) Status() Status {
 
 // ReplicationStatus returns the current replication state of this node.
 func (s *Server) ReplicationStatus() replnet.ReplicaStatus {
-	role := s.opts.Replication.Role
+	// Use runtime role for accurate status after promotion.
+	role := s.runtimeRole
 	switch role {
-	case replnet.RolePrimary:
+	case "primary":
 		var lastSeq uint64
 		var firstSeq uint64
 		if s.durableLog != nil {
@@ -291,13 +380,13 @@ func (s *Server) ReplicationStatus() replnet.ReplicaStatus {
 				firstSeq = st.FirstAvailableSeq
 			}
 		}
-		_ = firstSeq // included in DurableLogStats; not in ReplicaStatus directly
+		_ = firstSeq
 		return replnet.ReplicaStatus{
 			Role:         replnet.RolePrimary,
 			LastLocalSeq: lastSeq,
 			Durable:      true,
 		}
-	case replnet.RoleFollower:
+	case "follower":
 		return replnet.ReplicaStatus{
 			Role:            replnet.RoleFollower,
 			PrimaryBaseURL:  s.opts.Replication.PrimaryBaseURL,

@@ -343,3 +343,31 @@ type ExplainScanResponse struct {
 	Trace       *trace.Trace `json:"trace"`
 	Error       string       `json:"error,omitempty"`
 }
+
+// ── Phase 28: Manual promotion and controlled failover types ─────────────────
+
+// QuiesceResponse is returned by POST /replication/quiesce.
+type QuiesceResponse struct {
+	NodeID           string `json:"node_id"`
+	WriteState       string `json:"write_state"` // "quiesced"
+	QuiesceID        string `json:"quiesce_id"`
+	PrimaryLatestSeq uint64 `json:"primary_latest_seq"`
+	QuiescedAt       string `json:"quiesced_at"`
+	Idempotent       bool   `json:"idempotent"` // true if already quiesced
+}
+
+// PromoteRequest is the body of POST /replication/promote.
+type PromoteRequest struct {
+	QuiesceRecord            replnet.QuiesceRecord `json:"quiesce_record"`
+	ConfirmOldPrimaryStopped bool                  `json:"confirm_old_primary_stopped"`
+}
+
+// PromoteResponse is returned by POST /replication/promote.
+type PromoteResponse struct {
+	NodeID           string `json:"node_id"`
+	NewRole          string `json:"new_role"` // "primary"
+	QuiesceID        string `json:"quiesce_id"`
+	InheritedLastSeq uint64 `json:"inherited_last_seq"`
+	PromotedAt       string `json:"promoted_at"`
+	Idempotent       bool   `json:"idempotent"`
+}

@@ -16,7 +16,7 @@ CLUSTER_CMD      := ./cmd/shardforge-cluster
 GO               := go
 GOFLAGS          :=
 
-.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-replnet bench-ops bench-trace bench-report dashboard node node-demo node-demo-down replica-demo replica-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example replica-config-demo replica-status-demo ops-health-demo ops-simulate-failure-demo ops-rebalance-plan-demo smoke demo release-check final-smoke cluster-demo-up cluster-demo-smoke cluster-demo-down repl-demo-up repl-demo-smoke repl-demo-down repl-restart-demo-up repl-restart-demo-smoke repl-restart-demo-down repl-auto-demo-up repl-auto-demo-smoke repl-auto-demo-down help
+.PHONY: all build test fmt vet lint clean bench bench-engine bench-vector bench-shard bench-replica bench-dashboard bench-node bench-gateway bench-proxy bench-cluster bench-replnet bench-ops bench-trace bench-report dashboard node node-demo node-demo-down replica-demo replica-demo-down gateway-help gateway-demo gateway-config-demo proxy proxy-help proxy-route-demo cluster-validate cluster-help cluster-example replica-config-demo replica-status-demo ops-health-demo ops-simulate-failure-demo ops-rebalance-plan-demo smoke demo release-check final-smoke cluster-demo-up cluster-demo-smoke cluster-demo-down repl-demo-up repl-demo-smoke repl-demo-down repl-restart-demo-up repl-restart-demo-smoke repl-restart-demo-down repl-auto-demo-up repl-auto-demo-smoke repl-auto-demo-down repl-failover-demo-up repl-failover-demo-smoke repl-failover-demo-down help
 
 all: fmt vet build
 
@@ -254,6 +254,22 @@ repl-auto-demo-smoke:
 ## repl-auto-demo-down: Phase 27 — stop automatic replication demo and remove demo data directories
 repl-auto-demo-down:
 	./scripts/repl_auto_demo_down.sh
+
+## repl-failover-demo-up: Phase 28 — start manual promotion demo (primary+follower, no Docker)
+repl-failover-demo-up:
+	@echo "Starting controlled failover demo..."
+	./scripts/repl_failover_demo_up.sh
+	@echo ""
+	@echo "Run smoke test: ./scripts/repl_failover_demo_smoke.sh"
+	@echo "Tear down:      ./scripts/repl_failover_demo_down.sh"
+
+## repl-failover-demo-smoke: Phase 28 — run manual promotion smoke test (32 checks)
+repl-failover-demo-smoke:
+	./scripts/repl_failover_demo_smoke.sh
+
+## repl-failover-demo-down: Phase 28 — stop manual promotion demo and remove data directories
+repl-failover-demo-down:
+	./scripts/repl_failover_demo_down.sh
 
 ## clean: remove build artifacts
 clean:

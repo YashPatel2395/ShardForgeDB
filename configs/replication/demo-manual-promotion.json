@@ -1,0 +1,23 @@
+{
+    "scope": {
+        "manual_only": true,
+        "no_automatic_failover": true,
+        "no_consensus": true,
+        "no_raft": true
+    },
+    "old_primary": {
+        "node_id": "primary-1",
+        "role": "primary",
+        "base_url": "http://127.0.0.1:9601",
+        "data_dir": "/tmp/sfdb-failover-primary"
+    },
+    "follower": {
+        "node_id": "follower-1",
+        "role": "follower",
+        "base_url": "http://127.0.0.1:9602",
+        "primary_node_id": "primary-1",
+        "primary_base_url": "http://127.0.0.1:9601",
+        "data_dir": "/tmp/sfdb-failover-follower",
+        "bg_sync_interval_ms": 500
+    }
+}

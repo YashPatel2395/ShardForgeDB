@@ -235,6 +235,24 @@ func (c *Client) ExplainScan(ctx context.Context, start, end []byte) (*ExplainSc
 	return &resp, nil
 }
 
+// QuiesceReplication calls POST /replication/quiesce on a primary node.
+func (c *Client) QuiesceReplication(ctx context.Context) (*QuiesceResponse, error) {
+	var resp QuiesceResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/replication/quiesce", nil, &resp); err != nil {
+		return nil, fmt.Errorf("node client: quiesce: %w", err)
+	}
+	return &resp, nil
+}
+
+// PromoteFollower calls POST /replication/promote on a follower node.
+func (c *Client) PromoteFollower(ctx context.Context, req *PromoteRequest) (*PromoteResponse, error) {
+	var resp PromoteResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/replication/promote", req, &resp); err != nil {
+		return nil, fmt.Errorf("node client: promote: %w", err)
+	}
+	return &resp, nil
+}
+
 // Do executes an HTTP request with optional JSON body and decodes the response into a
 // map[string]any. Useful for proxy-forwarding when the exact response shape is unknown.
 // Returns an error for non-2xx status codes.

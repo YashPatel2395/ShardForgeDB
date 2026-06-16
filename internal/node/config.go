@@ -23,6 +23,20 @@ var ErrAlreadyStarted = errors.New("node: server already started")
 // Concurrent syncs are rejected to prevent double-application of the same batch.
 var ErrSyncInProgress = errors.New("node: sync already in progress")
 
+// Phase 28: manual promotion and controlled failover error sentinels.
+var (
+	ErrNodeQuiesced              = errors.New("node is quiesced: writes are rejected")
+	ErrAlreadyQuiesced           = errors.New("node is already quiesced")
+	ErrNotPrimary                = errors.New("operation requires primary role")
+	ErrNotFollower               = errors.New("operation requires follower role")
+	ErrPromotionNotReady         = errors.New("follower is not ready for promotion")
+	ErrPromotionSequenceMismatch = errors.New("follower sequence does not match quiesce record")
+	ErrPromotionSourceMismatch   = errors.New("quiesce record source does not match configured primary")
+	ErrPromotionRecordInvalid    = errors.New("quiesce record is invalid or corrupt")
+	ErrPromotionInProgress       = errors.New("promotion is already in progress")
+	ErrAlreadyPromoted           = errors.New("node is already promoted")
+)
+
 // validate checks that required Options fields are set and the DataDir can be created.
 func (o Options) validate() error {
 	if o.NodeID == "" {

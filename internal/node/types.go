@@ -299,12 +299,30 @@ type SyncResult struct {
 }
 
 // ReplicationStatusResponse is returned by GET /replication/status and
-// Client.ReplicationStatus(). It gives callers a typed view of the replication
-// and background-sync state without having to decode map[string]any.
+// Client.ReplicationStatus(). It gives callers a typed view of the replication,
+// background-sync, and Phase 28 promotion/quiesce state.
 type ReplicationStatusResponse struct {
 	NodeID         string                `json:"node_id"`
 	Replication    replnet.ReplicaStatus `json:"replication"`
 	BackgroundSync BackgroundSyncStatus  `json:"background_sync"`
+
+	// Phase 28 fields.
+	RuntimeRole     string `json:"runtime_role"`
+	LocalRoleSource string `json:"local_role_source"`
+
+	// Write-gate state (primary and standalone only; empty for followers).
+	// Values: "active", "quiesce_failed_fenced", "quiesced".
+	WriteState   string `json:"write_state,omitempty"`
+	Quiesced     bool   `json:"quiesced,omitempty"`
+	QuiesceState string `json:"quiesce_state,omitempty"`
+
+	// Quiesce record fields (non-empty when quiesced or quiesce_failed_fenced).
+	QuiesceID         string `json:"quiesce_id,omitempty"`
+	QuiescedAt        string `json:"quiesced_at,omitempty"`
+	QuiescedLatestSeq uint64 `json:"quiesced_latest_seq,omitempty"`
+
+	// Promotion state (follower only, or "promoted" after promotion).
+	PromotionState string `json:"promotion_state,omitempty"`
 }
 
 // ExplainPutResponse is the JSON body returned by POST /explain/put.

@@ -184,7 +184,7 @@ func TestPhase28_PlannedPromotion_FollowerReachesLagZero(t *testing.T) {
 }
 
 func TestPhase28_PlannedPromotion_QuiesceSucceeds(t *testing.T) {
-	primary := p28Primary(t)
+	primary := p28PrimaryRunning(t)
 	p28Req(t, primary, "PUT", "/kv/qs1", `{"value":"v1"}`)
 	rec := p28Req(t, primary, "POST", "/replication/quiesce", "")
 	if rec.Code != 200 {
@@ -193,7 +193,7 @@ func TestPhase28_PlannedPromotion_QuiesceSucceeds(t *testing.T) {
 }
 
 func TestPhase28_PlannedPromotion_PutRejectedAfterQuiesce(t *testing.T) {
-	primary := p28Primary(t)
+	primary := p28PrimaryRunning(t)
 	p28Req(t, primary, "PUT", "/kv/qs2", `{"value":"v1"}`)
 	p28Req(t, primary, "POST", "/replication/quiesce", "")
 	rec := p28Req(t, primary, "PUT", "/kv/qs3", `{"value":"v2"}`)
@@ -366,6 +366,9 @@ func TestPhase28_OldPrimary_RestartRemainsQuiesced(t *testing.T) {
 		NodeID: "old-primary", Addr: "127.0.0.1:0", DataDir: dir,
 		Replication: ReplicationOptions{Role: replnet.RolePrimary},
 	})
+	if err := srv.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
 	p28Req(t, srv, "PUT", "/kv/k1", `{"value":"v1"}`)
 	p28Req(t, srv, "POST", "/replication/quiesce", "")
 	srv.Close()
@@ -387,6 +390,9 @@ func TestPhase28_OldPrimary_RestartRejectsWrites(t *testing.T) {
 		NodeID: "old-primary", Addr: "127.0.0.1:0", DataDir: dir,
 		Replication: ReplicationOptions{Role: replnet.RolePrimary},
 	})
+	if err := srv.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
 	p28Req(t, srv, "POST", "/replication/quiesce", "")
 	srv.Close()
 
@@ -408,6 +414,9 @@ func TestPhase28_OldPrimary_RestartServesReads(t *testing.T) {
 		NodeID: "old-primary", Addr: "127.0.0.1:0", DataDir: dir,
 		Replication: ReplicationOptions{Role: replnet.RolePrimary},
 	})
+	if err := srv.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
 	p28Req(t, srv, "PUT", "/kv/rd1", `{"value":"readable"}`)
 	p28Req(t, srv, "POST", "/replication/quiesce", "")
 	srv.Close()
@@ -432,6 +441,9 @@ func TestPhase28_OldPrimary_RestartServesReplicationLog(t *testing.T) {
 		NodeID: "old-primary", Addr: "127.0.0.1:0", DataDir: dir,
 		Replication: ReplicationOptions{Role: replnet.RolePrimary},
 	})
+	if err := srv.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
 	p28Req(t, srv, "PUT", "/kv/rl1", `{"value":"v1"}`)
 	p28Req(t, srv, "POST", "/replication/quiesce", "")
 	srv.Close()
@@ -454,6 +466,9 @@ func TestPhase28_OldPrimary_StatusShowsQuiesceRecord(t *testing.T) {
 		NodeID: "old-primary", Addr: "127.0.0.1:0", DataDir: dir,
 		Replication: ReplicationOptions{Role: replnet.RolePrimary},
 	})
+	if err := srv.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
 	p28Req(t, srv, "PUT", "/kv/s1", `{"value":"v1"}`)
 	p28Req(t, srv, "POST", "/replication/quiesce", "")
 	srv.Close()
@@ -489,7 +504,7 @@ func TestPhase28_Promote_PrimaryNotQuiesced_Rejected(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	// Create a fake quiesce record (primary not actually quiesced).
-	qr := replnet.NewQuiesceRecord("p28-primary", "http://"+primary.Addr(), 0)
+	qr := mustNewQuiesceRecord(t, "p28-primary", "http://"+primary.Addr(), 0)
 	qr.Checksum = replnet.QuiesceChecksum(qr)
 	body, _ := json.Marshal(PromoteRequest{QuiesceRecord: *qr, ConfirmOldPrimaryStopped: true})
 	rec := p28Req(t, follower, "POST", "/replication/promote", string(body))
@@ -514,7 +529,7 @@ func TestPhase28_Promote_WrongQuiesceRecord_Rejected(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Create quiesce record with wrong seq (primary has 1, record says 5).
-	qr := replnet.NewQuiesceRecord("p28-primary", "http://"+primary.Addr(), 5)
+	qr := mustNewQuiesceRecord(t, "p28-primary", "http://"+primary.Addr(), 5)
 	qr.Checksum = replnet.QuiesceChecksum(qr)
 	body, _ := json.Marshal(PromoteRequest{QuiesceRecord: *qr, ConfirmOldPrimaryStopped: true})
 	rec := p28Req(t, follower, "POST", "/replication/promote", string(body))
@@ -540,7 +555,7 @@ func TestPhase28_Promote_FollowerBehind_Integration_Rejected(t *testing.T) {
 	// Stop bg worker immediately so follower stays behind.
 	follower.bgWorker.stop()
 
-	qr := replnet.NewQuiesceRecord("p28-primary", "http://"+primary.Addr(), 2)
+	qr := mustNewQuiesceRecord(t, "p28-primary", "http://"+primary.Addr(), 2)
 	qr.Checksum = replnet.QuiesceChecksum(qr)
 	body, _ := json.Marshal(PromoteRequest{QuiesceRecord: *qr, ConfirmOldPrimaryStopped: true})
 	rec := p28Req(t, follower, "POST", "/replication/promote", string(body))
@@ -563,7 +578,7 @@ func TestPhase28_Promote_ActiveSync_Rejected(t *testing.T) {
 	follower.syncInProgress.Store(true)
 	defer follower.syncInProgress.Store(false)
 
-	qr := replnet.NewQuiesceRecord("p28-primary", "http://"+primary.Addr(), 0)
+	qr := mustNewQuiesceRecord(t, "p28-primary", "http://"+primary.Addr(), 0)
 	qr.Checksum = replnet.QuiesceChecksum(qr)
 	body, _ := json.Marshal(PromoteRequest{QuiesceRecord: *qr, ConfirmOldPrimaryStopped: true})
 	rec := p28Req(t, follower, "POST", "/replication/promote", string(body))
@@ -583,7 +598,7 @@ func TestPhase28_Promote_MissingConfirmation_Integration_Rejected(t *testing.T) 
 	}
 	time.Sleep(300 * time.Millisecond)
 
-	qr := replnet.NewQuiesceRecord("p28-primary", "http://"+primary.Addr(), 0)
+	qr := mustNewQuiesceRecord(t, "p28-primary", "http://"+primary.Addr(), 0)
 	qr.Checksum = replnet.QuiesceChecksum(qr)
 	body, _ := json.Marshal(PromoteRequest{QuiesceRecord: *qr, ConfirmOldPrimaryStopped: false})
 	rec := p28Req(t, follower, "POST", "/replication/promote", string(body))
@@ -603,7 +618,7 @@ func TestPhase28_Promote_MismatchedSource_Rejected(t *testing.T) {
 	}
 	time.Sleep(300 * time.Millisecond)
 
-	qr := replnet.NewQuiesceRecord("p28-primary", "http://wrong:1234", 0)
+	qr := mustNewQuiesceRecord(t, "p28-primary", "http://wrong:1234", 0)
 	qr.Checksum = replnet.QuiesceChecksum(qr)
 	body, _ := json.Marshal(PromoteRequest{QuiesceRecord: *qr, ConfirmOldPrimaryStopped: true})
 	rec := p28Req(t, follower, "POST", "/replication/promote", string(body))
@@ -637,7 +652,7 @@ func TestPhase28_Promote_Idempotent_SameRecord_200(t *testing.T) {
 func TestPhase28_Promote_DifferentRecord_409(t *testing.T) {
 	_, follower, _, _, _ := p28PromoteFlow(t)
 
-	qr := replnet.NewQuiesceRecord("p28-primary", "http://127.0.0.1:1", 3)
+	qr := mustNewQuiesceRecord(t, "p28-primary", "http://127.0.0.1:1", 3)
 	qr.Checksum = replnet.QuiesceChecksum(qr)
 	body, _ := json.Marshal(PromoteRequest{QuiesceRecord: *qr, ConfirmOldPrimaryStopped: true})
 	rec := p28Req(t, follower, "POST", "/replication/promote", string(body))

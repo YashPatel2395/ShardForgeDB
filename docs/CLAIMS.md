@@ -1,6 +1,6 @@
 # ShardForgeDB — Claims Audit
 
-**Phase 27 — Automatic Background Pull Replication and Lag Tracking**
+**Phase 28 — Manual Promotion and Controlled Failover (Hardening Pass)**
 
 This file is the authoritative record of what ShardForgeDB can and cannot claim. All documentation, README copy, demo scripts, and recruiter materials must comply with this list. If a claim does not appear in Section A, it must not be made.
 
@@ -33,13 +33,14 @@ The following are accurate, honest descriptions of what exists in the codebase w
 | Manual rebalance planning (no data movement) | `internal/ops.PlanManualRebalance` — key movement plan, operator steps, pure computation |
 | Runtime operation trace mode (single-node) | `internal/engine.ExplainGet/Put/Delete/Scan`, `internal/vector.ExplainUpsert/Search/Delete` — real execution-path traces, JSON output, `shardforge explain` CLI; no fabricated steps |
 | Networked single-node trace API (HTTP) | `internal/node` — `POST /explain/put`, `GET /explain/get`, `DELETE /explain/delete`, `GET /explain/scan` call real `engine.Explain*` paths; `node.Client.ExplainGet/Put/Delete/Scan`; `shardforge explain-node` CLI; single-node HTTP only |
-| 1112 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 1112 passing tests, 23 packages with test files, 4 packages with no test files (`cmd/shardforge-bench`, `cmd/shardforge-dashboard`, `cmd/shardforge-node`, `internal/storage`) |
+| 1259 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 1259 passing tests, 23 packages with test files, 4 packages with no test files (`cmd/shardforge-bench`, `cmd/shardforge-dashboard`, `cmd/shardforge-node`, `internal/storage`) |
 | Reproducible benchmarks | `make bench-*` targets, results in `docs/BENCHMARKS.md` |
 | Reproducible local three-node HTTP cluster demo with static routing | `scripts/demo_cluster_{up,smoke,down}.sh` — 3 independent HTTP nodes + stateless proxy, FNV-1a routing, separate data dirs, data isolation proven; `configs/cluster/demo-3node.json`; `make cluster-demo-{up,smoke,down}`; see `docs/DEMO.md` |
 | Networked explicit pull-based replication demo between HTTP nodes | `scripts/repl_demo_{up,smoke,down}.sh` — leader (primary) + follower (replica) as real HTTP processes; explicit pull via `POST /replication/sync`; PUT+DELETE replication proven; idempotent pull proven; follower write-rejection proven; `configs/replication/demo-leader-follower.json`; `make repl-demo-{up,smoke,down}` |
 | Durable replication restart recovery demo | `scripts/repl_restart_demo_{up,smoke,down}.sh` — 18 checks: primary journal survives restart, follower cursor restored after restart, replication resumes from correct position, idempotent pull; `make repl-restart-demo-{up,smoke,down}` |
 | Automatic background pull replication with lag tracking | `internal/node/background_sync.go` — configurable background goroutine (interval, backoff, jitter), polls primary every 500ms, exponential backoff on failure, `ErrSyncInProgress`→skip, `*ReplicationGapError`→terminal blocked state, `lag_entries`/`lag_known` always set after any successful sync; `--bg-sync` CLI flags; `GET /replication/status` includes `background_sync` block; `scripts/repl_auto_demo_{up,smoke,down}.sh` — 24 checks; `make repl-auto-demo-{up,smoke,down}` |
-| 1112 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 1112 passing tests |
+| Operator-controlled manual promotion (planned failover, no automatic failover) | `POST /replication/quiesce` on primary: write-fence via RWMutex write gate, persist quiesce record (NewQuiesceID crypto/rand, CRC32 checksum, quiesceMu-serialized). `POST /replication/promote` on follower: 17 precondition checks, promotionBarrier+double-check drain, CreateJournalBaseline (idempotent), SavePromotionRecord (commit point), DurableLog starts at N+1. Cross-validated startup: baseline.base_seq == promotion_record.inherited_last_seq. Stable error codes (writeJSONError, code field). Typed ReplicationStatusResponse Phase 28 fields. 147 Phase 28 tests (26 hardening + prior Phase 28 tests). See `docs/MANUAL_PROMOTION_DESIGN.md`. NOT automatic failover; requires operator to stop old primary first. |
+| 1259 race-safe tests across 23 packages | `go test -race -count=1 ./...` — 1259 passing tests |
 
 ---
 
@@ -122,8 +123,9 @@ Every cluster config includes a `scope` object with all limitation flags documen
 ```
 Built an explainable Go database engine with WAL-backed LSM-tree storage, exact vector search,
 real networked HTTP node runtime, client-side consistent-hash routing, stateless proxy,
-explicit pull-based read replicas, and ops simulation tools — 865 race-safe tests, reproducible
-benchmarks at every phase.
+explicit pull-based read replicas with durable journal and cursor, automatic background pull
+replication with lag tracking, operator-controlled planned failover (quiesce + promote), and
+ops simulation tools — 1259 race-safe tests across 28 phases, reproducible benchmarks.
 ```
 
 ### What to say if asked "is it distributed?"

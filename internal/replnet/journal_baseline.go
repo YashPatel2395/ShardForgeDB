@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"os"
 	"path/filepath"
 )
@@ -14,6 +15,14 @@ const journalBaselineFileName = "journal_baseline.json"
 
 // ErrJournalBaselineCorrupt is returned when the journal baseline file is invalid.
 var ErrJournalBaselineCorrupt = errors.New("replnet: journal baseline is corrupt or invalid")
+
+// ErrJournalBaselineConflict is returned by CreateJournalBaseline when a baseline file
+// already exists with a different base_seq. The caller must not overwrite it.
+var ErrJournalBaselineConflict = errors.New("replnet: journal baseline already exists with different base_seq")
+
+// ErrJournalBaselineMaxUint64 is returned by CreateJournalBaseline when baseSeq is
+// math.MaxUint64, which would cause nextSeq to overflow on the first Append.
+var ErrJournalBaselineMaxUint64 = errors.New("replnet: journal baseline base_seq is MaxUint64 (would overflow)")
 
 // JournalBaseline records the sequence number that a promoted primary inherits
 // from the old primary. The new DurableLog starts numbering from BaseSeq+1.
@@ -66,6 +75,38 @@ func SaveJournalBaseline(dir string, b *JournalBaseline) error {
 		d.Close()
 	}
 	return nil
+}
+
+// JournalBaselineExists returns true if a journal baseline file exists in dir.
+func JournalBaselineExists(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, journalBaselineFileName))
+	return err == nil
+}
+
+// CreateJournalBaseline creates a journal baseline idempotently.
+//   - If no baseline exists, it creates one with the given baseSeq.
+//   - If a baseline already exists with the same baseSeq, it returns nil (idempotent).
+//   - If a baseline exists with a different baseSeq, it returns ErrJournalBaselineConflict.
+//   - If baseSeq == math.MaxUint64, it returns ErrJournalBaselineMaxUint64.
+func CreateJournalBaseline(dir string, baseSeq uint64) error {
+	if baseSeq == math.MaxUint64 {
+		return ErrJournalBaselineMaxUint64
+	}
+	existing, err := LoadJournalBaseline(dir)
+	if err != nil {
+		return fmt.Errorf("load existing journal baseline: %w", err)
+	}
+	if existing != nil {
+		if existing.BaseSeq == baseSeq {
+			return nil // idempotent: same value
+		}
+		return fmt.Errorf("%w: existing=%d requested=%d", ErrJournalBaselineConflict, existing.BaseSeq, baseSeq)
+	}
+	b := &JournalBaseline{
+		Version: journalBaselineVersion,
+		BaseSeq: baseSeq,
+	}
+	return SaveJournalBaseline(dir, b)
 }
 
 // LoadJournalBaseline reads a JournalBaseline from the data directory.

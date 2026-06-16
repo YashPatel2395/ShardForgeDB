@@ -34,10 +34,15 @@ type QuiesceRecord struct {
 	Checksum         uint32 `json:"checksum"`
 }
 
-func newQuiesceID() string {
+// NewQuiesceID generates a cryptographically random 16-hex-character quiesce identifier.
+// Returns an error if the OS entropy source is unavailable; callers must abort the
+// quiesce rather than proceed with an all-zero or predictable ID.
+func NewQuiesceID() (string, error) {
 	b := make([]byte, 8)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("replnet: generate quiesce ID: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // QuiesceChecksum computes the IEEE CRC32 checksum over a QuiesceRecord with Checksum=0.
@@ -120,13 +125,19 @@ func QuiesceRecordExists(dir string) bool {
 }
 
 // NewQuiesceRecord creates a new QuiesceRecord with a random quiesce ID and UTC timestamp.
-func NewQuiesceRecord(primaryNodeID, primaryBaseURL string, latestSeq uint64) *QuiesceRecord {
+// Returns an error if the OS entropy source is unavailable; callers must not persist a
+// record with a predictable ID.
+func NewQuiesceRecord(primaryNodeID, primaryBaseURL string, latestSeq uint64) (*QuiesceRecord, error) {
+	qID, err := NewQuiesceID()
+	if err != nil {
+		return nil, err
+	}
 	return &QuiesceRecord{
 		Version:          quiesceRecordVersion,
-		QuiesceID:        newQuiesceID(),
+		QuiesceID:        qID,
 		PrimaryNodeID:    primaryNodeID,
 		PrimaryBaseURL:   primaryBaseURL,
 		PrimaryLatestSeq: latestSeq,
 		QuiescedAt:       time.Now().UTC().Format(time.RFC3339Nano),
-	}
+	}, nil
 }

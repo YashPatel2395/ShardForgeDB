@@ -261,7 +261,7 @@ func p28Req(t *testing.T, srv *Server, method, path, body string) *httptest.Resp
 // ── Quiesce state machine tests ─────────────────────────────────────────────────
 
 func TestServer_Quiesce_Primary_Succeeds(t *testing.T) {
-	srv := p28Primary(t)
+	srv := p28PrimaryRunning(t)
 	// Write a value first.
 	p28Req(t, srv, "PUT", "/kv/k1", `{"value":"v1"}`)
 
@@ -319,7 +319,7 @@ func TestServer_Quiesce_Standalone_Rejected(t *testing.T) {
 }
 
 func TestServer_Quiesce_Idempotent_SameRecord(t *testing.T) {
-	srv := p28Primary(t)
+	srv := p28PrimaryRunning(t)
 	p28Req(t, srv, "PUT", "/kv/k1", `{"value":"v1"}`)
 
 	rec1 := p28Req(t, srv, "POST", "/replication/quiesce", "")
@@ -342,7 +342,7 @@ func TestServer_Quiesce_Idempotent_SameRecord(t *testing.T) {
 }
 
 func TestServer_Quiesce_PutRejectedAfterQuiesce(t *testing.T) {
-	srv := p28Primary(t)
+	srv := p28PrimaryRunning(t)
 	p28Req(t, srv, "POST", "/replication/quiesce", "")
 
 	rec := p28Req(t, srv, "PUT", "/kv/k1", `{"value":"v1"}`)
@@ -352,7 +352,7 @@ func TestServer_Quiesce_PutRejectedAfterQuiesce(t *testing.T) {
 }
 
 func TestServer_Quiesce_DeleteRejectedAfterQuiesce(t *testing.T) {
-	srv := p28Primary(t)
+	srv := p28PrimaryRunning(t)
 	p28Req(t, srv, "PUT", "/kv/k1", `{"value":"v1"}`)
 	p28Req(t, srv, "POST", "/replication/quiesce", "")
 
@@ -363,7 +363,7 @@ func TestServer_Quiesce_DeleteRejectedAfterQuiesce(t *testing.T) {
 }
 
 func TestServer_Quiesce_GetStillWorksAfterQuiesce(t *testing.T) {
-	srv := p28Primary(t)
+	srv := p28PrimaryRunning(t)
 	p28Req(t, srv, "PUT", "/kv/k1", `{"value":"v1"}`)
 	p28Req(t, srv, "POST", "/replication/quiesce", "")
 
@@ -379,7 +379,7 @@ func TestServer_Quiesce_GetStillWorksAfterQuiesce(t *testing.T) {
 }
 
 func TestServer_Quiesce_ReplicationLogStillAvailable(t *testing.T) {
-	srv := p28Primary(t)
+	srv := p28PrimaryRunning(t)
 	p28Req(t, srv, "PUT", "/kv/k1", `{"value":"v1"}`)
 	p28Req(t, srv, "POST", "/replication/quiesce", "")
 
@@ -399,6 +399,9 @@ func TestServer_Quiesce_RestartsWithWritesFenced(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
+	}
+	if err := srv.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
 	}
 	p28Req(t, srv, "PUT", "/kv/k1", `{"value":"v1"}`)
 	p28Req(t, srv, "POST", "/replication/quiesce", "")
@@ -423,7 +426,7 @@ func TestServer_Quiesce_RestartsWithWritesFenced(t *testing.T) {
 }
 
 func TestServer_Quiesce_StatusShowsQuiescedState(t *testing.T) {
-	srv := p28Primary(t)
+	srv := p28PrimaryRunning(t)
 	p28Req(t, srv, "POST", "/replication/quiesce", "")
 
 	rec := p28Req(t, srv, "GET", "/replication/status", "")
@@ -438,7 +441,7 @@ func TestServer_Quiesce_StatusShowsQuiescedState(t *testing.T) {
 }
 
 func TestServer_Quiesce_FinalSeqIsCorrect(t *testing.T) {
-	srv := p28Primary(t)
+	srv := p28PrimaryRunning(t)
 	p28Req(t, srv, "PUT", "/kv/k1", `{"value":"v1"}`)
 	p28Req(t, srv, "PUT", "/kv/k2", `{"value":"v2"}`)
 	p28Req(t, srv, "PUT", "/kv/k3", `{"value":"v3"}`)
@@ -452,7 +455,7 @@ func TestServer_Quiesce_FinalSeqIsCorrect(t *testing.T) {
 }
 
 func TestServer_Quiesce_ConcurrentPut_CompletesBeforeQuiesce(t *testing.T) {
-	srv := p28Primary(t)
+	srv := p28PrimaryRunning(t)
 
 	// Start a slow-ish write in background.
 	var wg sync.WaitGroup
@@ -497,7 +500,7 @@ func TestServer_Quiesce_RuntimeRoleIsPrimary(t *testing.T) {
 func TestServer_Quiesce_FailedRecordPersistence_NotClaimed(t *testing.T) {
 	// Use a read-only directory to simulate persistence failure.
 	// This is a basic test — the quiesce record might fail to save.
-	srv := p28Primary(t)
+	srv := p28PrimaryRunning(t)
 	// Quiesce should work on a normal dir.
 	rec := p28Req(t, srv, "POST", "/replication/quiesce", "")
 	if rec.Code != 200 {
@@ -548,7 +551,7 @@ func TestServer_Promote_WrongPrimaryURL_Rejected(t *testing.T) {
 	}
 
 	// Create a valid-looking quiesce record but with wrong primary URL.
-	qr := replnet.NewQuiesceRecord("p28-primary", "http://wrong-url:1234", 0)
+	qr := mustNewQuiesceRecord(t, "p28-primary", "http://wrong-url:1234", 0)
 	qr.Checksum = replnet.QuiesceChecksum(qr)
 	body, _ := json.Marshal(PromoteRequest{
 		QuiesceRecord:            *qr,
@@ -576,7 +579,7 @@ func TestServer_Promote_FollowerBehind_Rejected(t *testing.T) {
 
 	// Don't wait for sync — follower is behind.
 	// Create quiesce record with seq=1 (primary's seq).
-	qr := replnet.NewQuiesceRecord("p28-primary", "http://"+primary.Addr(), 1)
+	qr := mustNewQuiesceRecord(t, "p28-primary", "http://"+primary.Addr(), 1)
 	qr.Checksum = replnet.QuiesceChecksum(qr)
 
 	// Immediately try to promote (before follower catches up).
@@ -607,7 +610,7 @@ func TestServer_Promote_FollowerAhead_Rejected(t *testing.T) {
 	// Fake: set follower's seq ahead.
 	atomic.StoreUint64(&follower.lastApplied, 100)
 
-	qr := replnet.NewQuiesceRecord("p28-primary", "http://"+primary.Addr(), 50)
+	qr := mustNewQuiesceRecord(t, "p28-primary", "http://"+primary.Addr(), 50)
 	qr.Checksum = replnet.QuiesceChecksum(qr)
 	body, _ := json.Marshal(PromoteRequest{
 		QuiesceRecord:            *qr,
@@ -631,7 +634,7 @@ func TestServer_Promote_MaxUint64Seq_Rejected(t *testing.T) {
 	}
 
 	atomic.StoreUint64(&follower.lastApplied, ^uint64(0))
-	qr := replnet.NewQuiesceRecord("p28-primary", "http://"+primary.Addr(), ^uint64(0))
+	qr := mustNewQuiesceRecord(t, "p28-primary", "http://"+primary.Addr(), ^uint64(0))
 	qr.Checksum = replnet.QuiesceChecksum(qr)
 	body, _ := json.Marshal(PromoteRequest{
 		QuiesceRecord:            *qr,
@@ -655,7 +658,7 @@ func TestServer_Promote_CorruptQuiesceRecord_Rejected(t *testing.T) {
 	}
 
 	// Create record with bad checksum.
-	qr := replnet.NewQuiesceRecord("p28-primary", "http://"+primary.Addr(), 0)
+	qr := mustNewQuiesceRecord(t, "p28-primary", "http://"+primary.Addr(), 0)
 	qr.Checksum = 12345 // wrong checksum
 	body, _ := json.Marshal(PromoteRequest{
 		QuiesceRecord:            *qr,
@@ -1002,7 +1005,7 @@ func TestServer_Promote_ActiveManualSync_Rejected(t *testing.T) {
 	follower.syncInProgress.Store(true)
 	defer follower.syncInProgress.Store(false)
 
-	qr := replnet.NewQuiesceRecord("p28-primary", "http://"+primary.Addr(), 0)
+	qr := mustNewQuiesceRecord(t, "p28-primary", "http://"+primary.Addr(), 0)
 	qr.Checksum = replnet.QuiesceChecksum(qr)
 	body, _ := json.Marshal(PromoteRequest{QuiesceRecord: *qr, ConfirmOldPrimaryStopped: true})
 

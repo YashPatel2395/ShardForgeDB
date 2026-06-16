@@ -47,6 +47,16 @@ func (s *Server) writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, errorResponse{Error: msg, NodeID: s.opts.NodeID})
 }
 
+// writeJSONError writes a structured JSON error with a stable machine-readable code field.
+// Use this for Phase 28 endpoints so callers can distinguish error types programmatically.
+func (s *Server) writeJSONError(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, map[string]any{
+		"error":   message,
+		"code":    code,
+		"node_id": s.opts.NodeID,
+	})
+}
+
 // handleHealthz serves GET /healthz.
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -91,7 +101,7 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleKVPut(w http.ResponseWriter, r *http.Request, key []byte) {
-	if s.runtimeRole == "follower" {
+	if s.runtimeState().role == "follower" {
 		s.writeError(w, http.StatusForbidden,
 			"follower: writes are not accepted; this node is a read replica")
 		return
@@ -138,7 +148,7 @@ func (s *Server) handleKVGet(w http.ResponseWriter, r *http.Request, key []byte)
 }
 
 func (s *Server) handleKVDelete(w http.ResponseWriter, r *http.Request, key []byte) {
-	if s.runtimeRole == "follower" {
+	if s.runtimeState().role == "follower" {
 		s.writeError(w, http.StatusForbidden,
 			"follower: writes are not accepted; this node is a read replica")
 		return
@@ -219,7 +229,8 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleReplicationStatus serves GET /replication/status.
-// Phase 28+: includes write_state, quiesce, promotion, and runtime_role fields.
+// Phase 28+: returns a fully typed ReplicationStatusResponse including write_state,
+// quiesce, promotion, and runtime_role fields.
 func (s *Server) handleReplicationStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
@@ -227,41 +238,36 @@ func (s *Server) handleReplicationStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	s.mu.Lock()
-	runtimeRole := s.runtimeRole
-	localRoleSource := s.localRoleSource
-	quiesceState := s.quiesceState
-	quiesceRec := s.quiesceRecord
-	promotionState := s.promotionState
-	s.mu.Unlock()
+	st := s.runtimeState()
 
-	result := map[string]any{
-		"node_id":           s.opts.NodeID,
-		"replication":       s.ReplicationStatus(),
-		"background_sync":   s.BackgroundSyncStatus(),
-		"runtime_role":      runtimeRole,
-		"local_role_source": localRoleSource,
+	resp := ReplicationStatusResponse{
+		NodeID:          s.opts.NodeID,
+		Replication:     s.ReplicationStatus(),
+		BackgroundSync:  s.BackgroundSyncStatus(),
+		RuntimeRole:     st.role,
+		LocalRoleSource: st.localRoleSource,
+		PromotionState:  st.promotionState,
 	}
 
-	if runtimeRole == "primary" || runtimeRole == "standalone" {
+	if st.role == "primary" || st.role == "standalone" {
 		writeState := "active"
-		if quiesceState == "quiesced" {
+		switch st.quiesceState {
+		case "quiesced":
 			writeState = "quiesced"
+		case "quiesce_failed_fenced":
+			writeState = "quiesce_failed_fenced"
 		}
-		result["write_state"] = writeState
-		result["quiesced"] = quiesceState == "quiesced"
-		if quiesceRec != nil {
-			result["quiesce_id"] = quiesceRec.QuiesceID
-			result["quiesced_at"] = quiesceRec.QuiescedAt
-			result["quiesced_latest_seq"] = quiesceRec.PrimaryLatestSeq
+		resp.WriteState = writeState
+		resp.Quiesced = st.quiesceState == "quiesced"
+		resp.QuiesceState = st.quiesceState
+		if st.quiesceRecord != nil {
+			resp.QuiesceID = st.quiesceRecord.QuiesceID
+			resp.QuiescedAt = st.quiesceRecord.QuiescedAt
+			resp.QuiescedLatestSeq = st.quiesceRecord.PrimaryLatestSeq
 		}
 	}
 
-	if promotionState == "promoted" {
-		result["promotion_state"] = "promoted"
-	}
-
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleReplicationLog serves GET /replication/log?after=<seq>&limit=<n>.
@@ -272,7 +278,7 @@ func (s *Server) handleReplicationLog(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if s.runtimeRole != "primary" {
+	if s.runtimeState().role != "primary" {
 		s.writeError(w, http.StatusForbidden, "replication log is only available on primary nodes")
 		return
 	}
@@ -337,7 +343,7 @@ func (s *Server) handleReplicationApply(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if s.runtimeRole != "follower" {
+	if s.runtimeState().role != "follower" {
 		s.writeError(w, http.StatusForbidden, "replication apply is only valid for follower nodes")
 		return
 	}
@@ -370,10 +376,18 @@ func (s *Server) handleExplainPut(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if s.runtimeRole == "follower" {
+	if s.runtimeState().role == "follower" {
 		s.writeError(w, http.StatusForbidden,
 			"follower: writes are not accepted; this node is a read replica")
 		return
+	}
+	// ExplainPut performs a real engine write; it must respect the write gate.
+	if s.writeGate != nil {
+		if err := s.writeGate.Enter(); err != nil {
+			s.writeJSONError(w, http.StatusConflict, "node_quiesced", "node is write-quiesced")
+			return
+		}
+		defer s.writeGate.Exit()
 	}
 	var req explainPutRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -436,10 +450,18 @@ func (s *Server) handleExplainDelete(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if s.runtimeRole == "follower" {
+	if s.runtimeState().role == "follower" {
 		s.writeError(w, http.StatusForbidden,
 			"follower: writes are not accepted; this node is a read replica")
 		return
+	}
+	// ExplainDelete performs a real engine write; it must respect the write gate.
+	if s.writeGate != nil {
+		if err := s.writeGate.Enter(); err != nil {
+			s.writeJSONError(w, http.StatusConflict, "node_quiesced", "node is write-quiesced")
+			return
+		}
+		defer s.writeGate.Exit()
 	}
 	key := r.URL.Query().Get("key")
 	if key == "" {
@@ -499,7 +521,7 @@ func (s *Server) handleReplicationSync(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if s.runtimeRole != "follower" {
+	if s.runtimeState().role != "follower" {
 		s.writeError(w, http.StatusBadRequest, "sync is only valid for follower nodes")
 		return
 	}
@@ -572,7 +594,20 @@ func (s *Server) handleReplicationSync(w http.ResponseWriter, r *http.Request) {
 // ── Phase 28: Quiesce and Promote handlers ──────────────────────────────────────
 
 // handleQuiesce serves POST /replication/quiesce.
-// Quiesces the primary: drains in-flight writes, records final seq, rejects future writes.
+//
+// Quiesces the primary: drains all in-flight writes, records the final sequence number,
+// and rejects all future writes. The operation is idempotent: repeated calls return the
+// original quiesce record unchanged.
+//
+// State machine:
+//
+//	active              → (writeGate.Quiesce + SaveQuiesceRecord) → quiesced
+//	active              → (writeGate.Quiesce, SaveQuiesceRecord fails) → quiesce_failed_fenced
+//	quiesce_failed_fenced → (SaveQuiesceRecord retry with same record) → quiesced
+//	quiesced            → idempotent 200 (same QuiesceID)
+//
+// quiesceMu serializes the entire check-transition-persist sequence so two concurrent
+// requests cannot generate two different QuiesceIDs or race on the state machine.
 func (s *Server) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -580,61 +615,124 @@ func (s *Server) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	runtimeRole := s.runtimeRole
-	quiesceState := s.quiesceState
-	quiesceRec := s.quiesceRecord
-	closed := s.closed
-	s.mu.Unlock()
+	// Serialize the entire quiesce operation. A second concurrent request will block here
+	// and, once the first completes, observe the updated state and return idempotent/error.
+	s.quiesceMu.Lock()
+	defer s.quiesceMu.Unlock()
 
-	if closed {
-		s.writeError(w, http.StatusServiceUnavailable, "node is closing")
+	st := s.runtimeState()
+
+	if st.closed {
+		s.writeJSONError(w, http.StatusServiceUnavailable, "node_closing", "node is closing")
+		return
+	}
+	if st.role != "primary" {
+		s.writeJSONError(w, http.StatusBadRequest, "wrong_role",
+			fmt.Sprintf("quiesce is only valid for primary nodes (current role: %s)", st.role))
 		return
 	}
 
-	if runtimeRole != "primary" {
-		s.writeError(w, http.StatusBadRequest,
-			fmt.Sprintf("quiesce is only valid for primary nodes (current role: %s)", runtimeRole))
-		return
-	}
-
-	// Idempotent: if already quiesced, return the existing record.
-	if quiesceState == "quiesced" && quiesceRec != nil {
+	// Idempotent: already quiesced — return the durable record.
+	if st.quiesceState == "quiesced" && st.quiesceRecord != nil {
 		writeJSON(w, http.StatusOK, QuiesceResponse{
 			NodeID:           s.opts.NodeID,
 			WriteState:       "quiesced",
-			QuiesceID:        quiesceRec.QuiesceID,
-			PrimaryLatestSeq: quiesceRec.PrimaryLatestSeq,
-			QuiescedAt:       quiesceRec.QuiescedAt,
+			QuiesceID:        st.quiesceRecord.QuiesceID,
+			PrimaryLatestSeq: st.quiesceRecord.PrimaryLatestSeq,
+			QuiescedAt:       st.quiesceRecord.QuiescedAt,
 			Idempotent:       true,
 		})
 		return
 	}
 
-	if s.writeGate == nil {
-		s.writeError(w, http.StatusInternalServerError, "write gate not initialized")
+	// Retry: gate was closed but persistence failed on the previous attempt.
+	// Reuse the pending record so the QuiesceID is stable across retries.
+	if st.quiesceState == "quiesce_failed_fenced" {
+		s.mu.Lock()
+		pending := s.pendingQuiesceRecord
+		s.mu.Unlock()
+		if pending == nil {
+			s.writeJSONError(w, http.StatusInternalServerError, "internal_error",
+				"quiesce_failed_fenced state but no pending record (invariant violated)")
+			return
+		}
+		if err := replnet.SaveQuiesceRecord(s.opts.DataDir, pending); err != nil {
+			s.writeJSONError(w, http.StatusInternalServerError, "quiesce_persistence_failed",
+				"quiesce record retry failed: "+err.Error())
+			return
+		}
+		s.mu.Lock()
+		s.quiesceRecord = pending
+		s.quiesceState = "quiesced"
+		s.pendingQuiesceRecord = nil
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, QuiesceResponse{
+			NodeID:           s.opts.NodeID,
+			WriteState:       "quiesced",
+			QuiesceID:        pending.QuiesceID,
+			PrimaryLatestSeq: pending.PrimaryLatestSeq,
+			QuiescedAt:       pending.QuiescedAt,
+			Idempotent:       false,
+		})
 		return
 	}
 
-	// Drain all in-flight writes by taking the exclusive lock.
+	if s.writeGate == nil {
+		s.writeJSONError(w, http.StatusInternalServerError, "internal_error",
+			"write gate not initialized")
+		return
+	}
+
+	// Generate the quiesce ID before closing the gate. If entropy is unavailable,
+	// abort without touching the gate so writes continue normally.
+	qID, err := s.quiesceIDFn()
+	if err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, "internal_error",
+			"failed to generate quiesce ID: "+err.Error())
+		return
+	}
+
+	// Use the bound address (not opts.Addr which may be ":0") so the quiesce record
+	// contains the actual reachable URL that followers used to connect.
+	addr := s.Addr() // acquires s.mu internally; safe since we are not holding s.mu here
+	if strings.HasSuffix(addr, ":0") {
+		s.writeJSONError(w, http.StatusInternalServerError, "internal_error",
+			"node listener not yet bound (addr is :0)")
+		return
+	}
+	baseURL := "http://" + addr
+
+	// Drain all in-flight writes by taking the exclusive write-gate lock.
+	// After this returns, all concurrent write handlers have exited and no new write
+	// can enter (Enter() will return ErrNodeQuiesced).
 	s.writeGate.Quiesce()
 
-	// Get the final sequence from the journal.
+	// Snapshot the final committed sequence after the gate is closed.
 	var latestSeq uint64
 	if s.durableLog != nil {
 		latestSeq = s.durableLog.LatestSeq()
 	}
 
-	// Create and persist the quiesce record.
-	baseURL := s.opts.Addr
-	if !strings.HasPrefix(baseURL, "http") {
-		baseURL = "http://" + baseURL
+	rec := &replnet.QuiesceRecord{
+		Version:          1,
+		QuiesceID:        qID,
+		PrimaryNodeID:    s.opts.NodeID,
+		PrimaryBaseURL:   baseURL,
+		PrimaryLatestSeq: latestSeq,
+		QuiescedAt:       time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	rec := replnet.NewQuiesceRecord(s.opts.NodeID, baseURL, latestSeq)
+	// Stamp the checksum.
+	rec.Checksum = replnet.QuiesceChecksum(rec)
+
 	if err := replnet.SaveQuiesceRecord(s.opts.DataDir, rec); err != nil {
-		// Quiesce record persistence failed. The write gate is already closed,
-		// so writes are rejected, but the record is not durable.
-		s.writeError(w, http.StatusInternalServerError,
+		// The write gate is closed (writes rejected) but the record is not durable.
+		// Enter quiesce_failed_fenced: preserve the pending record so the next retry
+		// reuses the same QuiesceID rather than generating a new one.
+		s.mu.Lock()
+		s.quiesceState = "quiesce_failed_fenced"
+		s.pendingQuiesceRecord = rec
+		s.mu.Unlock()
+		s.writeJSONError(w, http.StatusInternalServerError, "quiesce_persistence_failed",
 			"quiesce record persistence failed: "+err.Error())
 		return
 	}
@@ -655,7 +753,21 @@ func (s *Server) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 }
 
 // handlePromote serves POST /replication/promote.
+//
 // Promotes a follower to primary after the operator has quiesced and stopped the old primary.
+// The operation requires:
+//  1. confirm_old_primary_stopped == true (operator acknowledgment)
+//  2. A valid, checksummed QuiesceRecord from the primary
+//  3. Follower's last_applied_seq == quiesce record's primary_latest_seq
+//
+// Concurrency:
+//   - promoteMu serializes the entire check-barrier-drain-commit sequence.
+//   - promotionBarrier blocks new SyncFromPrimary calls before the bgWorker is stopped.
+//   - syncInProgress is drained (polled with timeout) before the final commit.
+//
+// Failure handling:
+//   - Pre-commit (before SavePromotionRecord): revert barrier and promotionState → follower.
+//   - Post-commit (after SavePromotionRecord): do NOT revert; node recovers as primary on restart.
 func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -669,71 +781,130 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.Lock()
-	runtimeRole := s.runtimeRole
-	promotionState := s.promotionState
-	existingPromotion := s.promotionRecord
-	closed := s.closed
-	s.mu.Unlock()
+	// Serialize the entire promotion operation. A second concurrent promote blocks here
+	// and, once the first completes, will observe the updated state (promoted) and return
+	// the idempotent response rather than attempting a duplicate commit.
+	s.promoteMu.Lock()
+	defer s.promoteMu.Unlock()
 
-	if closed {
-		s.writeError(w, http.StatusServiceUnavailable, "node is closing")
+	st := s.runtimeState()
+
+	if st.closed {
+		s.writeJSONError(w, http.StatusServiceUnavailable, "node_closing", "node is closing")
 		return
 	}
 
-	// Already promoted — idempotent check (must come before role check since
-	// after promotion the runtime role is "primary").
-	if promotionState == "promoted" && existingPromotion != nil {
-		if existingPromotion.QuiesceID == req.QuiesceRecord.QuiesceID {
+	// Idempotent check must come before the role check: after promotion runtimeRole == "primary".
+	if st.promotionState == "promoted" && st.promotionRecord != nil {
+		if st.promotionRecord.QuiesceID == req.QuiesceRecord.QuiesceID {
 			writeJSON(w, http.StatusOK, PromoteResponse{
 				NodeID:           s.opts.NodeID,
 				NewRole:          "primary",
-				QuiesceID:        existingPromotion.QuiesceID,
-				InheritedLastSeq: existingPromotion.InheritedLastSeq,
-				PromotedAt:       existingPromotion.PromotedAt,
+				QuiesceID:        st.promotionRecord.QuiesceID,
+				InheritedLastSeq: st.promotionRecord.InheritedLastSeq,
+				PromotedAt:       st.promotionRecord.PromotedAt,
 				Idempotent:       true,
 			})
 			return
 		}
-		s.writeError(w, http.StatusConflict,
+		s.writeJSONError(w, http.StatusConflict, "already_promoted",
 			"node is already promoted with a different quiesce record")
 		return
 	}
 
-	// Must be a follower (check after idempotent check).
-	if runtimeRole != "follower" {
-		s.writeError(w, http.StatusBadRequest,
-			fmt.Sprintf("promote is only valid for follower nodes (current role: %s)", runtimeRole))
+	// Must be a follower at this point (idempotent check above handles "primary" after promotion).
+	if st.role != "follower" {
+		s.writeJSONError(w, http.StatusBadRequest, "wrong_role",
+			fmt.Sprintf("promote is only valid for follower nodes (current role: %s)", st.role))
 		return
 	}
 
-	if promotionState == "promoting" {
-		s.writeError(w, http.StatusConflict, "promotion is already in progress")
+	// promoteMu ensures we cannot reach here concurrently, so "promoting" state implies a
+	// crashed prior attempt that left the node in a partial state. Surface it explicitly.
+	if st.promotionState == "promoting" {
+		s.writeJSONError(w, http.StatusConflict, "promotion_in_progress",
+			"promotion was previously started but did not complete; check disk state")
 		return
 	}
 
-	// Validate preconditions.
+	// Validate all 17 preconditions before touching any durable state.
 	if err := s.validatePromotionPreconditions(&req); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		status, code := promotionErrorToHTTP(err)
+		s.writeJSONError(w, status, code, err.Error())
 		return
 	}
 
-	// Mark as promoting.
+	// Raise the promotion barrier BEFORE stopping the bgWorker so that no new
+	// SyncFromPrimary call can start (or persist) after we begin the commit sequence.
+	s.promotionBarrier.Store(true)
+
+	// Mark as promoting under s.mu so status endpoints reflect the transition.
 	s.mu.Lock()
 	s.promotionState = "promoting"
 	s.mu.Unlock()
 
-	// Execute promotion.
+	// Stop the background sync worker (if any). It checks its own context and exits cleanly.
+	if s.bgWorker != nil {
+		s.bgWorker.stop()
+	}
+
+	// Drain any in-flight SyncFromPrimary. The barrier prevents new ones from starting;
+	// this loop waits for the one that may have slipped through before the barrier.
+	drainDeadline := time.Now().Add(5 * time.Second)
+	for s.syncInProgress.Load() {
+		if time.Now().After(drainDeadline) {
+			// Revert: pre-commit failure, safe to unwind.
+			s.promotionBarrier.Store(false)
+			s.mu.Lock()
+			s.promotionState = ""
+			s.mu.Unlock()
+			s.writeJSONError(w, http.StatusConflict, "sync_in_progress",
+				"timed out waiting for in-flight sync to complete before promotion")
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Execute the crash-consistent two-phase commit:
+	//   phase 1: journal baseline (idempotent — orphan baseline is safe on crash)
+	//   phase 2: promotion record (commit point — restart recovers as primary)
 	resp, err := s.executePromotion(&req)
 	if err != nil {
+		// Check whether the commit point (promotion record) was written.
+		// If yes: post-commit failure — do NOT revert; node recovers as primary on restart.
+		// If no:  pre-commit failure — safe to revert state so the operator can retry.
+		if replnet.PromotionRecordExists(s.opts.DataDir) {
+			s.writeJSONError(w, http.StatusInternalServerError, "promotion_failed_post_commit",
+				"promotion record was written but subsequent steps failed: "+err.Error())
+			return
+		}
+		// Pre-commit: revert barrier and state so the follower resumes normal operation.
+		s.promotionBarrier.Store(false)
 		s.mu.Lock()
 		s.promotionState = ""
 		s.mu.Unlock()
-		s.writeError(w, http.StatusInternalServerError, "promotion failed: "+err.Error())
+		s.writeJSONError(w, http.StatusInternalServerError, "promotion_failed",
+			"promotion failed (pre-commit, reverted to follower): "+err.Error())
 		return
 	}
 
 	writeJSON(w, http.StatusOK, *resp)
+}
+
+// promotionErrorToHTTP maps a promotion validation error to an HTTP status and stable code.
+func promotionErrorToHTTP(err error) (int, string) {
+	switch {
+	case errors.Is(err, ErrPromotionRecordInvalid):
+		return http.StatusBadRequest, "promotion_record_invalid"
+	case errors.Is(err, ErrPromotionSequenceMismatch):
+		return http.StatusBadRequest, "promotion_sequence_mismatch"
+	case errors.Is(err, ErrPromotionSourceMismatch):
+		return http.StatusBadRequest, "promotion_source_mismatch"
+	case errors.Is(err, ErrPromotionNotReady):
+		return http.StatusBadRequest, "promotion_not_ready"
+	default:
+		return http.StatusBadRequest, "promotion_failed"
+	}
 }
 
 // validatePromotionPreconditions runs all 17 promotion checks.
@@ -810,28 +981,23 @@ func (s *Server) validatePromotionPreconditions(req *PromoteRequest) error {
 	return nil
 }
 
-// executePromotion performs the actual promotion sequence.
+// executePromotion performs the crash-consistent two-phase commit of the promotion.
+//
+// Called after: promotionBarrier is set, bgWorker is stopped, syncInProgress is drained.
+// Phase 1 (journal baseline): idempotent — an orphan baseline on crash is safe (follower ignores it).
+// Phase 2 (promotion record): the commit point — once written, restart recovers as primary.
 func (s *Server) executePromotion(req *PromoteRequest) (*PromoteResponse, error) {
 	qr := &req.QuiesceRecord
 	dir := s.opts.DataDir
-
-	// 1. Stop background sync worker.
-	if s.bgWorker != nil {
-		s.bgWorker.stop()
-	}
-
 	inheritedSeq := qr.PrimaryLatestSeq
 
-	// 2. Persist journal baseline.
-	baseline := &replnet.JournalBaseline{
-		Version: 1,
-		BaseSeq: inheritedSeq,
-	}
-	if err := replnet.SaveJournalBaseline(dir, baseline); err != nil {
+	// Phase 1: persist journal baseline (idempotent).
+	// CreateJournalBaseline returns nil if already written with the same seq (crash-safe).
+	if err := replnet.CreateJournalBaseline(dir, inheritedSeq); err != nil {
 		return nil, fmt.Errorf("persist journal baseline: %w", err)
 	}
 
-	// 3. Persist promotion record.
+	// Phase 2: persist promotion record (commit point).
 	promRec := replnet.NewPromotionRecord(
 		s.opts.NodeID,
 		qr.PrimaryNodeID,
@@ -843,13 +1009,13 @@ func (s *Server) executePromotion(req *PromoteRequest) (*PromoteResponse, error)
 		return nil, fmt.Errorf("persist promotion record: %w", err)
 	}
 
-	// 4. Open new DurableLog (will find baseline, start at inheritedSeq+1).
+	// Open new DurableLog (finds the baseline, starts at inheritedSeq+1).
 	dl, err := replnet.OpenDurableLog(dir)
 	if err != nil {
 		return nil, fmt.Errorf("open durable log: %w", err)
 	}
 
-	// 5. Switch runtime role.
+	// Switch runtime role atomically under s.mu.
 	s.mu.Lock()
 	s.runtimeRole = "primary"
 	s.localRoleSource = "promotion_record"
@@ -858,8 +1024,7 @@ func (s *Server) executePromotion(req *PromoteRequest) (*PromoteResponse, error)
 	s.durableLog = dl
 	s.writeGate = &writeGate{}
 	s.quiesceState = "active"
-	// Clear follower-only state.
-	s.replicator = nil
+	s.replicator = nil // clear follower-only state
 	s.mu.Unlock()
 
 	return &PromoteResponse{

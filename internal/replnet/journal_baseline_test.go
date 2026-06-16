@@ -9,6 +9,96 @@ import (
 	"testing"
 )
 
+// ── CreateJournalBaseline tests ──────────────────────────────────────────────────
+
+func TestCreateJournalBaseline_Fresh(t *testing.T) {
+	dir := t.TempDir()
+	if err := CreateJournalBaseline(dir, 42); err != nil {
+		t.Fatalf("CreateJournalBaseline: %v", err)
+	}
+	b, err := LoadJournalBaseline(dir)
+	if err != nil || b == nil {
+		t.Fatalf("load after create: %v, b=%v", err, b)
+	}
+	if b.BaseSeq != 42 {
+		t.Errorf("base_seq: got %d, want 42", b.BaseSeq)
+	}
+}
+
+func TestCreateJournalBaseline_Idempotent_SameSeq(t *testing.T) {
+	dir := t.TempDir()
+	if err := CreateJournalBaseline(dir, 100); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	// Second call with same seq must return nil (idempotent).
+	if err := CreateJournalBaseline(dir, 100); err != nil {
+		t.Errorf("idempotent create returned error: %v", err)
+	}
+}
+
+func TestCreateJournalBaseline_Conflict_DifferentSeq(t *testing.T) {
+	dir := t.TempDir()
+	if err := CreateJournalBaseline(dir, 10); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	err := CreateJournalBaseline(dir, 20)
+	if !errors.Is(err, ErrJournalBaselineConflict) {
+		t.Errorf("expected ErrJournalBaselineConflict, got: %v", err)
+	}
+}
+
+func TestCreateJournalBaseline_MaxUint64_Rejected(t *testing.T) {
+	dir := t.TempDir()
+	err := CreateJournalBaseline(dir, math.MaxUint64)
+	if !errors.Is(err, ErrJournalBaselineMaxUint64) {
+		t.Errorf("expected ErrJournalBaselineMaxUint64, got: %v", err)
+	}
+	// No file should have been created.
+	if JournalBaselineExists(dir) {
+		t.Error("baseline file must not be created for MaxUint64")
+	}
+}
+
+func TestCreateJournalBaseline_ZeroSeq_Allowed(t *testing.T) {
+	dir := t.TempDir()
+	if err := CreateJournalBaseline(dir, 0); err != nil {
+		t.Fatalf("CreateJournalBaseline(0): %v", err)
+	}
+	b, _ := LoadJournalBaseline(dir)
+	if b == nil || b.BaseSeq != 0 {
+		t.Errorf("expected base_seq=0, got %v", b)
+	}
+}
+
+func TestJournalBaselineExists_True_False(t *testing.T) {
+	dir := t.TempDir()
+	if JournalBaselineExists(dir) {
+		t.Error("should not exist in empty dir")
+	}
+	CreateJournalBaseline(dir, 5)
+	if !JournalBaselineExists(dir) {
+		t.Error("should exist after create")
+	}
+}
+
+func TestCreateJournalBaseline_Sequential_Idempotent(t *testing.T) {
+	// CreateJournalBaseline is protected by promoteMu in the promotion path and is
+	// never called concurrently in practice. Test that repeated sequential calls
+	// with the same value return nil without corrupting the file.
+	dir := t.TempDir()
+	for i := 0; i < 5; i++ {
+		if err := CreateJournalBaseline(dir, 42); err != nil {
+			t.Errorf("call %d: unexpected error: %v", i, err)
+		}
+	}
+	b, err := LoadJournalBaseline(dir)
+	if err != nil || b == nil || b.BaseSeq != 42 {
+		t.Errorf("unexpected state after repeated creates: %v %v", err, b)
+	}
+}
+
+// ── SaveLoad and other existing tests ────────────────────────────────────────────
+
 func TestJournalBaseline_SaveLoad_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	b := &JournalBaseline{Version: journalBaselineVersion, BaseSeq: 42}

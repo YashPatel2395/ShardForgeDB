@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"sync"
@@ -50,21 +51,70 @@ type Server struct {
 	bgWorker *backgroundSyncWorker
 
 	// Phase 28: write gate and promotion state.
-	// writeGate guards PUT/DELETE handlers. Writes take RLock; quiesce takes Lock.
+	// writeGate guards PUT/DELETE/ExplainPut/ExplainDelete handlers.
+	// Writes take RLock; quiesce takes exclusive Lock (drains in-flight writes).
 	// Non-nil for primary/standalone; nil for follower (already rejects writes).
 	writeGate *writeGate
 
-	// Quiesce state (primary only).
-	quiesceState  string // "active", "quiesced"
-	quiesceRecord *replnet.QuiesceRecord
+	// quiesceMu serializes the entire quiesce operation (check → gate → persist → state).
+	// Prevents TOCTOU: two concurrent POST /replication/quiesce cannot each generate a
+	// different QuiesceID or observe conflicting states.
+	quiesceMu sync.Mutex
 
-	// Promotion state (follower -> promoted primary).
+	// promoteMu serializes the entire promotion operation (check → barrier → drain → commit).
+	// Prevents two concurrent POST /replication/promote from both reaching executePromotion.
+	promoteMu sync.Mutex
+
+	// promotionBarrier is set true by handlePromote before stopping the bgWorker.
+	// SyncFromPrimary checks this flag before and after claiming syncInProgress so that
+	// no new sync starts or persists after the barrier is raised.
+	promotionBarrier atomic.Bool
+
+	// Quiesce state (primary only). Protected by mu.
+	// States: "active", "quiesce_failed_fenced", "quiesced"
+	quiesceState         string                 // protected by mu
+	quiesceRecord        *replnet.QuiesceRecord // non-nil when quiesceState == "quiesced"
+	pendingQuiesceRecord *replnet.QuiesceRecord // non-nil when quiesceState == "quiesce_failed_fenced"
+
+	// quiesceIDFn generates a random quiesce ID. Defaults to replnet.NewQuiesceID.
+	// Replaceable in tests to inject failures or fixed IDs.
+	quiesceIDFn func() (string, error)
+
+	// Promotion state (follower -> promoted primary). Protected by mu.
 	promotionState  string // "", "promoting", "promoted"
 	promotionRecord *replnet.PromotionRecord
 
 	// Runtime role — may differ from opts.Replication.Role after promotion.
+	// Protected by mu; use runtimeState() to read consistently.
 	runtimeRole     string // "primary", "follower", "standalone", ""
 	localRoleSource string // "config" or "promotion_record"
+}
+
+// runtimeSnapshot is a point-in-time copy of mutable Server fields read under mu.
+type runtimeSnapshot struct {
+	role            string
+	localRoleSource string
+	quiesceState    string
+	quiesceRecord   *replnet.QuiesceRecord
+	promotionState  string
+	promotionRecord *replnet.PromotionRecord
+	closed          bool
+}
+
+// runtimeState returns a synchronized snapshot of mutable Server state.
+// Call this instead of reading s.runtimeRole etc. directly from handlers.
+func (s *Server) runtimeState() runtimeSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return runtimeSnapshot{
+		role:            s.runtimeRole,
+		localRoleSource: s.localRoleSource,
+		quiesceState:    s.quiesceState,
+		quiesceRecord:   s.quiesceRecord,
+		promotionState:  s.promotionState,
+		promotionRecord: s.promotionRecord,
+		closed:          s.closed,
+	}
 }
 
 // Open validates opts, opens (or creates) the local Engine, and wires up the HTTP mux.
@@ -89,10 +139,11 @@ func Open(opts Options) (*Server, error) {
 	}
 
 	s := &Server{
-		opts:  opts,
-		eng:   eng,
-		mux:   http.NewServeMux(),
-		start: time.Now(),
+		opts:        opts,
+		eng:         eng,
+		mux:         http.NewServeMux(),
+		start:       time.Now(),
+		quiesceIDFn: replnet.NewQuiesceID,
 	}
 
 	// Phase 28: resolve runtime role from durable records before initializing
@@ -302,6 +353,37 @@ func (s *Server) resolveRuntimeRole() error {
 			return fmt.Errorf("promotion record node_id %q does not match config node_id %q",
 				rec.NodeID, s.opts.NodeID)
 		}
+
+		// Cross-validate required fields in the promotion record.
+		if rec.NewRole != "primary" {
+			return fmt.Errorf("promotion record new_role is %q, want \"primary\"", rec.NewRole)
+		}
+		if rec.SourcePrimaryNodeID == "" {
+			return fmt.Errorf("promotion record source_primary_node_id is empty")
+		}
+		if rec.SourcePrimaryBaseURL == "" {
+			return fmt.Errorf("promotion record source_primary_base_url is empty")
+		}
+		if rec.QuiesceID == "" {
+			return fmt.Errorf("promotion record quiesce_id is empty")
+		}
+		if rec.InheritedLastSeq == math.MaxUint64 {
+			return fmt.Errorf("promotion record inherited_last_seq is MaxUint64 (would overflow)")
+		}
+
+		// Verify journal baseline is present and consistent.
+		baseline, err := replnet.LoadJournalBaseline(dir)
+		if err != nil {
+			return fmt.Errorf("load journal baseline for promoted primary: %w", err)
+		}
+		if baseline == nil {
+			return fmt.Errorf("promoted primary has promotion record but no journal baseline (corrupt state)")
+		}
+		if baseline.BaseSeq != rec.InheritedLastSeq {
+			return fmt.Errorf("journal baseline base_seq %d != promotion record inherited_last_seq %d",
+				baseline.BaseSeq, rec.InheritedLastSeq)
+		}
+
 		s.runtimeRole = "primary"
 		s.localRoleSource = "promotion_record"
 		s.promotionRecord = rec
@@ -319,6 +401,8 @@ func (s *Server) resolveRuntimeRole() error {
 	} else if !errors.Is(err, replnet.ErrPromotionRecordNotFound) {
 		return fmt.Errorf("load promotion record: %w", err)
 	}
+	// Orphan baseline (journal_baseline.json without promotion_record.json) is safe to
+	// ignore: the promotion was never committed, and this node starts as a regular follower.
 
 	// No promotion record. Use config role.
 	s.runtimeRole = string(s.opts.Replication.Role)
@@ -482,13 +566,26 @@ func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 		return SyncResult{}, fmt.Errorf("node: SyncFromPrimary called on non-follower node")
 	}
 
+	// Reject syncs during promotion. The promotion barrier is set before the bgWorker is
+	// stopped so that no new sync can start (or persist) after the promotion sequence
+	// begins. Double-check after CAS so a sync that slipped through the first check still
+	// observes the barrier and releases the slot before any work is done.
+	if s.promotionBarrier.Load() {
+		return SyncResult{}, fmt.Errorf("node: sync rejected: promotion in progress")
+	}
+
 	// Reject concurrent syncs. Two concurrent calls could pull the same batch and attempt
 	// to apply identical entries, causing sequence-order violations or double-persistence.
-	// Choice: reject (B) — the caller should retry after the in-flight sync completes.
+	// Choice: reject — the caller should retry after the in-flight sync completes.
 	if !s.syncInProgress.CompareAndSwap(false, true) {
 		return SyncResult{}, ErrSyncInProgress
 	}
 	defer s.syncInProgress.Store(false)
+
+	// Double-check: if barrier was set between the first load and the CAS, abort.
+	if s.promotionBarrier.Load() {
+		return SyncResult{}, fmt.Errorf("node: sync rejected: promotion in progress")
+	}
 
 	bgEnabled := s.bgWorker != nil
 

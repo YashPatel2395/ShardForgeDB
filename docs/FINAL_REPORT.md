@@ -1,13 +1,13 @@
 # ShardForgeDB — Final Engineering Report
 
-**Version:** v0.4.0-portfolio
-**Status:** 27-phase build complete, all tests passing, all benchmarks reproducible.
+**Version:** v0.5.0-portfolio
+**Status:** 28-phase build complete, all tests passing, all benchmarks reproducible.
 
 ---
 
 ## Executive summary
 
-ShardForgeDB is a ground-up Go database engine built as a 27-phase educational and portfolio project. It implements a WAL-backed LSM-tree key-value store, exact vector search, a real networked HTTP node runtime, a stateless routing proxy, explicit pull-based read replicas with durable journal and cursor, automatic background pull replication with configurable interval/backoff/jitter and lag tracking, an operations simulation layer, and a full explainability system that produces real execution traces for every key database operation. All phases are tested, benchmarked, and documented. Every design decision and limitation is explicitly stated.
+ShardForgeDB is a ground-up Go database engine built as a 28-phase educational and portfolio project. It implements a WAL-backed LSM-tree key-value store, exact vector search, a real networked HTTP node runtime, a stateless routing proxy, explicit pull-based read replicas with durable journal and cursor, automatic background pull replication with configurable interval/backoff/jitter and lag tracking, an operations simulation layer, a full explainability system that produces real execution traces for every key database operation, and an operator-controlled manual promotion workflow for planned failover. All phases are tested, benchmarked, and documented. Every design decision and limitation is explicitly stated.
 
 The project is not a production database. It is an explainable, deeply documented implementation that demonstrates real engineering depth across storage, networking, routing, replication, observability, and operations tooling.
 
@@ -44,8 +44,9 @@ The project is not a production database. It is an explainable, deeply documente
 | 25 | `configs/replication/`, `scripts/repl_demo_*.sh`, `internal/node` (SyncResult, Client.SyncReplication), `internal/node/replication_phase25_test.go`, `internal/cluster/replication_demo_test.go` | Networked pull-based replication demo: leader+follower HTTP nodes, explicit pull via POST /replication/sync, PUT+DELETE replication, idempotent pull, role enforcement, 20 new tests | 20 | — |
 | 26 | `internal/replnet/durable_log.go`, `internal/replnet/state_store.go`, `internal/node/replication_phase26_test.go`, `scripts/repl_restart_demo_*.sh`, `docs/REPLICATION_DURABILITY_DESIGN.md` | Durable replication state: binary journal for primary (`replication.journal` — per-Append fsync, rollback-on-failure, ErrPoisonedLog on rollback failure, replay boundary checks); identity-bound versioned JSON cursor for follower (`replication_state.json` — version+follower_node_id+primary_url+last_applied_seq+updated_at+checksum, CRC32 over all fields, directory fsync best-effort); gap detection (HTTP 409); sequence monotonicity enforcement; concurrent sync guard (`ErrSyncInProgress`); crash window documented; restart recovery demo (18 checks). Test breakdown: 31 DurableLog + 12 StateStore + 18 Phase26_node = 61 Phase 26 tests | 61 | — |
 | 27 | `internal/node/background_sync.go`, `internal/node/background_sync_test.go`, `internal/node/replication_phase27_test.go`, `internal/node/server_lifecycle_test.go`, `internal/node/types.go` (Duration, BackgroundSyncConfig, WorkerState, BackgroundSyncStatus, ReplicationStatusResponse), `internal/node/config.go` (ErrAlreadyStarted, NaN/Inf jitter guard), `internal/node/server.go` (single-use lifecycle, race-safe start under mutex), `internal/node/handlers.go` (HTTP 409 ErrSyncInProgress + code field), `internal/node/client.go` (ReplicationStatus typed method; SyncReplication typed ErrSyncInProgress), `internal/replnet/replicator.go` (PullResult.PrimaryLatestSeqKnown, *uint64 logResponse), `cmd/shardforge-node/main.go` (bg-sync flags), `scripts/repl_auto_demo_*.sh` (24 checks), `configs/replication/demo-background-sync.json`, `docs/BACKGROUND_REPLICATION_DESIGN.md` | Automatic background pull replication with lag tracking: configurable goroutine polls primary every 500ms; exponential backoff (initial→max) with bounded jitter (fraction); ErrSyncInProgress→skip (resets backoff to 0, no failure counter); *ReplicationGapError→WorkerStateBlocked (clears Running/CurrentBackoffMs/NextRetryAt); lag_entries/lag_known propagated from PrimaryLatestSeqKnown (*uint64 pointer in logResponse); UTC timestamps (nowFn); server single-use lifecycle (ErrAlreadyStarted sentinel, started+closed bool under mu); worker CAS linearized inside lifecycleMu (CAS inside lifecycleMu.Lock() so stop() winning the mutex leaves CAS slot unconsumed; preLaunchHook test seam verifies stop() blocks until start() completes wg.Add+launch); shutdown cancellation not counted as failure (w.ctx.Err() guard); HTTP 409 with code="sync_in_progress" for manual sync conflict; Client.SyncReplication returns wrapped ErrSyncInProgress on 409 (502 does not match); typed ReplicationStatusResponse client; 24-check smoke demo; NOT Raft; NOT automatic failover. Test breakdown: 48 unit (background_sync_test.go: +StopWaitsForConcurrentStart +StopBeforeStart_StartStillSucceeds −ConcurrentStartStop) + 26 integration (replication_phase27_test.go) + 14 lifecycle+client (server_lifecycle_test.go: 9 original + 5 blocking-Start path) + 1 replnet (replicator_test.go#PrimaryLatestSeq_Reported) = 89 Phase 27 tests | 89 | — |
+| 28 | `internal/node/handlers.go` (handleQuiesce/handlePromote rewrite, writeJSONError, handleExplainPut/Delete fencing), `internal/node/server.go` (quiesceMu, promoteMu, promotionBarrier, quiesce_failed_fenced, quiesceIDFn seam, runtimeSnapshot/runtimeState()), `internal/node/types.go` (ReplicationStatusResponse Phase 28 fields), `internal/node/config.go` (ErrQuiesceInProgress, ErrQuiesceFailedFenced), `internal/replnet/quiesce_store.go` (NewQuiesceID→(string,error), NewQuiesceRecord→(*QuiesceRecord,error)), `internal/replnet/journal_baseline.go` (CreateJournalBaseline, JournalBaselineExists, ErrJournalBaselineConflict, ErrJournalBaselineMaxUint64), `internal/node/phase28_hardening_test.go` (26 new tests), `internal/node/phase28_test_helpers_test.go`, `docs/MANUAL_PROMOTION_DESIGN.md` | Phase 28 hardening pass: quiesceMu serializes all concurrent quiesce requests; quiesce_failed_fenced state with pendingQuiesceRecord retry; NewQuiesceID returns error on entropy failure (abort before gate closes); quiesceIDFn injectable seam; s.Addr() used for primary_base_url (rejects :0); handleExplainPut/Delete fenced by writeGate; runtimeSnapshot/runtimeState() eliminates unsynchronized runtimeRole reads; promoteMu serializes promotion; promotionBarrier atomic.Bool + double-check pattern prevents sync slip-through during promotion drain; CreateJournalBaseline idempotent (same seq OK, different seq→conflict, MaxUint64→error); cross-validation on startup (new_role=="primary", non-empty fields, MaxUint64 check, baseline exists, BaseSeq==InheritedLastSeq); pre-commit failure reverts follower state, post-commit failure preserved for restart recovery; writeJSONError with stable machine-readable code field; typed ReplicationStatusResponse with quiesce+promotion fields; orphan baseline safe on startup. Test breakdown: 26 hardening tests (phase28_hardening_test.go) + 7 baseline tests (journal_baseline_test.go additions) + 2 quiesce-store tests (quiesce_store_test.go additions) = 35 Phase 28 net-new tests | 147 (Phase 28) | — |
 
-**Total tests:** 1112
+**Total tests:** 1259
 **Total benchmarks:** 120+
 **Packages with tests:** 23 of 27
 
@@ -62,6 +63,8 @@ The networked layer adds real HTTP/JSON nodes, a client-side consistent-hash rou
 Read replicas add explicit pull-based sync: the primary keeps a durable binary journal (`replication.journal`); followers persist their cursor to `replication_state.json` and pull entries on demand. Both survive process restarts. Gap detection returns HTTP 409 when the follower falls too far behind.
 
 Phase 27 adds automatic background pull replication: when `--bg-sync` is set, a goroutine polls the primary every 500ms (configurable). Exponential backoff on failure, bounded jitter, `ErrSyncInProgress`→skip, `*ReplicationGapError`→terminal blocked state. Lag tracking (`lag_entries`, `lag_known`) is always accurate after any successful sync. The manual sync path is still available alongside the background worker. NOT Raft, NOT automatic failover.
+
+Phase 28 adds operator-controlled manual promotion and controlled failover: a primary can be quiesced (write-fenced) via `POST /replication/quiesce`; a follower can be promoted via `POST /replication/promote` with the quiesce record. The Phase 28 hardening pass fixes all concurrency and crash-consistency issues found after initial implementation.
 
 The ops layer adds health visibility, failure simulation (routing impact without live calls), and manual rebalance planning (key movement without data movement).
 
@@ -128,7 +131,7 @@ The trace system works only because each `Explain*` method mirrors the exact exe
 
 ## Release status
 
-All 27 phases complete. `go test -race -count=1 ./...` → 1112 tests pass across 23 packages. Smoke demos: cluster (25/25), repl (16/16), repl-restart (16/16), repl-auto (24/24).
+All 28 phases complete. `go test -race -count=1 ./...` → 1259 tests pass across 23 packages. Smoke demos: cluster (25/25), repl (16/16), repl-restart (16/16), repl-auto (24/24).
 
 **Phase 26 fix pass hardening** (not a new phase — correctness fixes to Phase 26 before PR acceptance):
 - Journal fsync before index update; rollback on failure (injectable `syncFn` for deterministic tests)
@@ -138,6 +141,22 @@ All 27 phases complete. `go test -race -count=1 ./...` → 1112 tests pass acros
 - Sequence monotonicity enforced in `replay()` (`seq == prevSeq+1`)
 - `ErrSyncInProgress` guard prevents concurrent `SyncFromPrimary` calls
 - Crash window documented explicitly: engine write before journal append; mutation visible in engine but absent from journal if crash occurs between the two
+
+**Phase 28 concurrency and crash-consistency hardening** (correctness fixes before PR acceptance):
+- `quiesceMu sync.Mutex` serializes the entire quiesce operation (check → gate → persist → state); concurrent quiesce requests queue and the second caller sees the already-quiesced state idempotently
+- `quiesce_failed_fenced` state: when the write gate closes but `SaveQuiesceRecord` fails, `pendingQuiesceRecord` is preserved and retry reuses the same QuiesceID
+- `NewQuiesceID() (string, error)`: entropy failure aborts quiesce before gate closes (gate is never poisoned by a zero/predictable ID); `quiesceIDFn func() (string, error)` injectable seam for tests
+- `s.Addr()` used for `primary_base_url` capture; quiesce rejected if listener not yet bound (`:0`)
+- `handleExplainPut` and `handleExplainDelete` now check `writeGate.Enter()` (previously unfenced despite real engine writes)
+- `runtimeSnapshot` struct + `runtimeState()` method: all mutable fields read under `s.mu` in one snapshot; eliminates data races in all handlers that previously read `s.runtimeRole` bare
+- `promoteMu sync.Mutex` serializes the entire promotion operation; concurrent promote attempts queue
+- `promotionBarrier atomic.Bool` + double-check pattern: set before stopping bgWorker; `SyncFromPrimary` checks barrier before AND after claiming `syncInProgress` CAS slot, preventing slip-through
+- `CreateJournalBaseline(dir, baseSeq)` idempotent helper: same value → nil, different value → `ErrJournalBaselineConflict`, `MaxUint64` → `ErrJournalBaselineMaxUint64`; used as phase-1 commit in promotion (orphan-safe)
+- Cross-validation in `resolveRuntimeRole()`: verifies `new_role=="primary"`, non-empty fields, `InheritedLastSeq != MaxUint64`, baseline exists, `baseline.BaseSeq == rec.InheritedLastSeq`; any mismatch → node refuses to open
+- Pre-commit failure: revert `promotionBarrier` + `promotionState`; post-commit failure: preserve state for restart recovery
+- `writeJSONError` helper: stable machine-readable `code` field in all error responses (`node_quiesced`, `wrong_role`, `node_closing`, `promotion_sequence_mismatch`, `quiesce_persistence_failed`, `sync_in_progress`)
+- Fully typed `ReplicationStatusResponse` with Phase 28 fields: `runtime_role`, `local_role_source`, `write_state`, `quiesced`, `quiesce_state`, `quiesce_id`, `quiesced_at`, `quiesced_latest_seq`, `promotion_state`
+- 26 new tests in `phase28_hardening_test.go` covering all of the above; 7 new baseline tests; 2 new quiesce-ID tests; total 1259 passing
 
 **Phase 27 production-contract hardening** (correctness and lifecycle fixes before PR acceptance):
 - `ErrAlreadyStarted` sentinel: server single-use lifecycle (`started bool` under mutex); double-Start or Start-after-Close returns typed error

@@ -83,11 +83,19 @@ func JournalBaselineExists(dir string) bool {
 	return err == nil
 }
 
+// ErrJournalIncompatible is returned by CreateJournalBaseline when an existing durable
+// journal's first entry seq is incompatible with the requested baseSeq. This prevents
+// a promoted primary from opening a journal that disagrees with its inherited cursor.
+var ErrJournalIncompatible = errors.New("replnet: existing journal is incompatible with requested baseline seq")
+
 // CreateJournalBaseline creates a journal baseline idempotently.
 //   - If no baseline exists, it creates one with the given baseSeq.
 //   - If a baseline already exists with the same baseSeq, it returns nil (idempotent).
 //   - If a baseline exists with a different baseSeq, it returns ErrJournalBaselineConflict.
 //   - If baseSeq == math.MaxUint64, it returns ErrJournalBaselineMaxUint64.
+//   - If an existing durable log has entries and its first entry seq != baseSeq+1,
+//     it returns ErrJournalIncompatible to prevent a promoted primary from opening a
+//     journal that disagrees with its inherited cursor.
 func CreateJournalBaseline(dir string, baseSeq uint64) error {
 	if baseSeq == math.MaxUint64 {
 		return ErrJournalBaselineMaxUint64
@@ -98,15 +106,47 @@ func CreateJournalBaseline(dir string, baseSeq uint64) error {
 	}
 	if existing != nil {
 		if existing.BaseSeq == baseSeq {
-			return nil // idempotent: same value
+			// Idempotent: same value. Still check journal compatibility below
+			// because a second call after a partial crash should also validate.
+			return journalCompatibilityCheck(dir, baseSeq)
 		}
 		return fmt.Errorf("%w: existing=%d requested=%d", ErrJournalBaselineConflict, existing.BaseSeq, baseSeq)
 	}
+
+	// Reject incompatible existing journals before writing the baseline.
+	if err := journalCompatibilityCheck(dir, baseSeq); err != nil {
+		return err
+	}
+
 	b := &JournalBaseline{
 		Version: journalBaselineVersion,
 		BaseSeq: baseSeq,
 	}
 	return SaveJournalBaseline(dir, b)
+}
+
+// journalCompatibilityCheck verifies that an existing durable journal (if any) is
+// compatible with the requested baseSeq. Returns nil if the journal does not exist,
+// is empty, or its first entry seq equals baseSeq+1. Returns ErrJournalIncompatible
+// if a non-empty journal's first entry disagrees.
+func journalCompatibilityCheck(dir string, baseSeq uint64) error {
+	dl, err := OpenDurableLog(dir)
+	if err != nil {
+		// No journal exists yet — compatible by definition.
+		return nil
+	}
+	defer dl.Close()
+	firstSeq := dl.FirstAvailableSeq()
+	if firstSeq == 0 {
+		// Journal is empty — compatible.
+		return nil
+	}
+	expectedFirst := baseSeq + 1
+	if firstSeq != expectedFirst {
+		return fmt.Errorf("%w: journal first_seq=%d, expected %d (base_seq=%d)",
+			ErrJournalIncompatible, firstSeq, expectedFirst, baseSeq)
+	}
+	return nil
 }
 
 // LoadJournalBaseline reads a JournalBaseline from the data directory.

@@ -253,7 +253,60 @@ type scanResponse struct {
 // errorResponse is returned on any handler error.
 type errorResponse struct {
 	Error  string `json:"error"`
+	Code   string `json:"code,omitempty"`   // stable machine-readable code (Phase 28+)
 	NodeID string `json:"node_id,omitempty"`
+}
+
+// HTTPStatusError is returned by Client methods when the server responds with a non-2xx status.
+// The Code field is a stable machine-readable identifier corresponding to the server's "code"
+// JSON field. Use errors.Is to map against package-level sentinel errors.
+type HTTPStatusError struct {
+	StatusCode int    // HTTP status code (e.g. 409)
+	Code       string // stable machine-readable code (e.g. "node_quiesced")
+	Message    string // human-readable error message from server
+}
+
+func (e *HTTPStatusError) Error() string {
+	if e.Code != "" {
+		return fmt.Sprintf("HTTP %d (%s): %s", e.StatusCode, e.Code, e.Message)
+	}
+	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Message)
+}
+
+// Is reports whether this error matches a well-known sentinel.
+// Mapping of server code values to package-level sentinel errors:
+//
+//	"node_quiesced"               → ErrNodeQuiesced
+//	"sync_in_progress"            → ErrSyncInProgress
+//	"promotion_sequence_mismatch" → ErrPromotionSequenceMismatch
+//	"promotion_source_mismatch"   → ErrPromotionSourceMismatch
+//	"promotion_record_invalid"    → ErrPromotionRecordInvalid
+//	"already_promoted"            → ErrAlreadyPromoted
+//	"promotion_in_progress"       → ErrPromotionInProgress
+//	"promotion_not_ready"         → ErrPromotionNotReady
+//	"quiesce_failed_fenced"       → ErrQuiesceFailedFenced
+func (e *HTTPStatusError) Is(target error) bool {
+	switch e.Code {
+	case "node_quiesced":
+		return target == ErrNodeQuiesced
+	case "sync_in_progress":
+		return target == ErrSyncInProgress
+	case "promotion_sequence_mismatch":
+		return target == ErrPromotionSequenceMismatch
+	case "promotion_source_mismatch":
+		return target == ErrPromotionSourceMismatch
+	case "promotion_record_invalid":
+		return target == ErrPromotionRecordInvalid
+	case "already_promoted":
+		return target == ErrAlreadyPromoted
+	case "promotion_in_progress":
+		return target == ErrPromotionInProgress
+	case "promotion_not_ready":
+		return target == ErrPromotionNotReady
+	case "quiesce_failed_fenced":
+		return target == ErrQuiesceFailedFenced
+	}
+	return false
 }
 
 // explainPutRequest is the JSON body for POST /explain/put.
@@ -323,6 +376,21 @@ type ReplicationStatusResponse struct {
 
 	// Promotion state (follower only, or "promoted" after promotion).
 	PromotionState string `json:"promotion_state,omitempty"`
+
+	// Promotion detail fields (populated after promotion from follower → primary).
+	PromotionSourceNodeID    string `json:"promotion_source_node_id,omitempty"`
+	PromotionSourceBaseURL   string `json:"promotion_source_base_url,omitempty"`
+	InheritedLastSeq         uint64 `json:"inherited_last_seq,omitempty"`
+	PromotedAt               string `json:"promoted_at,omitempty"`
+	PromotionDurableCommitted bool   `json:"promotion_durable_committed,omitempty"`
+
+	// Pending quiesce detail (non-empty when quiesce_state == "quiesce_failed_fenced").
+	PendingQuiesceID  string `json:"pending_quiesce_id,omitempty"`
+	PendingQuiesceSeq uint64 `json:"pending_quiesce_seq,omitempty"`
+
+	// QuiesceIntentState indicates that a quiesce intent record is durably written but the
+	// final QuiesceRecord has not been committed yet. Values: "" (none) or "active".
+	QuiesceIntentState string `json:"quiesce_intent_state,omitempty"`
 }
 
 // ExplainPutResponse is the JSON body returned by POST /explain/put.

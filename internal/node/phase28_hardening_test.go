@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -200,11 +201,19 @@ func TestHardening_PromotionBarrier_BlocksSyncFromPrimary(t *testing.T) {
 	}
 }
 
-// ── 7. promotionBarrier double-check — slip-through test ─────────────────────────
+// ── 7. promotionBarrier — all three barrier checks reject sync ────────────────────
+//
+// SyncFromPrimary has three barrier check points:
+//   (a) before CAS — fast reject for new calls when barrier is already set
+//   (b) after CAS — catches the window between first check and CAS
+//   (c) inside RLock — catches syncs that waited for WLock while promotion committed
+//
+// Setting barrier before calling SyncFromPrimary exercises check (a). Checks (b) and
+// (c) are exercised via the replicationMutationMu: if promotion holds WLock and a sync
+// passes both pre-RLock checks, the third check inside RLock will reject it.
+// This test verifies the deterministic case: barrier set → all checks reject → no error leaks.
 
 func TestHardening_PromotionBarrier_PostCAS_DoubleCheck(t *testing.T) {
-	// This tests that even if a sync CAS'd syncInProgress before the barrier was set,
-	// the double-check after CAS catches the barrier and the sync aborts.
 	primary := p28Primary(t)
 	if err := primary.StartBackground(); err != nil {
 		t.Fatalf("start primary: %v", err)
@@ -215,9 +224,8 @@ func TestHardening_PromotionBarrier_PostCAS_DoubleCheck(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	// Simulate: CAS succeeds but barrier is immediately set.
+	// Raise the barrier. SyncFromPrimary should be rejected at the first check.
 	follower.syncInProgress.Store(false)
-	// Set barrier AFTER the moment when CAS would have checked it.
 	follower.promotionBarrier.Store(true)
 	defer follower.promotionBarrier.Store(false)
 
@@ -522,38 +530,90 @@ func TestHardening_OrphanBaseline_FollowerStartsNormally(t *testing.T) {
 }
 
 // ── 14. promoteMu serializes concurrent promotion attempts ───────────────────────
+//
+// This test verifies that when two goroutines race to promote a FRESH follower
+// simultaneously, promoteMu ensures exactly one is the initial committer and the
+// other sees the already-promoted state and returns idempotent.
 
 func TestHardening_ConcurrentPromote_OnlyOneCommits(t *testing.T) {
-	_, follower, qResp, _, _ := p28PromoteFlow(t)
+	primary := p28Primary(t)
+	if err := primary.StartBackground(); err != nil {
+		t.Fatalf("start primary: %v", err)
+	}
 
-	// Build a valid promote request using the same quiesce_id.
+	// Write 2 entries and quiesce.
+	p28Req(t, primary, "PUT", "/kv/k1", `{"value":"v1"}`)
+	p28Req(t, primary, "PUT", "/kv/k2", `{"value":"v2"}`)
+
+	follower := p28Follower(t, primary.Addr(), t.TempDir())
+	if err := follower.StartBackground(); err != nil {
+		t.Fatalf("start follower: %v", err)
+	}
+
+	// Wait for follower to catch up.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadUint64(&follower.lastApplied) >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if atomic.LoadUint64(&follower.lastApplied) < 2 {
+		t.Fatal("follower did not catch up")
+	}
+
+	// Quiesce primary.
+	qRec := p28Req(t, primary, "POST", "/replication/quiesce", "")
+	if qRec.Code != 200 {
+		t.Fatalf("quiesce: %d", qRec.Code)
+	}
+	var qResp QuiesceResponse
+	json.Unmarshal(qRec.Body.Bytes(), &qResp)
+
+	// Build a valid promote request for the FRESH follower (first-ever promotion).
 	qr := replnet.QuiesceRecord{
 		Version: 1, QuiesceID: qResp.QuiesceID, PrimaryNodeID: "p28-primary",
-		PrimaryBaseURL: "http://127.0.0.1:1", PrimaryLatestSeq: qResp.PrimaryLatestSeq,
+		PrimaryBaseURL: "http://" + primary.Addr(), PrimaryLatestSeq: qResp.PrimaryLatestSeq,
 		QuiescedAt: qResp.QuiescedAt,
 	}
 	qr.Checksum = replnet.QuiesceChecksum(&qr)
 	body, _ := json.Marshal(PromoteRequest{QuiesceRecord: qr, ConfirmOldPrimaryStopped: true})
 
-	// Send two concurrent promote requests — both should succeed idempotently.
-	codes := make([]int, 2)
+	// Race 2 goroutines to be the initial committer. promoteMu guarantees that only one
+	// reaches the commit point; the second observes the already-promoted state.
+	const n = 2
+	codes := make([]int, n)
+	resps := make([]PromoteResponse, n)
 	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
+	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			rec := p28Req(t, follower, "POST", "/replication/promote", string(body))
 			codes[i] = rec.Code
+			json.Unmarshal(rec.Body.Bytes(), &resps[i])
 		}(i)
 	}
 	wg.Wait()
 
 	for i, code := range codes {
 		if code != 200 {
-			t.Errorf("goroutine %d: expected 200, got %d", i, code)
+			t.Errorf("goroutine %d: expected 200, got %d: %s", i, code, "")
 		}
 	}
-	// Node must be primary exactly once.
+
+	// Exactly one must be non-idempotent (the initial commit); the other is idempotent.
+	nonIdempotent := 0
+	for _, r := range resps {
+		if !r.Idempotent {
+			nonIdempotent++
+		}
+	}
+	if nonIdempotent != 1 {
+		t.Errorf("expected exactly 1 non-idempotent commit, got %d", nonIdempotent)
+	}
+
+	// Node must be primary.
 	if follower.runtimeRole != "primary" {
 		t.Errorf("expected primary role, got %q", follower.runtimeRole)
 	}
@@ -753,5 +813,185 @@ func TestHardening_Client_ReplicationStatus_Phase28Fields(t *testing.T) {
 	}
 	if resp.LocalRoleSource != "config" {
 		t.Errorf("LocalRoleSource: %q", resp.LocalRoleSource)
+	}
+}
+
+// ── 21. Quiesce intent — normal flow removes intent file ─────────────────────────
+
+func TestHardening_QuiesceIntent_NormalFlow_IntentFileRemoved(t *testing.T) {
+	srv := p28PrimaryRunning(t)
+
+	rec := p28Req(t, srv, "POST", "/replication/quiesce", "")
+	if rec.Code != 200 {
+		t.Fatalf("quiesce: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// After a successful quiesce, the intent file must be removed.
+	if replnet.QuiesceIntentExists(srv.opts.DataDir) {
+		t.Error("quiesce_intent.json should be removed after successful quiesce")
+	}
+	// The final record must exist.
+	if !replnet.QuiesceRecordExists(srv.opts.DataDir) {
+		t.Error("quiesce_record.json should exist after successful quiesce")
+	}
+}
+
+// ── 22. Quiesce intent — startup with intent-only restores fence ──────────────────
+
+func TestHardening_QuiesceIntent_StartupIntentOnly_RestoresFence(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write a quiesce intent without a final quiesce record.
+	// This simulates a crash between SaveQuiesceIntent and writeGate.Quiesce.
+	intent := &replnet.QuiesceIntentRecord{
+		Version:        1,
+		QuiesceID:      "crash-intent-id",
+		PrimaryNodeID:  "primary",
+		PrimaryBaseURL: "http://127.0.0.1:9999",
+		IntentAt:       "2026-01-01T00:00:00Z",
+	}
+	if err := replnet.SaveQuiesceIntent(dir, intent); err != nil {
+		t.Fatalf("SaveQuiesceIntent: %v", err)
+	}
+	// No quiesce_record.json.
+
+	srv, err := Open(Options{
+		NodeID:  "primary",
+		Addr:    "127.0.0.1:0",
+		DataDir: dir,
+		Replication: ReplicationOptions{
+			Role: replnet.RolePrimary,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open with intent-only: %v", err)
+	}
+	defer srv.Close()
+
+	st := srv.runtimeState()
+	// Writes must be fenced — quiesce_failed_fenced state.
+	if st.quiesceState != "quiesce_failed_fenced" {
+		t.Errorf("expected quiesce_failed_fenced, got %q", st.quiesceState)
+	}
+	// Pending record must carry the original quiesce ID.
+	if st.pendingQuiesceRecord == nil || st.pendingQuiesceRecord.QuiesceID != "crash-intent-id" {
+		t.Errorf("pendingQuiesceRecord has wrong ID: %v", st.pendingQuiesceRecord)
+	}
+	// Write gate must be closed.
+	if err := srv.writeGate.Enter(); !errors.Is(err, ErrNodeQuiesced) {
+		t.Errorf("expected write gate to be closed (ErrNodeQuiesced), got: %v", err)
+	}
+}
+
+// ── 23. Quiesce intent — startup with intent+final removes stale intent ───────────
+
+func TestHardening_QuiesceIntent_StartupIntentPlusFinal_CleansUp(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write intent and final quiesce record with matching quiesce IDs.
+	// This simulates a crash between SaveQuiesceRecord and RemoveQuiesceIntent.
+	intent := &replnet.QuiesceIntentRecord{
+		Version:        1,
+		QuiesceID:      "matching-id",
+		PrimaryNodeID:  "primary",
+		PrimaryBaseURL: "http://127.0.0.1:9999",
+		IntentAt:       "2026-01-01T00:00:00Z",
+	}
+	if err := replnet.SaveQuiesceIntent(dir, intent); err != nil {
+		t.Fatalf("SaveQuiesceIntent: %v", err)
+	}
+	finalRec := &replnet.QuiesceRecord{
+		Version:          1,
+		QuiesceID:        "matching-id",
+		PrimaryNodeID:    "primary",
+		PrimaryBaseURL:   "http://127.0.0.1:9999",
+		PrimaryLatestSeq: 5,
+		QuiescedAt:       "2026-01-01T00:00:01Z",
+	}
+	finalRec.Checksum = replnet.QuiesceChecksum(finalRec)
+	if err := replnet.SaveQuiesceRecord(dir, finalRec); err != nil {
+		t.Fatalf("SaveQuiesceRecord: %v", err)
+	}
+
+	srv, err := Open(Options{
+		NodeID:  "primary",
+		Addr:    "127.0.0.1:0",
+		DataDir: dir,
+		Replication: ReplicationOptions{
+			Role: replnet.RolePrimary,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open with intent+final: %v", err)
+	}
+	defer srv.Close()
+
+	st := srv.runtimeState()
+	// Node should be fully quiesced — not in failed-fenced state.
+	if st.quiesceState != "quiesced" {
+		t.Errorf("expected quiesced, got %q", st.quiesceState)
+	}
+	if st.quiesceRecord == nil || st.quiesceRecord.QuiesceID != "matching-id" {
+		t.Errorf("quiesceRecord: %v", st.quiesceRecord)
+	}
+	// Intent file must have been cleaned up.
+	if replnet.QuiesceIntentExists(dir) {
+		t.Error("quiesce_intent.json should be removed after startup with matching intent+final")
+	}
+}
+
+// ── 24. HTTPStatusError — errors.Is maps stable codes to sentinels ───────────────
+
+func TestHardening_HTTPStatusError_ErrorsIs_StableCodes(t *testing.T) {
+	cases := []struct {
+		code      string
+		sentinel  error
+	}{
+		{"node_quiesced", ErrNodeQuiesced},
+		{"sync_in_progress", ErrSyncInProgress},
+		{"promotion_sequence_mismatch", ErrPromotionSequenceMismatch},
+		{"promotion_source_mismatch", ErrPromotionSourceMismatch},
+		{"promotion_record_invalid", ErrPromotionRecordInvalid},
+		{"already_promoted", ErrAlreadyPromoted},
+		{"promotion_in_progress", ErrPromotionInProgress},
+		{"promotion_not_ready", ErrPromotionNotReady},
+		{"quiesce_failed_fenced", ErrQuiesceFailedFenced},
+	}
+	for _, tc := range cases {
+		err := &HTTPStatusError{StatusCode: 409, Code: tc.code, Message: "msg"}
+		if !errors.Is(err, tc.sentinel) {
+			t.Errorf("code %q: errors.Is(%v) returned false", tc.code, tc.sentinel)
+		}
+	}
+	// Unknown code should not match any sentinel.
+	unknownErr := &HTTPStatusError{StatusCode: 500, Code: "unknown_code", Message: "msg"}
+	if errors.Is(unknownErr, ErrNodeQuiesced) {
+		t.Error("unknown code should not match ErrNodeQuiesced")
+	}
+}
+
+// ── 25. Promoted primary status includes detail fields ───────────────────────────
+
+func TestHardening_ReplicationStatus_AfterPromotion_DetailFields(t *testing.T) {
+	_, follower, _, pResp, _ := p28PromoteFlow(t)
+
+	rec := p28Req(t, follower, "GET", "/replication/status", "")
+	var resp ReplicationStatusResponse
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+
+	if resp.PromotionState != "promoted" {
+		t.Errorf("promotion_state: %q", resp.PromotionState)
+	}
+	if !resp.PromotionDurableCommitted {
+		t.Error("promotion_durable_committed should be true")
+	}
+	if resp.PromotionSourceNodeID != "p28-primary" {
+		t.Errorf("promotion_source_node_id: %q", resp.PromotionSourceNodeID)
+	}
+	if resp.InheritedLastSeq != pResp.InheritedLastSeq {
+		t.Errorf("inherited_last_seq: got %d, want %d", resp.InheritedLastSeq, pResp.InheritedLastSeq)
+	}
+	if resp.PromotedAt == "" {
+		t.Error("promoted_at should be set")
 	}
 }

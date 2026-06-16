@@ -108,11 +108,7 @@ func (s *Server) handleKVPut(w http.ResponseWriter, r *http.Request, key []byte)
 	}
 	if s.writeGate != nil {
 		if err := s.writeGate.Enter(); err != nil {
-			writeJSON(w, http.StatusConflict, map[string]any{
-				"error":   "node_quiesced",
-				"message": "node is write-quiesced",
-				"node_id": s.opts.NodeID,
-			})
+			s.writeJSONError(w, http.StatusConflict, "node_quiesced", "node is write-quiesced")
 			return
 		}
 		defer s.writeGate.Exit()
@@ -155,11 +151,7 @@ func (s *Server) handleKVDelete(w http.ResponseWriter, r *http.Request, key []by
 	}
 	if s.writeGate != nil {
 		if err := s.writeGate.Enter(); err != nil {
-			writeJSON(w, http.StatusConflict, map[string]any{
-				"error":   "node_quiesced",
-				"message": "node is write-quiesced",
-				"node_id": s.opts.NodeID,
-			})
+			s.writeJSONError(w, http.StatusConflict, "node_quiesced", "node is write-quiesced")
 			return
 		}
 		defer s.writeGate.Exit()
@@ -265,6 +257,24 @@ func (s *Server) handleReplicationStatus(w http.ResponseWriter, r *http.Request)
 			resp.QuiescedAt = st.quiesceRecord.QuiescedAt
 			resp.QuiescedLatestSeq = st.quiesceRecord.PrimaryLatestSeq
 		}
+		// Pending quiesce fields (quiesce_failed_fenced state).
+		if st.pendingQuiesceRecord != nil {
+			resp.PendingQuiesceID = st.pendingQuiesceRecord.QuiesceID
+			resp.PendingQuiesceSeq = st.pendingQuiesceRecord.PrimaryLatestSeq
+		}
+		// Quiesce intent field.
+		if st.quiesceIntentActive {
+			resp.QuiesceIntentState = "active"
+		}
+	}
+
+	// Promotion detail fields (populated after successful promotion).
+	if st.promotionState == "promoted" && st.promotionRecord != nil {
+		resp.PromotionSourceNodeID = st.promotionRecord.SourcePrimaryNodeID
+		resp.PromotionSourceBaseURL = st.promotionRecord.SourcePrimaryBaseURL
+		resp.InheritedLastSeq = st.promotionRecord.InheritedLastSeq
+		resp.PromotedAt = st.promotionRecord.PromotedAt
+		resp.PromotionDurableCommitted = true
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -337,6 +347,8 @@ func (s *Server) handleReplicationLog(w http.ResponseWriter, r *http.Request) {
 
 // handleReplicationApply serves POST /replication/apply.
 // Only valid on follower nodes. Primary and standalone nodes return 403.
+// Checks the promotionBarrier before and after acquiring replicationMutationMu.RLock
+// so that the apply cannot proceed or persist while promotion holds the WLock.
 func (s *Server) handleReplicationApply(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -347,6 +359,26 @@ func (s *Server) handleReplicationApply(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, http.StatusForbidden, "replication apply is only valid for follower nodes")
 		return
 	}
+
+	// Pre-lock barrier check: fast-reject if promotion has already begun.
+	if s.promotionBarrier.Load() {
+		s.writeJSONError(w, http.StatusConflict, "promotion_in_progress",
+			"promotion in progress: replication apply rejected")
+		return
+	}
+
+	// Acquire shared lock. handlePromote holds the exclusive WLock while committing.
+	s.replicationMutationMu.RLock()
+	defer s.replicationMutationMu.RUnlock()
+
+	// Post-lock barrier check: catches applies that passed the pre-lock check but
+	// had to wait while promotion held WLock (and cleared follower state).
+	if s.promotionBarrier.Load() {
+		s.writeJSONError(w, http.StatusConflict, "promotion_in_progress",
+			"promotion in progress: replication apply rejected")
+		return
+	}
+
 	var body struct {
 		Entries []replnet.Entry `json:"entries"`
 	}
@@ -702,12 +734,32 @@ func (s *Server) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 	}
 	baseURL := "http://" + addr
 
-	// Drain all in-flight writes by taking the exclusive write-gate lock.
+	// Step 2: Persist the quiesce intent BEFORE closing the write gate.
+	// This is the crash-safe fence: if the node crashes after intent write but before
+	// the final quiesce record, startup will restore the fence rather than silently
+	// restoring writes. See resolveRuntimeRole for startup recovery rules.
+	intent := &replnet.QuiesceIntentRecord{
+		Version:        1,
+		QuiesceID:      qID,
+		PrimaryNodeID:  s.opts.NodeID,
+		PrimaryBaseURL: baseURL,
+		IntentAt:       time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := replnet.SaveQuiesceIntent(s.opts.DataDir, intent); err != nil {
+		s.writeJSONError(w, http.StatusInternalServerError, "quiesce_persistence_failed",
+			"quiesce intent persistence failed: "+err.Error())
+		return
+	}
+	s.mu.Lock()
+	s.quiesceIntentActive = true
+	s.mu.Unlock()
+
+	// Step 3: Drain all in-flight writes by taking the exclusive write-gate lock.
 	// After this returns, all concurrent write handlers have exited and no new write
 	// can enter (Enter() will return ErrNodeQuiesced).
 	s.writeGate.Quiesce()
 
-	// Snapshot the final committed sequence after the gate is closed.
+	// Step 4–5: Snapshot the final committed sequence and persist the quiesce record.
 	var latestSeq uint64
 	if s.durableLog != nil {
 		latestSeq = s.durableLog.LatestSeq()
@@ -721,13 +773,14 @@ func (s *Server) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 		PrimaryLatestSeq: latestSeq,
 		QuiescedAt:       time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	// Stamp the checksum.
 	rec.Checksum = replnet.QuiesceChecksum(rec)
 
 	if err := replnet.SaveQuiesceRecord(s.opts.DataDir, rec); err != nil {
-		// The write gate is closed (writes rejected) but the record is not durable.
+		// The write gate is closed (writes rejected) but the final record is not durable.
 		// Enter quiesce_failed_fenced: preserve the pending record so the next retry
 		// reuses the same QuiesceID rather than generating a new one.
+		// Note: quiesceIntentActive remains true — the intent is still on disk and
+		// protects the fence on restart.
 		s.mu.Lock()
 		s.quiesceState = "quiesce_failed_fenced"
 		s.pendingQuiesceRecord = rec
@@ -737,9 +790,14 @@ func (s *Server) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Step 6: Remove the intent file (crash-safe: intent without final → quiesce_failed_fenced on restart).
+	// Ignore removal errors — a stale intent with a matching final record is handled safely on startup.
+	_ = replnet.RemoveQuiesceIntent(s.opts.DataDir)
+
 	s.mu.Lock()
 	s.quiesceRecord = rec
 	s.quiesceState = "quiesced"
+	s.quiesceIntentActive = false
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, QuiesceResponse{
@@ -848,27 +906,19 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 		s.bgWorker.stop()
 	}
 
-	// Drain any in-flight SyncFromPrimary. The barrier prevents new ones from starting;
-	// this loop waits for the one that may have slipped through before the barrier.
-	drainDeadline := time.Now().Add(5 * time.Second)
-	for s.syncInProgress.Load() {
-		if time.Now().After(drainDeadline) {
-			// Revert: pre-commit failure, safe to unwind.
-			s.promotionBarrier.Store(false)
-			s.mu.Lock()
-			s.promotionState = ""
-			s.mu.Unlock()
-			s.writeJSONError(w, http.StatusConflict, "sync_in_progress",
-				"timed out waiting for in-flight sync to complete before promotion")
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	// Acquire exclusive replication mutex. This blocks until any in-flight SyncFromPrimary
+	// or handleReplicationApply releases its RLock. No polling, no timeout — the WLock
+	// guarantees mutual exclusion with the third barrier check inside each RLock holder.
+	s.replicationMutationMu.Lock()
 
 	// Execute the crash-consistent two-phase commit:
 	//   phase 1: journal baseline (idempotent — orphan baseline is safe on crash)
 	//   phase 2: promotion record (commit point — restart recovers as primary)
 	resp, err := s.executePromotion(&req)
+
+	// Release the exclusive lock before any further state changes or I/O.
+	s.replicationMutationMu.Unlock()
+
 	if err != nil {
 		// Check whether the commit point (promotion record) was written.
 		// If yes: post-commit failure — do NOT revert; node recovers as primary on restart.
@@ -883,6 +933,19 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.promotionState = ""
 		s.mu.Unlock()
+
+		// Restart the background sync worker if it was configured. The worker was stopped
+		// above to block syncs during the promotion attempt; since promotion did not commit,
+		// the follower must resume automatic background replication.
+		if s.opts.Replication.BackgroundSync.Enabled {
+			worker := newBackgroundSyncWorker(s.opts.Replication.BackgroundSync, s.SyncFromPrimary)
+			if startErr := worker.start(); startErr == nil {
+				s.mu.Lock()
+				s.bgWorker = worker
+				s.mu.Unlock()
+			}
+		}
+
 		s.writeJSONError(w, http.StatusInternalServerError, "promotion_failed",
 			"promotion failed (pre-commit, reverted to follower): "+err.Error())
 		return

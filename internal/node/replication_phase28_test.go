@@ -564,7 +564,9 @@ func TestPhase28_Promote_FollowerBehind_Integration_Rejected(t *testing.T) {
 	}
 }
 
-func TestPhase28_Promote_ActiveSync_Rejected(t *testing.T) {
+func TestPhase28_Promote_SyncFlagSet_SucceedsViaMutex(t *testing.T) {
+	// The replicationMutationMu WLock (not the syncInProgress flag) gates promotion.
+	// Promote must succeed when syncInProgress is set but no real RLock is held.
 	primary := p28Primary(t)
 	if err := primary.StartBackground(); err != nil {
 		t.Fatalf("start primary: %v", err)
@@ -582,8 +584,8 @@ func TestPhase28_Promote_ActiveSync_Rejected(t *testing.T) {
 	qr.Checksum = replnet.QuiesceChecksum(qr)
 	body, _ := json.Marshal(PromoteRequest{QuiesceRecord: *qr, ConfirmOldPrimaryStopped: true})
 	rec := p28Req(t, follower, "POST", "/replication/promote", string(body))
-	if rec.Code != 400 {
-		t.Errorf("expected 400, got %d", rec.Code)
+	if rec.Code != 200 {
+		t.Errorf("expected 200 (WLock handles concurrency), got %d", rec.Code)
 	}
 }
 

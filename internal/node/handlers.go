@@ -885,7 +885,7 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate all 17 preconditions before touching any durable state.
+	// Validate all 16 preconditions before touching any durable state.
 	if err := s.validatePromotionPreconditions(&req); err != nil {
 		status, code := promotionErrorToHTTP(err)
 		s.writeJSONError(w, status, code, err.Error())
@@ -1024,11 +1024,6 @@ func (s *Server) validatePromotionPreconditions(req *PromoteRequest) error {
 	if qr.PrimaryLatestSeq > 0 && followerSeq == 0 {
 		return fmt.Errorf("%w: primary had entries (seq=%d) but follower applied none",
 			ErrPromotionSequenceMismatch, qr.PrimaryLatestSeq)
-	}
-
-	// 13. No sync in progress.
-	if s.syncInProgress.Load() {
-		return fmt.Errorf("%w: sync is currently in progress", ErrPromotionNotReady)
 	}
 
 	// 16. quiesced_at is a valid RFC3339 timestamp.

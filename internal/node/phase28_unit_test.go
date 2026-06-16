@@ -989,7 +989,10 @@ func TestServer_Promote_WorkerIsStoppedAfterPromotion(t *testing.T) {
 	}
 }
 
-func TestServer_Promote_ActiveManualSync_Rejected(t *testing.T) {
+func TestServer_Promote_SyncFlagSet_SucceedsViaMutex(t *testing.T) {
+	// The replicationMutationMu WLock (not the syncInProgress flag) is the authoritative
+	// gate for promotion. When syncInProgress is set but no real RLock is held, promote
+	// must succeed — the WLock acquires immediately and the two-phase commit proceeds.
 	primary := p28Primary(t)
 	if err := primary.StartBackground(); err != nil {
 		t.Fatalf("start primary: %v", err)
@@ -1001,7 +1004,8 @@ func TestServer_Promote_ActiveManualSync_Rejected(t *testing.T) {
 	}
 	time.Sleep(300 * time.Millisecond)
 
-	// Simulate a sync in progress.
+	// Set the syncInProgress flag without actually holding a replicationMutationMu RLock.
+	// Promote must still succeed because the WLock is the real concurrency gate.
 	follower.syncInProgress.Store(true)
 	defer follower.syncInProgress.Store(false)
 
@@ -1010,7 +1014,7 @@ func TestServer_Promote_ActiveManualSync_Rejected(t *testing.T) {
 	body, _ := json.Marshal(PromoteRequest{QuiesceRecord: *qr, ConfirmOldPrimaryStopped: true})
 
 	rec := p28Req(t, follower, "POST", "/replication/promote", string(body))
-	if rec.Code != 400 {
-		t.Errorf("expected 400 for active sync, got %d, body: %s", rec.Code, rec.Body.String())
+	if rec.Code != 200 {
+		t.Errorf("expected 200 (WLock handles concurrency), got %d, body: %s", rec.Code, rec.Body.String())
 	}
 }

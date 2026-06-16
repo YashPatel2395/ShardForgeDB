@@ -179,40 +179,46 @@ explicit, auditable action).
 11. Follower's last_applied_seq == quiesce record primary_latest_seq (exact match).
 12. Follower's last_applied_seq > 0 OR quiesce record primary_latest_seq == 0
     (follower must have applied at least one entry if primary had entries).
-13. No sync is currently in progress (syncInProgress flag is false).
-14. No promotion is currently in progress (promotionState != "promoting").
-15. Background sync worker is stoppable (not in a state that would interfere).
-16. Quiesce record quiesced_at is a valid RFC3339 timestamp.
-17. Node ID is non-empty.
+13. No promotion is currently in progress (promotionState != "promoting").
+14. Background sync worker is stoppable (not in a state that would interfere).
+15. Quiesce record quiesced_at is a valid RFC3339 timestamp.
+16. Node ID is non-empty.
 
 ## 12. Background-Worker Shutdown and Promotion Barrier
 
 Before the role switch, the follower must safely stop all replication activity:
 
 1. Acquire `promoteMu` — serializes concurrent promotion attempts.
-2. Set `promotionBarrier atomic.Bool` to `true` — signals `SyncFromPrimary` to abort.
-3. Drain active `SyncFromPrimary` calls: spin until `syncInProgress` is false, with
-   a 5-second timeout.
+2. Validate all 16 preconditions (static checks only — no lock held yet).
+3. Set `promotionBarrier atomic.Bool` to `true` — signals `SyncFromPrimary` to abort.
 4. Stop the background sync worker (`bgWorker.stop()`).
-5. Proceed with promotion commit.
+5. Acquire `replicationMutationMu` write-lock — blocks until any in-flight
+   `SyncFromPrimary` or `handleReplicationApply` releases its read-lock.
+6. Execute the two-phase commit (journal baseline + promotion record).
+7. Release the write-lock.
 
-**Double-check barrier**: `SyncFromPrimary` checks `promotionBarrier` before AND
-after acquiring `syncInProgress`. This prevents a sync that starts concurrently
-just before step 2 from slipping through:
+**Triple barrier**: `SyncFromPrimary` checks `promotionBarrier` at three points —
+before the `syncInProgress` CAS, after the CAS, and inside the `RLock` — so no
+sync can slip through once the barrier is raised:
 
 ```
-if s.promotionBarrier.Load() { return error }   // pre-CAS check
+if s.promotionBarrier.Load() { return error }               // pre-CAS check 1
 if !s.syncInProgress.CompareAndSwap(false, true) { return ErrSyncInProgress }
 defer s.syncInProgress.Store(false)
-if s.promotionBarrier.Load() { return error }   // post-CAS double-check
+if s.promotionBarrier.Load() { return error }               // post-CAS check 2
+s.replicationMutationMu.RLock()
+defer s.replicationMutationMu.RUnlock()
+if s.promotionBarrier.Load() { return error }               // inside RLock check 3
 ```
+
+The `RLock` + `RUnlock` mechanism (not the `syncInProgress` flag) is the
+authoritative mutual-exclusion gate between syncs and promotions.
 
 ## 13. Manual-Sync Concurrency Behavior
 
-During promotion, `syncInProgress` is checked as a precondition (check 13). If a
-sync is in flight, promotion is rejected with `ErrPromotionNotReady`. After
-promotion completes, the follower-to-primary role switch means
-`POST /replication/sync` returns an error ("not a follower").
+After promotion, the follower-to-primary role switch means
+`POST /replication/sync` returns an error ("not a follower"). Any sync that was
+in flight when the barrier was raised exits via check 2 or check 3 above.
 
 ## 14. Promotion Persistence Ordering
 

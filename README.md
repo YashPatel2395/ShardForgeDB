@@ -8,7 +8,7 @@ An **explainable** Go database engine for key-value and vector search workloads,
 > Phase 26 makes replication state durable: primary binary journal (`replication.journal`) and follower cursor (`replication_state.json`) survive process restarts. Replication gap detection added (HTTP 409).
 > Phase 25 adds a reproducible leader+follower HTTP replication demo: explicit pull via `POST /replication/sync`, PUT+DELETE replication proven, idempotent pull proven, follower write-rejection proven.
 >
-> **1259 race-safe tests. 120+ reproducible benchmarks. All 28 phases complete.**
+> **1264 race-safe tests. 120+ reproducible benchmarks. All 28 phases complete.**
 
 ---
 

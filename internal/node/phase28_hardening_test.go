@@ -944,8 +944,8 @@ func TestHardening_QuiesceIntent_StartupIntentPlusFinal_CleansUp(t *testing.T) {
 
 func TestHardening_HTTPStatusError_ErrorsIs_StableCodes(t *testing.T) {
 	cases := []struct {
-		code      string
-		sentinel  error
+		code     string
+		sentinel error
 	}{
 		{"node_quiesced", ErrNodeQuiesced},
 		{"sync_in_progress", ErrSyncInProgress},

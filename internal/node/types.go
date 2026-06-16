@@ -253,7 +253,7 @@ type scanResponse struct {
 // errorResponse is returned on any handler error.
 type errorResponse struct {
 	Error  string `json:"error"`
-	Code   string `json:"code,omitempty"`   // stable machine-readable code (Phase 28+)
+	Code   string `json:"code,omitempty"` // stable machine-readable code (Phase 28+)
 	NodeID string `json:"node_id,omitempty"`
 }
 
@@ -378,10 +378,10 @@ type ReplicationStatusResponse struct {
 	PromotionState string `json:"promotion_state,omitempty"`
 
 	// Promotion detail fields (populated after promotion from follower → primary).
-	PromotionSourceNodeID    string `json:"promotion_source_node_id,omitempty"`
-	PromotionSourceBaseURL   string `json:"promotion_source_base_url,omitempty"`
-	InheritedLastSeq         uint64 `json:"inherited_last_seq,omitempty"`
-	PromotedAt               string `json:"promoted_at,omitempty"`
+	PromotionSourceNodeID     string `json:"promotion_source_node_id,omitempty"`
+	PromotionSourceBaseURL    string `json:"promotion_source_base_url,omitempty"`
+	InheritedLastSeq          uint64 `json:"inherited_last_seq,omitempty"`
+	PromotedAt                string `json:"promoted_at,omitempty"`
 	PromotionDurableCommitted bool   `json:"promotion_durable_committed,omitempty"`
 
 	// Pending quiesce detail (non-empty when quiesce_state == "quiesce_failed_fenced").

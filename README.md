@@ -2,13 +2,13 @@
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer toward a real distributed system. Every phase is strictly documented, tested, and benchmarked. Every claim is audited.
 
-> **Phase 28 — Manual Promotion and Controlled Failover (Hardening Pass 2).** Phases 1–27 locked; Phase 28 implemented and under final review.
-> Phase 28 adds operator-controlled planned failover: `POST /replication/quiesce` write-fences a primary; `POST /replication/promote` promotes a follower. Hardening pass 2 adds: durable quiesce-intent record (crash-safe fence before gate close), `replicationMutationMu` (replaces 5s drain poll), typed `HTTPStatusError` with `errors.Is` sentinel mapping, consistent `node_quiesced` error codes across all KV handlers, startup cross-validation of promotion record vs replication state, background-sync worker restart on pre-commit promotion failure, and 5 new deterministic tests. 1264 total tests.
+> **Phase 28 — Manual Promotion and Controlled Failover (Hardening Pass 3).** Phases 1–27 locked; Phase 28 implemented and under final review.
+> Phase 28 adds operator-controlled planned failover: `POST /replication/quiesce` write-fences a primary; `POST /replication/promote` promotes a follower. Hardening pass 3 adds: cursor re-validation under exclusive WLock, split `ApplyReplicationEntries` (public guarded + private locked), startup failure on replication-state store errors, `journalCompatibilityCheck` stat-first error propagation, atomic bgWorker restart helper, typed `ErrPromotionInProgress` from all 3 barrier returns (HTTP 409), quiesce retry intent cleanup, real stop-before-promote integration test, and bgEnabled race fix. 1282 total tests.
 > Phase 27 adds automatic background pull replication: configurable goroutine polls primary every 500ms, exponential backoff, bounded jitter, lag tracking (`lag_entries`, `lag_known`), terminal gap detection. No Raft, no automatic failover.
 > Phase 26 makes replication state durable: primary binary journal (`replication.journal`) and follower cursor (`replication_state.json`) survive process restarts. Replication gap detection added (HTTP 409).
 > Phase 25 adds a reproducible leader+follower HTTP replication demo: explicit pull via `POST /replication/sync`, PUT+DELETE replication proven, idempotent pull proven, follower write-rejection proven.
 >
-> **1264 race-safe tests. 120+ reproducible benchmarks. All 28 phases complete.**
+> **1282 race-safe tests. 120+ reproducible benchmarks. All 28 phases complete.**
 
 ---
 
@@ -561,7 +561,7 @@ make node-demo-down
 - [x] `internal/node/types.go` — `HTTPStatusError` with `Is()` mapping 9 stable codes to sentinels; `Code string` added to `errorResponse`; `ReplicationStatusResponse` extended with 8 new fields (`PromotionSourceNodeID`, `PromotionSourceBaseURL`, `InheritedLastSeq`, `PromotedAt`, `PromotionDurableCommitted`, `PendingQuiesceID`, `PendingQuiesceSeq`, `QuiesceIntentState`)
 - [x] `internal/node/client.go` — `doJSON` returns typed `*HTTPStatusError` on non-2xx (parses `code` field); `SyncReplication` uses same typed error
 - [x] `internal/node/phase28_hardening_test.go` — 31 hardening tests (added tests 21–25: quiesce intent normal flow, intent-only startup fence, intent+final cleanup, `HTTPStatusError.Is()`, promoted-primary detail fields); test 14 rewritten for true concurrent-first-commit race
-- [x] **1264 total tests (1259 Phase 28 pass-1 + 5 hardening pass-2 net-new)**
+- [x] **1282 total tests (1264 hardening pass-2 + 18 hardening pass-3 net-new)**
 - [x] **NOT automatic failover** — operator must stop old primary before calling promote
 - [x] **No distributed fencing** — quiesce write-fence is local to the primary process
 

@@ -8,7 +8,7 @@ The final target: **ShardForgeDB — a real explainable distributed database eng
 
 ---
 
-## Current state (Phases 1–27 complete)
+## Current state (Phases 1–28 complete)
 
 | Component | Status |
 |---|---|

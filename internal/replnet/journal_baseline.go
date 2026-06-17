@@ -126,20 +126,30 @@ func CreateJournalBaseline(dir string, baseSeq uint64) error {
 }
 
 // journalCompatibilityCheck verifies that an existing durable journal (if any) is
-// compatible with the requested baseSeq. Returns nil if the journal does not exist,
-// is empty, or its first entry seq equals baseSeq+1. Returns ErrJournalIncompatible
-// if a non-empty journal's first entry disagrees.
+// compatible with the requested baseSeq.
+//
+// Compatibility rules:
+//   - Journal file absent → compatible (nil)
+//   - Journal file empty → compatible (nil)
+//   - Journal first_seq == baseSeq+1 → compatible (nil)
+//   - Journal first_seq != baseSeq+1 → ErrJournalIncompatible
+//   - OpenDurableLog fails (corrupt, permission error, etc.) → propagate error
 func journalCompatibilityCheck(dir string, baseSeq uint64) error {
+	// Check if the journal file exists. An absent file is always compatible.
+	journalPath := filepath.Join(dir, journalFileName)
+	if _, statErr := os.Stat(journalPath); os.IsNotExist(statErr) {
+		return nil // no journal file — compatible by definition
+	}
+	// Journal file exists: open and inspect. Any open/replay failure is a real error
+	// (corruption, permission denied) and must not be silently treated as compatible.
 	dl, err := OpenDurableLog(dir)
 	if err != nil {
-		// No journal exists yet — compatible by definition.
-		return nil
+		return fmt.Errorf("open durable log for compatibility check: %w", err)
 	}
 	defer dl.Close()
 	firstSeq := dl.FirstAvailableSeq()
 	if firstSeq == 0 {
-		// Journal is empty — compatible.
-		return nil
+		return nil // empty journal — compatible
 	}
 	expectedFirst := baseSeq + 1
 	if firstSeq != expectedFirst {

@@ -347,8 +347,8 @@ func (s *Server) handleReplicationLog(w http.ResponseWriter, r *http.Request) {
 
 // handleReplicationApply serves POST /replication/apply.
 // Only valid on follower nodes. Primary and standalone nodes return 403.
-// Checks the promotionBarrier before and after acquiring replicationMutationMu.RLock
-// so that the apply cannot proceed or persist while promotion holds the WLock.
+// Uses the guarded ApplyReplicationEntries which checks promotionBarrier and holds
+// replicationMutationMu.RLock — no apply can proceed while promotion holds the WLock.
 func (s *Server) handleReplicationApply(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -357,25 +357,6 @@ func (s *Server) handleReplicationApply(w http.ResponseWriter, r *http.Request) 
 	}
 	if s.runtimeState().role != "follower" {
 		s.writeError(w, http.StatusForbidden, "replication apply is only valid for follower nodes")
-		return
-	}
-
-	// Pre-lock barrier check: fast-reject if promotion has already begun.
-	if s.promotionBarrier.Load() {
-		s.writeJSONError(w, http.StatusConflict, "promotion_in_progress",
-			"promotion in progress: replication apply rejected")
-		return
-	}
-
-	// Acquire shared lock. handlePromote holds the exclusive WLock while committing.
-	s.replicationMutationMu.RLock()
-	defer s.replicationMutationMu.RUnlock()
-
-	// Post-lock barrier check: catches applies that passed the pre-lock check but
-	// had to wait while promotion held WLock (and cleared follower state).
-	if s.promotionBarrier.Load() {
-		s.writeJSONError(w, http.StatusConflict, "promotion_in_progress",
-			"promotion in progress: replication apply rejected")
 		return
 	}
 
@@ -388,6 +369,11 @@ func (s *Server) handleReplicationApply(w http.ResponseWriter, r *http.Request) 
 	}
 	lastSeq, err := s.ApplyReplicationEntries(body.Entries)
 	if err != nil {
+		if errors.Is(err, ErrPromotionInProgress) {
+			s.writeJSONError(w, http.StatusConflict, "promotion_in_progress",
+				"promotion in progress: replication apply rejected")
+			return
+		}
 		s.writeError(w, http.StatusUnprocessableEntity, "apply failed: "+err.Error())
 		return
 	}
@@ -559,6 +545,17 @@ func (s *Server) handleReplicationSync(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.SyncFromPrimary(r.Context())
 	if err != nil {
+		// ErrPromotionInProgress: promotion has raised the barrier; sync is rejected.
+		// Return 409 Conflict so the caller knows the follower is transitioning to primary.
+		if errors.Is(err, ErrPromotionInProgress) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"ok":      false,
+				"code":    "promotion_in_progress",
+				"node_id": s.opts.NodeID,
+				"error":   err.Error(),
+			})
+			return
+		}
 		// ErrSyncInProgress: a concurrent sync (background worker or another manual call)
 		// is already in flight. Return 409 Conflict so the caller can retry.
 		if errors.Is(err, ErrSyncInProgress) {
@@ -693,10 +690,19 @@ func (s *Server) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 				"quiesce record retry failed: "+err.Error())
 			return
 		}
+		// Intent cleanup: remove the intent file that was written in the original attempt.
+		// If removal fails, keep quiesceIntentActive=true and note it — the intent will be
+		// safely resolved at next startup (matching intent+final IDs → quiesced, cleanup done).
+		intentRemoved := replnet.RemoveQuiesceIntent(s.opts.DataDir) == nil
 		s.mu.Lock()
 		s.quiesceRecord = pending
 		s.quiesceState = "quiesced"
 		s.pendingQuiesceRecord = nil
+		if intentRemoved {
+			s.quiesceIntentActive = false
+		}
+		// If intent removal failed, quiesceIntentActive remains true.
+		// Status reports will show quiesce_intent_state = "cleanup_pending".
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, QuiesceResponse{
 			NodeID:           s.opts.NodeID,
@@ -911,6 +917,21 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 	// guarantees mutual exclusion with the third barrier check inside each RLock holder.
 	s.replicationMutationMu.Lock()
 
+	// Re-validate dynamic state while holding the exclusive WLock. This catches
+	// replication that applied entries between pre-barrier validation and WLock acquisition.
+	if lockedErr := s.validatePromotionPreconditionsLocked(&req); lockedErr != nil {
+		s.replicationMutationMu.Unlock()
+		// Pre-commit: revert barrier and state so the follower can resume.
+		s.promotionBarrier.Store(false)
+		s.mu.Lock()
+		s.promotionState = ""
+		s.mu.Unlock()
+		s.restartBackgroundWorkerAfterPromotionFailure()
+		status, code := promotionErrorToHTTP(lockedErr)
+		s.writeJSONError(w, status, code, lockedErr.Error())
+		return
+	}
+
 	// Execute the crash-consistent two-phase commit:
 	//   phase 1: journal baseline (idempotent — orphan baseline is safe on crash)
 	//   phase 2: promotion record (commit point — restart recovers as primary)
@@ -934,17 +955,7 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 		s.promotionState = ""
 		s.mu.Unlock()
 
-		// Restart the background sync worker if it was configured. The worker was stopped
-		// above to block syncs during the promotion attempt; since promotion did not commit,
-		// the follower must resume automatic background replication.
-		if s.opts.Replication.BackgroundSync.Enabled {
-			worker := newBackgroundSyncWorker(s.opts.Replication.BackgroundSync, s.SyncFromPrimary)
-			if startErr := worker.start(); startErr == nil {
-				s.mu.Lock()
-				s.bgWorker = worker
-				s.mu.Unlock()
-			}
-		}
+		s.restartBackgroundWorkerAfterPromotionFailure()
 
 		s.writeJSONError(w, http.StatusInternalServerError, "promotion_failed",
 			"promotion failed (pre-commit, reverted to follower): "+err.Error())
@@ -970,7 +981,7 @@ func promotionErrorToHTTP(err error) (int, string) {
 	}
 }
 
-// validatePromotionPreconditions runs all 17 promotion checks.
+// validatePromotionPreconditions runs static preconditions (structure and identities).
 func (s *Server) validatePromotionPreconditions(req *PromoteRequest) error {
 	qr := &req.QuiesceRecord
 
@@ -1013,19 +1024,6 @@ func (s *Server) validatePromotionPreconditions(req *PromoteRequest) error {
 			ErrPromotionRecordInvalid)
 	}
 
-	// 11. Follower's last_applied_seq == quiesce record primary_latest_seq.
-	followerSeq := atomic.LoadUint64(&s.lastApplied)
-	if followerSeq != qr.PrimaryLatestSeq {
-		return fmt.Errorf("%w: follower seq %d != quiesce seq %d",
-			ErrPromotionSequenceMismatch, followerSeq, qr.PrimaryLatestSeq)
-	}
-
-	// 12. Follower must have applied at least one entry if primary had entries.
-	if qr.PrimaryLatestSeq > 0 && followerSeq == 0 {
-		return fmt.Errorf("%w: primary had entries (seq=%d) but follower applied none",
-			ErrPromotionSequenceMismatch, qr.PrimaryLatestSeq)
-	}
-
 	// 16. quiesced_at is a valid RFC3339 timestamp.
 	if _, err := time.Parse(time.RFC3339Nano, qr.QuiescedAt); err != nil {
 		return fmt.Errorf("%w: invalid quiesced_at timestamp: %v", ErrPromotionRecordInvalid, err)
@@ -1034,6 +1032,55 @@ func (s *Server) validatePromotionPreconditions(req *PromoteRequest) error {
 	// 17. Node ID is non-empty.
 	if s.opts.NodeID == "" {
 		return fmt.Errorf("%w: node_id is empty", ErrPromotionNotReady)
+	}
+
+	return nil
+}
+
+// validatePromotionPreconditionsLocked performs dynamic promotion checks while the
+// caller holds replicationMutationMu.WLock. These checks re-read mutable state that
+// may have changed between initial validation and WLock acquisition.
+//
+// Checks:
+//   - Server not closed (concurrent Close)
+//   - Runtime role still "follower" (concurrent role change — should not happen with promoteMu held)
+//   - runtime lastApplied exactly equals quiesceRecord.PrimaryLatestSeq
+//   - durable replication cursor also equals quiesceRecord.PrimaryLatestSeq
+//
+// Caller must hold replicationMutationMu.WLock and promoteMu.
+func (s *Server) validatePromotionPreconditionsLocked(req *PromoteRequest) error {
+	qr := &req.QuiesceRecord
+
+	// Re-read closed and role atomically.
+	s.mu.Lock()
+	role := s.runtimeRole
+	closed := s.closed
+	s.mu.Unlock()
+
+	if closed {
+		return fmt.Errorf("%w: server closed during promotion commit", ErrPromotionNotReady)
+	}
+	if role != "follower" {
+		return fmt.Errorf("%w: runtime role changed to %q during promotion", ErrPromotionNotReady, role)
+	}
+
+	// Re-read follower runtime cursor. No replication can occur while we hold the WLock,
+	// but this catches mutations that slipped in between pre-barrier validation and WLock acquisition.
+	followerSeq := atomic.LoadUint64(&s.lastApplied)
+	if followerSeq != qr.PrimaryLatestSeq {
+		return fmt.Errorf("%w: follower runtime seq %d diverged from quiesce seq %d between validation and lock",
+			ErrPromotionSequenceMismatch, followerSeq, qr.PrimaryLatestSeq)
+	}
+
+	// Also verify the durable cursor (stateStore) matches. The durable cursor is the
+	// authoritative persisted position; a runtime/durable divergence means an in-flight
+	// sync applied entries without persisting the cursor, or a previous partial failure.
+	if s.stateStore != nil {
+		durableCursor := s.stateStore.LastAppliedSeq()
+		if durableCursor != qr.PrimaryLatestSeq {
+			return fmt.Errorf("%w: durable cursor %d does not match quiesce seq %d (in-flight replication applied between validation and WLock)",
+				ErrPromotionSequenceMismatch, durableCursor, qr.PrimaryLatestSeq)
+		}
 	}
 
 	return nil

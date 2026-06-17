@@ -403,18 +403,20 @@ func (s *Server) resolveRuntimeRole() error {
 		}
 
 		// Cross-validate promotion record against persisted follower replication state.
-		// If the state file exists, the cursor must match InheritedLastSeq and the source
-		// URL must match. A mismatch indicates the state files are from different nodes.
-		if ss, stateErr := replnet.NewReplicationStateStore(dir, rec.NodeID, rec.SourcePrimaryBaseURL); stateErr == nil {
-			cursor := ss.LastAppliedSeq()
-			if rec.InheritedLastSeq > 0 && cursor != rec.InheritedLastSeq {
-				return fmt.Errorf("replication state cursor %d does not match promotion record inherited_last_seq %d (state files from different nodes?)",
-					cursor, rec.InheritedLastSeq)
-			}
+		// NewReplicationStateStore returns (ss, nil) for a missing file (fresh follower, cursor=0).
+		// Any other error (identity mismatch, corrupt state, permission error) fails startup —
+		// the operator must diagnose before the promoted primary can serve requests.
+		// Note: promotion with inherited_last_seq==0 from a fresh follower (missing state file,
+		// cursor=0) is valid — the cursor check below only triggers when InheritedLastSeq > 0.
+		ss, stateErr := replnet.NewReplicationStateStore(dir, rec.NodeID, rec.SourcePrimaryBaseURL)
+		if stateErr != nil {
+			return fmt.Errorf("validate replication state at promoted-primary startup: %w", stateErr)
 		}
-		// Ignore state store errors (e.g. missing file = fresh follower with seq 0, or
-		// identity mismatch already surfaced by the store itself). The baseline check above
-		// is the authoritative cross-validation gate.
+		cursor := ss.LastAppliedSeq()
+		if rec.InheritedLastSeq > 0 && cursor != rec.InheritedLastSeq {
+			return fmt.Errorf("replication state cursor %d does not match promotion record inherited_last_seq %d (state files from different nodes?)",
+				cursor, rec.InheritedLastSeq)
+		}
 
 		s.runtimeRole = "primary"
 		s.localRoleSource = "promotion_record"
@@ -594,13 +596,32 @@ func (s *Server) ReplicationEntries(after uint64, limit int) ([]replnet.Entry, e
 	return s.durableLog.EntriesAfter(after, limit)
 }
 
-// ApplyReplicationEntries applies a batch of entries from the primary to the local engine.
+// ApplyReplicationEntries checks the promotion barrier, acquires replicationMutationMu.RLock,
+// and calls applyReplicationEntriesLocked. Use this from callers that do NOT already hold
+// the RLock (e.g. handleReplicationApply, external callers).
+//
+// Returns ErrPromotionInProgress if the promotion barrier is set.
+func (s *Server) ApplyReplicationEntries(entries []replnet.Entry) (uint64, error) {
+	if s.promotionBarrier.Load() {
+		return atomic.LoadUint64(&s.lastApplied), fmt.Errorf("node: apply rejected: %w", ErrPromotionInProgress)
+	}
+	s.replicationMutationMu.RLock()
+	defer s.replicationMutationMu.RUnlock()
+	if s.promotionBarrier.Load() {
+		return atomic.LoadUint64(&s.lastApplied), fmt.Errorf("node: apply rejected: %w", ErrPromotionInProgress)
+	}
+	return s.applyReplicationEntriesLocked(entries)
+}
+
+// applyReplicationEntriesLocked applies a batch of replication entries to the local engine.
+// Caller must hold replicationMutationMu.RLock. Use ApplyReplicationEntries if no lock is held.
+//
 // Entries must be in ascending Seq order. Already-applied entries (Seq <= lastApplied) are
 // safely skipped. Out-of-order gaps return replnet.ErrInvalidEntry.
 // Returns the last applied sequence number after this batch.
 //
 // After successful application the follower's cursor is persisted via stateStore (if present).
-func (s *Server) ApplyReplicationEntries(entries []replnet.Entry) (uint64, error) {
+func (s *Server) applyReplicationEntriesLocked(entries []replnet.Entry) (uint64, error) {
 	last := atomic.LoadUint64(&s.lastApplied)
 	for _, e := range entries {
 		if e.Seq <= last {
@@ -659,7 +680,7 @@ func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 	// Three-point barrier check (before CAS, after CAS, after RLock) ensures no sync
 	// proceeds while promotion holds the replicationMutationMu.WLock.
 	if s.promotionBarrier.Load() {
-		return SyncResult{}, fmt.Errorf("node: sync rejected: promotion in progress")
+		return SyncResult{}, fmt.Errorf("node: sync rejected: promotion in progress: %w", ErrPromotionInProgress)
 	}
 
 	// Reject concurrent syncs. Two concurrent calls could pull the same batch and attempt
@@ -672,7 +693,7 @@ func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 
 	// Post-CAS double-check: if barrier was set between the first load and the CAS, abort.
 	if s.promotionBarrier.Load() {
-		return SyncResult{}, fmt.Errorf("node: sync rejected: promotion in progress")
+		return SyncResult{}, fmt.Errorf("node: sync rejected: promotion in progress: %w", ErrPromotionInProgress)
 	}
 
 	// Acquire shared lock before doing any follower-state mutation. handlePromote holds
@@ -686,10 +707,12 @@ func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 	// wait while promotion held WLock (and cleared replicator). The barrier remains true
 	// after promotion completes, so this check is definitive.
 	if s.promotionBarrier.Load() {
-		return SyncResult{}, fmt.Errorf("node: sync rejected: promotion in progress")
+		return SyncResult{}, fmt.Errorf("node: sync rejected: promotion in progress: %w", ErrPromotionInProgress)
 	}
 
+	s.mu.Lock()
 	bgEnabled := s.bgWorker != nil
+	s.mu.Unlock()
 
 	before := atomic.LoadUint64(&s.lastApplied)
 	pr, err := s.replicator.PullEntries(ctx, before, 0)
@@ -715,7 +738,7 @@ func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 	}
 
 	fetched := len(pr.Entries)
-	lastSeq, err := s.ApplyReplicationEntries(pr.Entries)
+	lastSeq, err := s.applyReplicationEntriesLocked(pr.Entries)
 	if err != nil {
 		return SyncResult{
 			SourceNode:            s.opts.Replication.PrimaryBaseURL,
@@ -770,4 +793,30 @@ func (s *Server) BackgroundSyncStatus() BackgroundSyncStatus {
 		}
 	}
 	return s.bgWorker.Status()
+}
+
+// restartBackgroundWorkerAfterPromotionFailure safely restarts the background sync worker
+// after a pre-commit promotion failure. It verifies the server is still a follower and
+// coordinates with Close to avoid launching against already-closed resources.
+//
+// The caller must have already cleared promotionBarrier (Store(false)) before calling this.
+// If Close wins the race, the worker is not started. If the worker starts first, Close will
+// observe it under s.mu and stop it cleanly.
+func (s *Server) restartBackgroundWorkerAfterPromotionFailure() {
+	if !s.opts.Replication.BackgroundSync.Enabled {
+		return
+	}
+	worker := newBackgroundSyncWorker(s.opts.Replication.BackgroundSync, s.SyncFromPrimary)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Do not restart if the server is closing, the role is no longer follower
+	// (post-commit promotion completed on another goroutine — should not happen with
+	// promoteMu held, but guard defensively), or the barrier is somehow still set.
+	if s.closed || s.runtimeRole != "follower" || s.promotionBarrier.Load() {
+		return
+	}
+	if err := worker.start(); err != nil {
+		return // worker already started (invariant violated; ignore)
+	}
+	s.bgWorker = worker
 }

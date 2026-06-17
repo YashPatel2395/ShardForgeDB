@@ -362,7 +362,20 @@ func TestHandleReplicationSync_WrongMethod(t *testing.T) {
 // --- ApplyReplicationEntries ---
 
 func TestApplyReplicationEntries_SkipsAlreadyApplied(t *testing.T) {
-	s := newTestServer(t, "n1")
+	// ApplyReplicationEntries now requires follower role — use a follower server.
+	s, err := Open(Options{
+		NodeID:  "n1",
+		Addr:    "127.0.0.1:0",
+		DataDir: t.TempDir(),
+		Replication: ReplicationOptions{
+			Role:           replnet.RoleFollower,
+			PrimaryBaseURL: "http://127.0.0.1:19991", // non-existent; tests only call Apply directly
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
 
 	entries := []replnet.Entry{
 		{Seq: 1, Op: replnet.OpPut, Key: "k1", Value: "v1"},
@@ -381,7 +394,20 @@ func TestApplyReplicationEntries_SkipsAlreadyApplied(t *testing.T) {
 }
 
 func TestApplyReplicationEntries_OutOfOrder_ReturnsError(t *testing.T) {
-	s := newTestServer(t, "n1")
+	// ApplyReplicationEntries now requires follower role — use a follower server.
+	s, err := Open(Options{
+		NodeID:  "n1",
+		Addr:    "127.0.0.1:0",
+		DataDir: t.TempDir(),
+		Replication: ReplicationOptions{
+			Role:           replnet.RoleFollower,
+			PrimaryBaseURL: "http://127.0.0.1:19992",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
 
 	// Apply seq 1 first.
 	s.ApplyReplicationEntries([]replnet.Entry{
@@ -389,7 +415,7 @@ func TestApplyReplicationEntries_OutOfOrder_ReturnsError(t *testing.T) {
 	})
 
 	// Now try to apply seq 3 (gap at 2).
-	_, err := s.ApplyReplicationEntries([]replnet.Entry{
+	_, err = s.ApplyReplicationEntries([]replnet.Entry{
 		{Seq: 3, Op: replnet.OpPut, Key: "k3", Value: "v3"},
 	})
 	if err == nil {

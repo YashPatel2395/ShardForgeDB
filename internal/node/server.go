@@ -88,6 +88,10 @@ type Server struct {
 	// Replaceable in tests to inject failures or fixed IDs.
 	quiesceIDFn func() (string, error)
 
+	// removeQuiesceIntentFn removes the quiesce intent file. Defaults to replnet.RemoveQuiesceIntent.
+	// Replaceable in tests to inject removal failures and verify cleanup_pending reporting.
+	removeQuiesceIntentFn func(dir string) error
+
 	// Promotion state (follower -> promoted primary). Protected by mu.
 	promotionState  string // "", "promoting", "promoted"
 	promotionRecord *replnet.PromotionRecord
@@ -151,11 +155,12 @@ func Open(opts Options) (*Server, error) {
 	}
 
 	s := &Server{
-		opts:        opts,
-		eng:         eng,
-		mux:         http.NewServeMux(),
-		start:       time.Now(),
-		quiesceIDFn: replnet.NewQuiesceID,
+		opts:                  opts,
+		eng:                   eng,
+		mux:                   http.NewServeMux(),
+		start:                 time.Now(),
+		quiesceIDFn:           replnet.NewQuiesceID,
+		removeQuiesceIntentFn: replnet.RemoveQuiesceIntent,
 	}
 
 	// Phase 28: resolve runtime role from durable records before initializing
@@ -597,10 +602,13 @@ func (s *Server) ReplicationEntries(after uint64, limit int) ([]replnet.Entry, e
 }
 
 // ApplyReplicationEntries checks the promotion barrier, acquires replicationMutationMu.RLock,
-// and calls applyReplicationEntriesLocked. Use this from callers that do NOT already hold
-// the RLock (e.g. handleReplicationApply, external callers).
+// verifies the node is still a follower, and calls applyReplicationEntriesLocked.
+// Use this from callers that do NOT already hold the RLock (e.g. handleReplicationApply,
+// external callers).
 //
 // Returns ErrPromotionInProgress if the promotion barrier is set.
+// Returns ErrNotFollower if the node is a primary, standalone, or promoted primary.
+// Primary and standalone nodes must not mutate engine state via this path.
 func (s *Server) ApplyReplicationEntries(entries []replnet.Entry) (uint64, error) {
 	if s.promotionBarrier.Load() {
 		return atomic.LoadUint64(&s.lastApplied), fmt.Errorf("node: apply rejected: %w", ErrPromotionInProgress)
@@ -609,6 +617,16 @@ func (s *Server) ApplyReplicationEntries(entries []replnet.Entry) (uint64, error
 	defer s.replicationMutationMu.RUnlock()
 	if s.promotionBarrier.Load() {
 		return atomic.LoadUint64(&s.lastApplied), fmt.Errorf("node: apply rejected: %w", ErrPromotionInProgress)
+	}
+	// Re-read the role under s.mu after acquiring the RLock. Lock ordering is
+	// replicationMutationMu (outer) → s.mu (inner), which is consistent with executePromotion.
+	// This ensures primary, standalone, and promoted-primary callers are rejected and do not
+	// mutate engine state or advance lastApplied.
+	s.mu.Lock()
+	role := s.runtimeRole
+	s.mu.Unlock()
+	if role != "follower" {
+		return atomic.LoadUint64(&s.lastApplied), fmt.Errorf("node: apply rejected (role=%q): %w", role, ErrNotFollower)
 	}
 	return s.applyReplicationEntriesLocked(entries)
 }
@@ -671,16 +689,32 @@ func (s *Server) applyReplicationEntriesLocked(entries []replnet.Entry) (uint64,
 // This method is the single authoritative synchronization path used by both
 // POST /replication/sync (manual) and the background sync worker (automatic).
 func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
-	if s.replicator == nil {
-		return SyncResult{}, fmt.Errorf("node: SyncFromPrimary called on non-follower node")
-	}
-
-	// Reject syncs during promotion. The promotion barrier is set before the bgWorker is
-	// stopped so that no new sync can start (or persist) after the promotion sequence begins.
-	// Three-point barrier check (before CAS, after CAS, after RLock) ensures no sync
-	// proceeds while promotion holds the replicationMutationMu.WLock.
+	// First barrier check (fast path; no mutex required).
+	// Reject syncs during promotion: the barrier is set before the bgWorker is stopped so
+	// no new sync can start after the promotion sequence begins.
 	if s.promotionBarrier.Load() {
 		return SyncResult{}, fmt.Errorf("node: sync rejected: promotion in progress: %w", ErrPromotionInProgress)
+	}
+
+	// Capture runtime state under s.mu to eliminate data races on s.runtimeRole,
+	// s.replicator, s.closed, and s.bgWorker. These fields are written by executePromotion
+	// (under s.mu + replicationMutationMu.WLock) and Close (under s.mu). Reading them
+	// without the mutex would be a data race flagged by -race.
+	s.mu.Lock()
+	closed := s.closed
+	role := s.runtimeRole
+	replicator := s.replicator
+	bgEnabled := s.bgWorker != nil
+	s.mu.Unlock()
+
+	if closed {
+		return SyncResult{}, ErrClosed
+	}
+	if role != "follower" {
+		return SyncResult{}, fmt.Errorf("node: SyncFromPrimary: not a follower (role: %q): %w", role, ErrNotFollower)
+	}
+	if replicator == nil {
+		return SyncResult{}, fmt.Errorf("node: SyncFromPrimary: replicator is nil (node is not configured as follower)")
 	}
 
 	// Reject concurrent syncs. Two concurrent calls could pull the same batch and attempt
@@ -704,18 +738,17 @@ func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 	defer s.replicationMutationMu.RUnlock()
 
 	// Third barrier check: catches syncs that passed both pre-RLock checks but had to
-	// wait while promotion held WLock (and cleared replicator). The barrier remains true
-	// after promotion completes, so this check is definitive.
+	// wait while promotion held WLock. The barrier remains true after promotion completes,
+	// so this check is definitive.
 	if s.promotionBarrier.Load() {
 		return SyncResult{}, fmt.Errorf("node: sync rejected: promotion in progress: %w", ErrPromotionInProgress)
 	}
 
-	s.mu.Lock()
-	bgEnabled := s.bgWorker != nil
-	s.mu.Unlock()
-
+	// Use the captured replicator pointer (safe: the Replicator has no Close method and
+	// is not destroyed on promotion — the pointer stored in s.replicator is cleared under
+	// replicationMutationMu.WLock, which we now hold as RLock, so no mutation can race here).
 	before := atomic.LoadUint64(&s.lastApplied)
-	pr, err := s.replicator.PullEntries(ctx, before, 0)
+	pr, err := replicator.PullEntries(ctx, before, 0)
 	if err != nil {
 		var gapErr *replnet.ReplicationGapError
 		if errors.As(err, &gapErr) {
@@ -785,23 +818,39 @@ func (s *Server) SyncFromPrimary(ctx context.Context) (SyncResult, error) {
 
 // BackgroundSyncStatus returns the current background sync worker status.
 // Returns a disabled-state snapshot when background sync is not configured.
+//
+// s.bgWorker is read under s.mu to eliminate a data race with
+// restartBackgroundWorkerAfterPromotionFailure, which writes s.bgWorker under s.mu.
+// worker.Status() is called outside the server mutex (worker has its own mu; the
+// established lock ordering is s.mu → worker.mu, not the reverse).
 func (s *Server) BackgroundSyncStatus() BackgroundSyncStatus {
-	if s.bgWorker == nil {
+	s.mu.Lock()
+	worker := s.bgWorker
+	s.mu.Unlock()
+	if worker == nil {
 		return BackgroundSyncStatus{
 			Enabled: false,
 			State:   WorkerStateDisabled,
 		}
 	}
-	return s.bgWorker.Status()
+	return worker.Status()
 }
 
 // restartBackgroundWorkerAfterPromotionFailure safely restarts the background sync worker
 // after a pre-commit promotion failure. It verifies the server is still a follower and
 // coordinates with Close to avoid launching against already-closed resources.
 //
+// Idempotency: the function inspects the current bgWorker state before creating a replacement.
+// If a worker is already starting, running, backing off, or blocked, no second worker is created.
+// Only a nil, stopped, or disabled worker is replaced.
+//
 // The caller must have already cleared promotionBarrier (Store(false)) before calling this.
 // If Close wins the race, the worker is not started. If the worker starts first, Close will
 // observe it under s.mu and stop it cleanly.
+//
+// Lock ordering: holds s.mu to inspect and write s.bgWorker; calls worker.Status() while
+// holding s.mu (safe: worker.mu is a leaf lock — nothing in the worker acquires s.mu, so
+// s.mu → worker.mu is a valid ordering).
 func (s *Server) restartBackgroundWorkerAfterPromotionFailure() {
 	if !s.opts.Replication.BackgroundSync.Enabled {
 		return
@@ -809,14 +858,28 @@ func (s *Server) restartBackgroundWorkerAfterPromotionFailure() {
 	worker := newBackgroundSyncWorker(s.opts.Replication.BackgroundSync, s.SyncFromPrimary)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Do not restart if the server is closing, the role is no longer follower
-	// (post-commit promotion completed on another goroutine — should not happen with
-	// promoteMu held, but guard defensively), or the barrier is somehow still set.
+	// Abort if the server is closing, the role is no longer follower, or the barrier
+	// is still set (concurrent promote attempt — should not happen with promoteMu held).
 	if s.closed || s.runtimeRole != "follower" || s.promotionBarrier.Load() {
 		return
 	}
+	// Inspect the existing worker. Only replace a worker that is nil, stopped, or in the
+	// initial disabled state. Do not create a second worker if one is already active
+	// (starting, running, backing off, blocked, or stopping).
+	if s.bgWorker != nil {
+		state := s.bgWorker.Status().State
+		switch state {
+		case WorkerStateStopped, WorkerStateDisabled:
+			// Stale or never-started: safe to replace.
+		default:
+			// Active worker present: idempotent no-op.
+			return
+		}
+	}
 	if err := worker.start(); err != nil {
-		return // worker already started (invariant violated; ignore)
+		// start() returned ErrAlreadyStarted on a freshly constructed worker — invariant
+		// violation. Do not install a broken worker pointer.
+		return
 	}
 	s.bgWorker = worker
 }

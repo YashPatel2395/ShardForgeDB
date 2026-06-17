@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -436,32 +437,175 @@ func TestSafety_JournalCompatibilityCheck_AbsentJournal(t *testing.T) {
 	}
 }
 
-// ── Safety Item 5: Close vs bgWorker restart race ─────────────────────────────
+// ── Safety Item 1 (extended): Worker restart idempotency ─────────────────────
 
-// TestSafety_CloseDuringWorkerRestart verifies that racing Close with a pre-commit
-// promotion failure (which restarts the bgWorker) does not panic.
-func TestSafety_CloseDuringWorkerRestart(t *testing.T) {
+// TestSafety_WorkerRestart_IdempotentSingleWorker proves that calling
+// restartBackgroundWorkerAfterPromotionFailure twice installs exactly one replacement
+// worker (not two), that one Close stops it, and that no orphan goroutine remains.
+func TestSafety_WorkerRestart_IdempotentSingleWorker(t *testing.T) {
 	primary := p28Primary(t)
 	if err := primary.StartBackground(); err != nil {
 		t.Fatalf("start primary: %v", err)
 	}
 
-	// Run restartBackgroundWorkerAfterPromotionFailure in a follower that has background sync.
 	follower := p28Follower(t, primary.Addr(), t.TempDir())
 	if err := follower.StartBackground(); err != nil {
 		t.Fatalf("start follower: %v", err)
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	// Simulate a pre-commit failure state: barrier=false, promotionState="".
-	// Simply call restartBackgroundWorkerAfterPromotionFailure without holding any locks.
-	// It should not panic even if called multiple times.
-	for i := 0; i < 10; i++ {
-		follower.restartBackgroundWorkerAfterPromotionFailure()
+	// Capture the initial worker.
+	follower.mu.Lock()
+	initialWorker := follower.bgWorker
+	follower.mu.Unlock()
+	if initialWorker == nil {
+		t.Fatal("expected non-nil bgWorker after StartBackground")
 	}
-	// Close and call again — must not panic.
-	follower.Close()
-	follower.restartBackgroundWorkerAfterPromotionFailure() // must not panic on closed server
+
+	// Stop the original worker so the restart has something to replace.
+	initialWorker.stop()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if initialWorker.Status().State == WorkerStateStopped {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if initialWorker.Status().State != WorkerStateStopped {
+		t.Fatal("initial worker did not reach Stopped state")
+	}
+
+	// First restart call: installs a replacement worker.
+	follower.restartBackgroundWorkerAfterPromotionFailure()
+
+	follower.mu.Lock()
+	firstReplacement := follower.bgWorker
+	follower.mu.Unlock()
+
+	if firstReplacement == initialWorker {
+		t.Error("expected bgWorker to be replaced, got same pointer")
+	}
+	if firstReplacement == nil {
+		t.Fatal("expected non-nil bgWorker after first restart")
+	}
+
+	// Wait for the replacement to be running (not starting).
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		state := firstReplacement.Status().State
+		if state == WorkerStateRunning || state == WorkerStateBackingOff {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Second restart call: replacement is active — must NOT install another worker.
+	follower.restartBackgroundWorkerAfterPromotionFailure()
+
+	follower.mu.Lock()
+	afterSecondCall := follower.bgWorker
+	follower.mu.Unlock()
+
+	if afterSecondCall != firstReplacement {
+		t.Errorf("second restart call must not replace a running worker (idempotency violated): got new pointer %p, want %p", afterSecondCall, firstReplacement)
+	}
+
+	// One Close stops the single replacement worker cleanly.
+	if err := follower.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+
+	// After Close the replacement worker must be stopped (or stopping).
+	state := firstReplacement.Status().State
+	if state != WorkerStateStopped && state != WorkerStateStopping {
+		t.Errorf("expected worker stopped after Close, got %q", state)
+	}
+
+	// Restart call on a closed server must not install a new worker.
+	follower.restartBackgroundWorkerAfterPromotionFailure()
+	follower.mu.Lock()
+	afterClosedRestart := follower.bgWorker
+	follower.mu.Unlock()
+	// Close does not nil bgWorker; it remains pointing to the stopped replacement.
+	if afterClosedRestart != firstReplacement {
+		t.Error("restart on closed server must not change bgWorker pointer")
+	}
+}
+
+// ── Safety Item 2: Close-versus-worker-restart race ───────────────────────────
+
+// TestSafety_CloseVsWorkerRestart_Deterministic races Close against
+// restartBackgroundWorkerAfterPromotionFailure using a WaitGroup barrier so both
+// goroutines start simultaneously. Runs 50 iterations under -race.
+//
+// Required outcomes on every iteration:
+//   - no panic
+//   - no data race flagged by -race
+//   - after Close returns, no worker is in a running/starting/backing-off state
+func TestSafety_CloseVsWorkerRestart_Deterministic(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		primary := p28Primary(t)
+		if err := primary.StartBackground(); err != nil {
+			t.Fatalf("iter %d: start primary: %v", i, err)
+		}
+
+		follower := p28Follower(t, primary.Addr(), t.TempDir())
+		if err := follower.StartBackground(); err != nil {
+			t.Fatalf("iter %d: start follower: %v", i, err)
+		}
+		time.Sleep(40 * time.Millisecond)
+
+		// Stop the initial worker so the restart has a stopped worker to replace.
+		follower.mu.Lock()
+		w := follower.bgWorker
+		follower.mu.Unlock()
+		if w != nil {
+			w.stop()
+			dl2 := time.Now().Add(time.Second)
+			for time.Now().Before(dl2) {
+				if w.Status().State == WorkerStateStopped {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+
+		// Release both goroutines simultaneously.
+		var barrier sync.WaitGroup
+		barrier.Add(1)
+		var done sync.WaitGroup
+		done.Add(2)
+
+		go func() {
+			barrier.Wait()
+			follower.restartBackgroundWorkerAfterPromotionFailure()
+			done.Done()
+		}()
+		go func() {
+			barrier.Wait()
+			_ = follower.Close()
+			done.Done()
+		}()
+
+		barrier.Done() // release both
+		done.Wait()
+
+		// After Close: no worker should be in a live state.
+		follower.mu.Lock()
+		finalWorker := follower.bgWorker
+		follower.mu.Unlock()
+		if finalWorker != nil {
+			state := finalWorker.Status().State
+			switch state {
+			case WorkerStateStopped, WorkerStateStopping, WorkerStateDisabled:
+				// OK
+			default:
+				t.Errorf("iter %d: worker in state %q after Close (want stopped/stopping/disabled)", i, state)
+			}
+		}
+
+		primary.Close()
+	}
 }
 
 // ── Safety Item 6: ErrPromotionInProgress from SyncFromPrimary ────────────────
@@ -826,4 +970,452 @@ func TestSafety_ConfirmOldPrimaryStopped_IsOperatorAssertion(t *testing.T) {
 	// This test only documents that the system does not independently verify.
 	t.Logf("promote with live old primary: code=%d body=%s", rec.Code, rec.Body.String())
 	// No assertion on outcome — the test documents the semantic, not a correctness guarantee.
+}
+
+// ── Safety Item 3: BackgroundSyncStatus data race ─────────────────────────────
+
+// TestSafety_BackgroundSyncStatus_RaceProof runs concurrent BackgroundSyncStatus,
+// GET /replication/status, and restartBackgroundWorkerAfterPromotionFailure calls.
+// The -race detector must not fire.
+func TestSafety_BackgroundSyncStatus_RaceProof(t *testing.T) {
+	primary := p28Primary(t)
+	if err := primary.StartBackground(); err != nil {
+		t.Fatalf("start primary: %v", err)
+	}
+
+	follower := p28Follower(t, primary.Addr(), t.TempDir())
+	if err := follower.StartBackground(); err != nil {
+		t.Fatalf("start follower: %v", err)
+	}
+	time.Sleep(80 * time.Millisecond)
+
+	// Stop the initial worker so restart will actually install a replacement.
+	follower.mu.Lock()
+	w := follower.bgWorker
+	follower.mu.Unlock()
+	if w != nil {
+		w.stop()
+		dl := time.Now().Add(time.Second)
+		for time.Now().Before(dl) {
+			if w.Status().State == WorkerStateStopped {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Goroutine 1: repeatedly calls BackgroundSyncStatus (reads s.bgWorker).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_ = follower.BackgroundSyncStatus()
+			}
+		}
+	}()
+
+	// Goroutine 2: repeatedly calls GET /replication/status (also calls BackgroundSyncStatus).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_ = p28Req(t, follower, "GET", "/replication/status", "")
+			}
+		}
+	}()
+
+	// Goroutine 3: repeatedly calls restartBackgroundWorkerAfterPromotionFailure (writes s.bgWorker).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				follower.restartBackgroundWorkerAfterPromotionFailure()
+			}
+		}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+	close(done)
+	wg.Wait()
+	follower.Close()
+}
+
+// ── Safety Item 4: Replicator pointer race in SyncFromPrimary ─────────────────
+
+// TestSafety_SyncFromPrimary_ReplicatorRace races concurrent SyncFromPrimary calls
+// against s.replicator and s.runtimeRole mutations (simulating promotion). The -race
+// detector must not fire and no nil-pointer panic must occur.
+func TestSafety_SyncFromPrimary_ReplicatorRace(t *testing.T) {
+	primary := p28Primary(t)
+	if err := primary.StartBackground(); err != nil {
+		t.Fatalf("start primary: %v", err)
+	}
+
+	follower := p28Follower(t, primary.Addr(), t.TempDir())
+	if err := follower.StartBackground(); err != nil {
+		t.Fatalf("start follower: %v", err)
+	}
+	time.Sleep(80 * time.Millisecond)
+
+	const iterations = 60
+	var start sync.WaitGroup
+	start.Add(1)
+	var wg sync.WaitGroup
+
+	// Writer goroutine: briefly simulates promotion clearing s.replicator and changing role.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		start.Wait()
+		for i := 0; i < iterations; i++ {
+			follower.mu.Lock()
+			saved := follower.replicator
+			savedRole := follower.runtimeRole
+			follower.replicator = nil
+			follower.runtimeRole = "primary"
+			follower.mu.Unlock()
+
+			// Immediately restore so the follower can continue functioning.
+			follower.mu.Lock()
+			follower.replicator = saved
+			follower.runtimeRole = savedRole
+			follower.mu.Unlock()
+		}
+	}()
+
+	// Reader goroutine: repeatedly calls SyncFromPrimary.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		start.Wait()
+		for i := 0; i < iterations; i++ {
+			_, err := follower.SyncFromPrimary(context.Background())
+			if err != nil {
+				// ErrNotFollower, ErrPromotionInProgress, ErrClosed, ErrSyncInProgress,
+				// nil-replicator error are all acceptable outcomes.
+				_ = err
+			}
+		}
+	}()
+
+	start.Done() // release both goroutines simultaneously
+	wg.Wait()
+	follower.Close()
+}
+
+// ── Safety Item 5: ApplyReplicationEntries follower-only ──────────────────────
+
+// TestSafety_ApplyReplicationEntries_PrimaryRejected verifies that calling
+// ApplyReplicationEntries on a primary node returns ErrNotFollower and does not
+// mutate the engine.
+func TestSafety_ApplyReplicationEntries_PrimaryRejected(t *testing.T) {
+	primary := p28Primary(t)
+	if err := primary.StartBackground(); err != nil {
+		t.Fatalf("start primary: %v", err)
+	}
+	before := atomic.LoadUint64(&primary.lastApplied)
+
+	_, err := primary.ApplyReplicationEntries([]replnet.Entry{{Seq: 1, Op: replnet.OpPut, Key: "k", Value: "v"}})
+	if err == nil {
+		t.Fatal("expected error for primary node, got nil")
+	}
+	if !errors.Is(err, ErrNotFollower) {
+		t.Errorf("expected ErrNotFollower, got: %v", err)
+	}
+	after := atomic.LoadUint64(&primary.lastApplied)
+	if after != before {
+		t.Errorf("lastApplied changed on primary: before=%d after=%d", before, after)
+	}
+}
+
+// TestSafety_ApplyReplicationEntries_StandaloneRejected verifies that a standalone
+// node also rejects ApplyReplicationEntries with ErrNotFollower.
+func TestSafety_ApplyReplicationEntries_StandaloneRejected(t *testing.T) {
+	srv, err := Open(Options{
+		NodeID:  "standalone-node",
+		Addr:    "127.0.0.1:0",
+		DataDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+
+	before := atomic.LoadUint64(&srv.lastApplied)
+	_, err = srv.ApplyReplicationEntries([]replnet.Entry{{Seq: 1, Op: replnet.OpPut, Key: "k", Value: "v"}})
+	if err == nil {
+		t.Fatal("expected error for standalone node, got nil")
+	}
+	if !errors.Is(err, ErrNotFollower) {
+		t.Errorf("expected ErrNotFollower, got: %v", err)
+	}
+	if atomic.LoadUint64(&srv.lastApplied) != before {
+		t.Error("lastApplied must not change on standalone rejection")
+	}
+}
+
+// TestSafety_ApplyReplicationEntries_PromotedPrimaryRejected verifies that a promoted
+// primary (formerly follower) rejects ApplyReplicationEntries with ErrNotFollower.
+func TestSafety_ApplyReplicationEntries_PromotedPrimaryRejected(t *testing.T) {
+	primaryNode := p28Primary(t)
+	if err := primaryNode.StartBackground(); err != nil {
+		t.Fatalf("start primary: %v", err)
+	}
+
+	followerDir := t.TempDir()
+	follower := p28Follower(t, primaryNode.Addr(), followerDir)
+	if err := follower.StartBackground(); err != nil {
+		t.Fatalf("start follower: %v", err)
+	}
+
+	// Quiesce primary at seq 0 and promote follower.
+	qRec := p28Req(t, primaryNode, "POST", "/replication/quiesce", "")
+	var qResp QuiesceResponse
+	json.Unmarshal(qRec.Body.Bytes(), &qResp)
+	qr := replnet.QuiesceRecord{
+		Version: 1, QuiesceID: qResp.QuiesceID, PrimaryNodeID: "p28-primary",
+		PrimaryBaseURL: "http://" + primaryNode.Addr(), PrimaryLatestSeq: qResp.PrimaryLatestSeq,
+		QuiescedAt: qResp.QuiescedAt,
+	}
+	qr.Checksum = replnet.QuiesceChecksum(&qr)
+	body, _ := json.Marshal(PromoteRequest{QuiesceRecord: qr, ConfirmOldPrimaryStopped: true})
+	pRec := p28Req(t, follower, "POST", "/replication/promote", string(body))
+	if pRec.Code != 200 {
+		t.Fatalf("promote failed: %d %s", pRec.Code, pRec.Body.String())
+	}
+
+	// Now the follower is a promoted primary.
+	st := follower.runtimeState()
+	if st.role != "primary" {
+		t.Fatalf("expected promoted primary role, got %q", st.role)
+	}
+
+	before := atomic.LoadUint64(&follower.lastApplied)
+	_, applyErr := follower.ApplyReplicationEntries([]replnet.Entry{{Seq: before + 1, Op: replnet.OpPut, Key: "k", Value: "v"}})
+	if applyErr == nil {
+		t.Fatal("expected error for promoted primary, got nil")
+	}
+	// After promotion, promotionBarrier remains set (definitive gate). The barrier check
+	// fires before the role check, so ErrPromotionInProgress is returned instead of
+	// ErrNotFollower. Either sentinel proves that a promoted primary cannot mutate engine state.
+	if !errors.Is(applyErr, ErrPromotionInProgress) && !errors.Is(applyErr, ErrNotFollower) {
+		t.Errorf("expected ErrPromotionInProgress or ErrNotFollower for promoted primary, got: %v", applyErr)
+	}
+	if atomic.LoadUint64(&follower.lastApplied) != before {
+		t.Error("lastApplied must not change after promoted-primary rejection")
+	}
+}
+
+// TestSafety_ApplyReplicationEntries_CursorUnchangedOnRoleReject verifies that the
+// engine and stateStore cursor are unchanged after a role-based rejection.
+func TestSafety_ApplyReplicationEntries_CursorUnchangedOnRoleReject(t *testing.T) {
+	primary := p28Primary(t)
+	if err := primary.StartBackground(); err != nil {
+		t.Fatalf("start primary: %v", err)
+	}
+	p28Req(t, primary, "PUT", "/kv/k1", `{"value":"v1"}`)
+
+	follower := p28Follower(t, primary.Addr(), t.TempDir())
+	if err := follower.StartBackground(); err != nil {
+		t.Fatalf("start follower: %v", err)
+	}
+	// Wait for replication.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadUint64(&follower.lastApplied) >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cursorBefore := atomic.LoadUint64(&follower.lastApplied)
+	if cursorBefore == 0 {
+		t.Skip("follower did not replicate in time — skipping cursor check")
+	}
+
+	// Temporarily simulate the follower being a primary to force a role rejection.
+	follower.mu.Lock()
+	follower.runtimeRole = "primary"
+	follower.mu.Unlock()
+	defer func() {
+		follower.mu.Lock()
+		follower.runtimeRole = "follower"
+		follower.mu.Unlock()
+	}()
+
+	_, err := follower.ApplyReplicationEntries([]replnet.Entry{{Seq: cursorBefore + 1, Op: replnet.OpPut, Key: "k2", Value: "v2"}})
+	if !errors.Is(err, ErrNotFollower) {
+		t.Fatalf("expected ErrNotFollower, got: %v", err)
+	}
+	if atomic.LoadUint64(&follower.lastApplied) != cursorBefore {
+		t.Errorf("cursor changed after role rejection: before=%d after=%d", cursorBefore, atomic.LoadUint64(&follower.lastApplied))
+	}
+	// Engine must not have the key.
+	_, found, _ := follower.eng.Get([]byte("k2"))
+	if found {
+		t.Error("engine must not contain k2 after role-rejected apply")
+	}
+}
+
+// ── Safety Item 6: Quiesce intent cleanup truthfulness ────────────────────────
+
+// TestSafety_Quiesce_InitialPath_IntentCleanupFailure verifies that when the initial
+// quiesce succeeds (record written) but intent removal fails, quiesceIntentActive
+// remains true and GET /replication/status reports quiesce_intent_state=cleanup_pending.
+func TestSafety_Quiesce_InitialPath_IntentCleanupFailure(t *testing.T) {
+	dir := t.TempDir()
+	srv, err := Open(Options{
+		NodeID:      "qclean-primary",
+		Addr:        "127.0.0.1:0",
+		DataDir:     dir,
+		Replication: ReplicationOptions{Role: replnet.RolePrimary},
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := srv.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+
+	// Inject a failing removeQuiesceIntentFn.
+	srv.removeQuiesceIntentFn = func(string) error {
+		return fmt.Errorf("simulated removal failure")
+	}
+
+	rec := p28Req(t, srv, "POST", "/replication/quiesce", "")
+	if rec.Code != 200 {
+		t.Fatalf("quiesce failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// quiesceIntentActive must remain true because removal failed.
+	st := srv.runtimeState()
+	if !st.quiesceIntentActive {
+		t.Error("quiesceIntentActive must be true when intent removal failed")
+	}
+	if st.quiesceState != "quiesced" {
+		t.Errorf("quiesce state must be 'quiesced', got %q", st.quiesceState)
+	}
+
+	// GET /replication/status must show cleanup_pending.
+	statusRec := p28Req(t, srv, "GET", "/replication/status", "")
+	var resp ReplicationStatusResponse
+	if err := json.Unmarshal(statusRec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal status: %v", err)
+	}
+	if resp.QuiesceIntentState != "cleanup_pending" {
+		t.Errorf("expected QuiesceIntentState='cleanup_pending', got %q", resp.QuiesceIntentState)
+	}
+}
+
+// TestSafety_Quiesce_InitialPath_IntentCleanupSuccess verifies that when the initial
+// quiesce succeeds and intent removal succeeds, quiesceIntentActive is false and
+// quiesce_intent_state is not set in the status response.
+func TestSafety_Quiesce_InitialPath_IntentCleanupSuccess(t *testing.T) {
+	srv, err := Open(Options{
+		NodeID:      "qclean-ok",
+		Addr:        "127.0.0.1:0",
+		DataDir:     t.TempDir(),
+		Replication: ReplicationOptions{Role: replnet.RolePrimary},
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := srv.StartBackground(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+
+	rec := p28Req(t, srv, "POST", "/replication/quiesce", "")
+	if rec.Code != 200 {
+		t.Fatalf("quiesce failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	st := srv.runtimeState()
+	if st.quiesceIntentActive {
+		t.Error("quiesceIntentActive must be false after successful quiesce + intent removal")
+	}
+	if st.quiesceState != "quiesced" {
+		t.Errorf("expected quiesced, got %q", st.quiesceState)
+	}
+
+	statusRec := p28Req(t, srv, "GET", "/replication/status", "")
+	var resp ReplicationStatusResponse
+	json.Unmarshal(statusRec.Body.Bytes(), &resp)
+	if resp.QuiesceIntentState != "" {
+		t.Errorf("expected empty QuiesceIntentState after successful cleanup, got %q", resp.QuiesceIntentState)
+	}
+}
+
+// TestSafety_Quiesce_RestartResolvesMatchingIntent verifies that on startup, when both
+// a quiesce intent and a matching final record exist (crash between step 5 and step 6),
+// the node removes the stale intent and starts in the quiesced state with no active intent.
+func TestSafety_Quiesce_RestartResolvesMatchingIntent(t *testing.T) {
+	dir := t.TempDir()
+	quiesceID := "restart-test-qid"
+
+	intent := &replnet.QuiesceIntentRecord{
+		Version:        1,
+		QuiesceID:      quiesceID,
+		PrimaryNodeID:  "restart-primary",
+		PrimaryBaseURL: "http://127.0.0.1:19990",
+		IntentAt:       time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	intent.Checksum = replnet.QuiesceIntentChecksum(intent)
+	if err := replnet.SaveQuiesceIntent(dir, intent); err != nil {
+		t.Fatalf("save intent: %v", err)
+	}
+
+	finalRec := &replnet.QuiesceRecord{
+		Version:          1,
+		QuiesceID:        quiesceID,
+		PrimaryNodeID:    "restart-primary",
+		PrimaryBaseURL:   "http://127.0.0.1:19990",
+		PrimaryLatestSeq: 0,
+		QuiescedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	finalRec.Checksum = replnet.QuiesceChecksum(finalRec)
+	if err := replnet.SaveQuiesceRecord(dir, finalRec); err != nil {
+		t.Fatalf("save quiesce record: %v", err)
+	}
+
+	// Open: startup must remove the stale intent and start quiesced.
+	srv, err := Open(Options{
+		NodeID:      "restart-primary",
+		Addr:        "127.0.0.1:0",
+		DataDir:     dir,
+		Replication: ReplicationOptions{Role: replnet.RolePrimary},
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+
+	// Intent file must be gone.
+	if replnet.QuiesceIntentExists(dir) {
+		t.Error("intent file must be removed after startup with matching intent+final")
+	}
+
+	st := srv.runtimeState()
+	if st.quiesceState != "quiesced" {
+		t.Errorf("expected quiesced, got %q", st.quiesceState)
+	}
+	if st.quiesceIntentActive {
+		t.Error("quiesceIntentActive must be false after startup cleanup of matching intent")
+	}
 }

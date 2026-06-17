@@ -262,9 +262,17 @@ func (s *Server) handleReplicationStatus(w http.ResponseWriter, r *http.Request)
 			resp.PendingQuiesceID = st.pendingQuiesceRecord.QuiesceID
 			resp.PendingQuiesceSeq = st.pendingQuiesceRecord.PrimaryLatestSeq
 		}
-		// Quiesce intent field.
+		// Quiesce intent field. Distinguish two intent-active sub-states:
+		//   "active"          — intent written, gate not yet closed (quiesce in flight)
+		//   "cleanup_pending" — quiesce committed but intent removal failed; safe to ignore
+		//                       (startup resolves matching intent+final safely), but exposed
+		//                       here so operators can diagnose and manually clean up if needed.
 		if st.quiesceIntentActive {
-			resp.QuiesceIntentState = "active"
+			if st.quiesceState == "quiesced" {
+				resp.QuiesceIntentState = "cleanup_pending"
+			} else {
+				resp.QuiesceIntentState = "active"
+			}
 		}
 	}
 
@@ -693,7 +701,7 @@ func (s *Server) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 		// Intent cleanup: remove the intent file that was written in the original attempt.
 		// If removal fails, keep quiesceIntentActive=true and note it — the intent will be
 		// safely resolved at next startup (matching intent+final IDs → quiesced, cleanup done).
-		intentRemoved := replnet.RemoveQuiesceIntent(s.opts.DataDir) == nil
+		intentRemoved := s.removeQuiesceIntentFn(s.opts.DataDir) == nil
 		s.mu.Lock()
 		s.quiesceRecord = pending
 		s.quiesceState = "quiesced"
@@ -797,13 +805,18 @@ func (s *Server) handleQuiesce(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Step 6: Remove the intent file (crash-safe: intent without final → quiesce_failed_fenced on restart).
-	// Ignore removal errors — a stale intent with a matching final record is handled safely on startup.
-	_ = replnet.RemoveQuiesceIntent(s.opts.DataDir)
+	// Capture the result: only clear quiesceIntentActive when removal succeeds. If it fails,
+	// the stale intent remains on disk but will be resolved safely on restart (matching
+	// intent+final IDs → quiesced, cleanup done). Status exposes cleanup_pending in this case.
+	intentRemoved := s.removeQuiesceIntentFn(s.opts.DataDir) == nil
 
 	s.mu.Lock()
 	s.quiesceRecord = rec
 	s.quiesceState = "quiesced"
-	s.quiesceIntentActive = false
+	if intentRemoved {
+		s.quiesceIntentActive = false
+	}
+	// If removal failed, quiesceIntentActive remains true; status reports cleanup_pending.
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, QuiesceResponse{

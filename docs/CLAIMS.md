@@ -1,6 +1,6 @@
 # ShardForgeDB — Claims Audit
 
-**Phase 28 — Manual Promotion and Controlled Failover (Hardening Pass 2)**
+**Phase 28 — Manual Promotion and Controlled Failover (Hardening Pass 4)** — awaiting final validation and merge
 
 This file is the authoritative record of what ShardForgeDB can and cannot claim. All documentation, README copy, demo scripts, and recruiter materials must comply with this list. If a claim does not appear in Section A, it must not be made.
 
@@ -125,7 +125,7 @@ Built an explainable Go database engine with WAL-backed LSM-tree storage, exact 
 real networked HTTP node runtime, client-side consistent-hash routing, stateless proxy,
 explicit pull-based read replicas with durable journal and cursor, automatic background pull
 replication with lag tracking, operator-controlled planned failover (quiesce + promote), and
-ops simulation tools — 1282 race-safe tests across 28 phases, reproducible benchmarks.
+ops simulation tools — 1292 race-safe tests across 28 phases, reproducible benchmarks. Phases 1–27 locked; Phase 28 implemented and awaiting final validation and merge.
 ```
 
 ### What to say if asked "is it distributed?"

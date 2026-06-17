@@ -561,7 +561,7 @@ make node-demo-down
 - [x] `internal/node/types.go` — `HTTPStatusError` with `Is()` mapping 9 stable codes to sentinels; `Code string` added to `errorResponse`; `ReplicationStatusResponse` extended with 8 new fields (`PromotionSourceNodeID`, `PromotionSourceBaseURL`, `InheritedLastSeq`, `PromotedAt`, `PromotionDurableCommitted`, `PendingQuiesceID`, `PendingQuiesceSeq`, `QuiesceIntentState`)
 - [x] `internal/node/client.go` — `doJSON` returns typed `*HTTPStatusError` on non-2xx (parses `code` field); `SyncReplication` uses same typed error
 - [x] `internal/node/phase28_hardening_test.go` — 31 hardening tests (added tests 21–25: quiesce intent normal flow, intent-only startup fence, intent+final cleanup, `HTTPStatusError.Is()`, promoted-primary detail fields); test 14 rewritten for true concurrent-first-commit race
-- [x] **1292 total tests (1264 hardening pass-2 + 18 hardening pass-3 + 10 hardening pass-4 net-new)**
+- [x] **1292 total tests — Phase 28 net-new: 98 (phase28_hardening_test.go: 31, phase28_safety_test.go: 28, journal_baseline_test.go: 22, quiesce_store_test.go: 17)**
 - [x] **NOT automatic failover** — operator must stop old primary before calling promote
 - [x] **No distributed fencing** — quiesce write-fence is local to the primary process
 

@@ -515,10 +515,11 @@ func TestSafety_WorkerRestart_IdempotentSingleWorker(t *testing.T) {
 		t.Errorf("Close: %v", err)
 	}
 
-	// After Close the replacement worker must be stopped (or stopping).
+	// After Close returns, stop() has called wg.Wait(), so the goroutine has exited
+	// and its deferred function has set state to WorkerStateStopped. Require exactly that.
 	state := firstReplacement.Status().State
-	if state != WorkerStateStopped && state != WorkerStateStopping {
-		t.Errorf("expected worker stopped after Close, got %q", state)
+	if state != WorkerStateStopped {
+		t.Errorf("expected WorkerStateStopped after Close, got %q", state)
 	}
 
 	// Restart call on a closed server must not install a new worker.
@@ -590,17 +591,16 @@ func TestSafety_CloseVsWorkerRestart_Deterministic(t *testing.T) {
 		barrier.Done() // release both
 		done.Wait()
 
-		// After Close: no worker should be in a live state.
+		// After Close returns, stop() has called wg.Wait(), so the goroutine has exited.
+		// Require exactly WorkerStateStopped — WorkerStateStopping means the goroutine
+		// has not exited yet, which cannot happen after wg.Wait() returns.
 		follower.mu.Lock()
 		finalWorker := follower.bgWorker
 		follower.mu.Unlock()
 		if finalWorker != nil {
 			state := finalWorker.Status().State
-			switch state {
-			case WorkerStateStopped, WorkerStateStopping, WorkerStateDisabled:
-				// OK
-			default:
-				t.Errorf("iter %d: worker in state %q after Close (want stopped/stopping/disabled)", i, state)
+			if state != WorkerStateStopped {
+				t.Errorf("iter %d: worker in state %q after Close (want WorkerStateStopped)", i, state)
 			}
 		}
 
@@ -1223,29 +1223,31 @@ func TestSafety_ApplyReplicationEntries_PromotedPrimaryRejected(t *testing.T) {
 
 // TestSafety_ApplyReplicationEntries_CursorUnchangedOnRoleReject verifies that the
 // engine and stateStore cursor are unchanged after a role-based rejection.
+//
+// Setup uses an explicit synchronous SyncFromPrimary call (no background polling,
+// no t.Skip) so cursorBefore is deterministically exactly 1.
 func TestSafety_ApplyReplicationEntries_CursorUnchangedOnRoleReject(t *testing.T) {
 	primary := p28Primary(t)
 	if err := primary.StartBackground(); err != nil {
 		t.Fatalf("start primary: %v", err)
 	}
-	p28Req(t, primary, "PUT", "/kv/k1", `{"value":"v1"}`)
-
-	follower := p28Follower(t, primary.Addr(), t.TempDir())
-	if err := follower.StartBackground(); err != nil {
-		t.Fatalf("start follower: %v", err)
+	// Write one entry to give the primary a non-empty journal (seq 1).
+	rec := p28Req(t, primary, "PUT", "/kv/k1", `{"value":"v1"}`)
+	if rec.Code != 200 {
+		t.Fatalf("PUT /kv/k1: %d %s", rec.Code, rec.Body.String())
 	}
-	// Wait for replication.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		if atomic.LoadUint64(&follower.lastApplied) >= 1 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+
+	// Create a follower but do NOT start background sync — use explicit SyncFromPrimary
+	// so the cursor is set deterministically.
+	follower := p28Follower(t, primary.Addr(), t.TempDir())
+
+	if _, err := follower.SyncFromPrimary(context.Background()); err != nil {
+		t.Fatalf("SyncFromPrimary: %v", err)
 	}
 
 	cursorBefore := atomic.LoadUint64(&follower.lastApplied)
-	if cursorBefore == 0 {
-		t.Skip("follower did not replicate in time — skipping cursor check")
+	if cursorBefore != 1 {
+		t.Fatalf("expected lastApplied=1 after SyncFromPrimary, got %d", cursorBefore)
 	}
 
 	// Temporarily simulate the follower being a primary to force a role rejection.

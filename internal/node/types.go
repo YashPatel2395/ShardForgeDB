@@ -253,7 +253,60 @@ type scanResponse struct {
 // errorResponse is returned on any handler error.
 type errorResponse struct {
 	Error  string `json:"error"`
+	Code   string `json:"code,omitempty"` // stable machine-readable code (Phase 28+)
 	NodeID string `json:"node_id,omitempty"`
+}
+
+// HTTPStatusError is returned by Client methods when the server responds with a non-2xx status.
+// The Code field is a stable machine-readable identifier corresponding to the server's "code"
+// JSON field. Use errors.Is to map against package-level sentinel errors.
+type HTTPStatusError struct {
+	StatusCode int    // HTTP status code (e.g. 409)
+	Code       string // stable machine-readable code (e.g. "node_quiesced")
+	Message    string // human-readable error message from server
+}
+
+func (e *HTTPStatusError) Error() string {
+	if e.Code != "" {
+		return fmt.Sprintf("HTTP %d (%s): %s", e.StatusCode, e.Code, e.Message)
+	}
+	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Message)
+}
+
+// Is reports whether this error matches a well-known sentinel.
+// Mapping of server code values to package-level sentinel errors:
+//
+//	"node_quiesced"               → ErrNodeQuiesced
+//	"sync_in_progress"            → ErrSyncInProgress
+//	"promotion_sequence_mismatch" → ErrPromotionSequenceMismatch
+//	"promotion_source_mismatch"   → ErrPromotionSourceMismatch
+//	"promotion_record_invalid"    → ErrPromotionRecordInvalid
+//	"already_promoted"            → ErrAlreadyPromoted
+//	"promotion_in_progress"       → ErrPromotionInProgress
+//	"promotion_not_ready"         → ErrPromotionNotReady
+//	"quiesce_failed_fenced"       → ErrQuiesceFailedFenced
+func (e *HTTPStatusError) Is(target error) bool {
+	switch e.Code {
+	case "node_quiesced":
+		return target == ErrNodeQuiesced
+	case "sync_in_progress":
+		return target == ErrSyncInProgress
+	case "promotion_sequence_mismatch":
+		return target == ErrPromotionSequenceMismatch
+	case "promotion_source_mismatch":
+		return target == ErrPromotionSourceMismatch
+	case "promotion_record_invalid":
+		return target == ErrPromotionRecordInvalid
+	case "already_promoted":
+		return target == ErrAlreadyPromoted
+	case "promotion_in_progress":
+		return target == ErrPromotionInProgress
+	case "promotion_not_ready":
+		return target == ErrPromotionNotReady
+	case "quiesce_failed_fenced":
+		return target == ErrQuiesceFailedFenced
+	}
+	return false
 }
 
 // explainPutRequest is the JSON body for POST /explain/put.
@@ -299,12 +352,45 @@ type SyncResult struct {
 }
 
 // ReplicationStatusResponse is returned by GET /replication/status and
-// Client.ReplicationStatus(). It gives callers a typed view of the replication
-// and background-sync state without having to decode map[string]any.
+// Client.ReplicationStatus(). It gives callers a typed view of the replication,
+// background-sync, and Phase 28 promotion/quiesce state.
 type ReplicationStatusResponse struct {
 	NodeID         string                `json:"node_id"`
 	Replication    replnet.ReplicaStatus `json:"replication"`
 	BackgroundSync BackgroundSyncStatus  `json:"background_sync"`
+
+	// Phase 28 fields.
+	RuntimeRole     string `json:"runtime_role"`
+	LocalRoleSource string `json:"local_role_source"`
+
+	// Write-gate state (primary and standalone only; empty for followers).
+	// Values: "active", "quiesce_failed_fenced", "quiesced".
+	WriteState   string `json:"write_state,omitempty"`
+	Quiesced     bool   `json:"quiesced,omitempty"`
+	QuiesceState string `json:"quiesce_state,omitempty"`
+
+	// Quiesce record fields (non-empty when quiesced or quiesce_failed_fenced).
+	QuiesceID         string `json:"quiesce_id,omitempty"`
+	QuiescedAt        string `json:"quiesced_at,omitempty"`
+	QuiescedLatestSeq uint64 `json:"quiesced_latest_seq,omitempty"`
+
+	// Promotion state (follower only, or "promoted" after promotion).
+	PromotionState string `json:"promotion_state,omitempty"`
+
+	// Promotion detail fields (populated after promotion from follower → primary).
+	PromotionSourceNodeID     string `json:"promotion_source_node_id,omitempty"`
+	PromotionSourceBaseURL    string `json:"promotion_source_base_url,omitempty"`
+	InheritedLastSeq          uint64 `json:"inherited_last_seq,omitempty"`
+	PromotedAt                string `json:"promoted_at,omitempty"`
+	PromotionDurableCommitted bool   `json:"promotion_durable_committed,omitempty"`
+
+	// Pending quiesce detail (non-empty when quiesce_state == "quiesce_failed_fenced").
+	PendingQuiesceID  string `json:"pending_quiesce_id,omitempty"`
+	PendingQuiesceSeq uint64 `json:"pending_quiesce_seq,omitempty"`
+
+	// QuiesceIntentState indicates that a quiesce intent record is durably written but the
+	// final QuiesceRecord has not been committed yet. Values: "" (none) or "active".
+	QuiesceIntentState string `json:"quiesce_intent_state,omitempty"`
 }
 
 // ExplainPutResponse is the JSON body returned by POST /explain/put.
@@ -342,4 +428,32 @@ type ExplainScanResponse struct {
 	ResultCount int          `json:"result_count"`
 	Trace       *trace.Trace `json:"trace"`
 	Error       string       `json:"error,omitempty"`
+}
+
+// ── Phase 28: Manual promotion and controlled failover types ─────────────────
+
+// QuiesceResponse is returned by POST /replication/quiesce.
+type QuiesceResponse struct {
+	NodeID           string `json:"node_id"`
+	WriteState       string `json:"write_state"` // "quiesced"
+	QuiesceID        string `json:"quiesce_id"`
+	PrimaryLatestSeq uint64 `json:"primary_latest_seq"`
+	QuiescedAt       string `json:"quiesced_at"`
+	Idempotent       bool   `json:"idempotent"` // true if already quiesced
+}
+
+// PromoteRequest is the body of POST /replication/promote.
+type PromoteRequest struct {
+	QuiesceRecord            replnet.QuiesceRecord `json:"quiesce_record"`
+	ConfirmOldPrimaryStopped bool                  `json:"confirm_old_primary_stopped"`
+}
+
+// PromoteResponse is returned by POST /replication/promote.
+type PromoteResponse struct {
+	NodeID           string `json:"node_id"`
+	NewRole          string `json:"new_role"` // "primary"
+	QuiesceID        string `json:"quiesce_id"`
+	InheritedLastSeq uint64 `json:"inherited_last_seq"`
+	PromotedAt       string `json:"promoted_at"`
+	Idempotent       bool   `json:"idempotent"`
 }

@@ -2,13 +2,13 @@
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer toward a real distributed system. Every phase is strictly documented, tested, and benchmarked. Every claim is audited.
 
-> **Phase 27 — Automatic Background Pull Replication and Lag Tracking.** Phases 1–27 complete and locked.
-> Phase 27 adds a configurable background goroutine that automatically polls the primary every 500ms (configurable), exponential backoff on failure, bounded jitter, lag tracking (`lag_entries`, `lag_known`), and terminal gap detection. No Raft, no consensus, no automatic failover.
+> **Phase 28 — Manual Promotion and Controlled Failover (Hardening Pass 4).** Phases 1–27 locked; Phase 28 implemented and awaiting final validation and merge.
+> Phase 28 adds operator-controlled planned failover: `POST /replication/quiesce` write-fences a primary; `POST /replication/promote` promotes a follower. Hardening pass 4 adds: idempotent bgWorker restart (never replaces live worker), deterministic Close-vs-restart race test, `BackgroundSyncStatus` read under mutex, `SyncFromPrimary` replicator capture under mutex, `ApplyReplicationEntries` follower-only enforcement (ErrNotFollower for primary/standalone/promoted-primary), injectable `removeQuiesceIntentFn` seam with truthful `quiesceIntentActive` tracking (`cleanup_pending` vs `active` intent state). 1292 total tests.
+> Phase 27 adds automatic background pull replication: configurable goroutine polls primary every 500ms, exponential backoff, bounded jitter, lag tracking (`lag_entries`, `lag_known`), terminal gap detection. No Raft, no automatic failover.
 > Phase 26 makes replication state durable: primary binary journal (`replication.journal`) and follower cursor (`replication_state.json`) survive process restarts. Replication gap detection added (HTTP 409).
 > Phase 25 adds a reproducible leader+follower HTTP replication demo: explicit pull via `POST /replication/sync`, PUT+DELETE replication proven, idempotent pull proven, follower write-rejection proven.
-> Phase 24 adds a 3-node local cluster demo: independent HTTP nodes, stateless proxy, FNV-1a routing, data isolation proof.
 >
-> **1112 race-safe tests. 120+ reproducible benchmarks. All 27 phases complete.**
+> **1292 race-safe tests. 120+ reproducible benchmarks. Phases 1–27 locked; Phase 28 implemented and awaiting final validation and merge.**
 
 ---
 
@@ -548,6 +548,22 @@ make node-demo-down
 - [x] **NOT Raft, NOT consensus, NOT quorum, NOT automatic failover, NOT leader election**
 - [x] **Background sync is follower-only** — primary is unaffected; follower rejects writes
 - [x] **Phase 26 crash window acknowledged** — engine commit → journal append window remains
+
+**Phase 28 — Manual Promotion and Controlled Failover (Hardening Pass 4)** — implemented; awaiting final validation and merge
+
+- [x] `internal/replnet/quiesce_intent.go` — NEW: `QuiesceIntentRecord` (crash-safe fence written before write-gate close); `SaveQuiesceIntent`/`LoadQuiesceIntent`/`RemoveQuiesceIntent`; startup rules: intent-only → `quiesce_failed_fenced`; intent+final matching → `quiesced` + intent cleanup; mismatch → startup error
+- [x] `internal/replnet/quiesce_store.go` — `NewQuiesceID() (string, error)`: crypto/rand, returns error on entropy failure; `NewQuiesceRecord` returns `(*QuiesceRecord, error)`; `quiesceIDFn` injectable seam on Server
+- [x] `internal/replnet/journal_baseline.go` — `CreateJournalBaseline`: hardened with `journalCompatibilityCheck` (rejects existing journals whose first entry seq ≠ baseSeq+1); `ErrJournalIncompatible` sentinel
+- [x] `internal/node/server.go` — `replicationMutationMu sync.RWMutex`: SyncFromPrimary/handleReplicationApply hold RLock; handlePromote holds WLock (replaces 5s drain poll); triple barrier check (before CAS, after CAS, inside RLock)
+- [x] `internal/node/server.go` — `ReplicationStatus()` data race fixed: reads `s.runtimeRole` via `s.runtimeState()` instead of directly
+- [x] `internal/node/server.go` — `resolveRuntimeRole()`: quiesce intent startup rules; cross-validate promotion record against `replication_state.json` cursor; intent-only pending record seq updated after durable log opens
+- [x] `internal/node/handlers.go` — `handleKVPut`/`handleKVDelete`: consistent `writeJSONError` with stable `node_quiesced` code (replaces inline `map[string]any`); `handleQuiesce`: intent written before gate close, removed after final commit; `handleReplicationApply`: barrier check + RLock; pre-commit promotion failure restarts bgWorker
+- [x] `internal/node/types.go` — `HTTPStatusError` with `Is()` mapping 9 stable codes to sentinels; `Code string` added to `errorResponse`; `ReplicationStatusResponse` extended with 8 new fields (`PromotionSourceNodeID`, `PromotionSourceBaseURL`, `InheritedLastSeq`, `PromotedAt`, `PromotionDurableCommitted`, `PendingQuiesceID`, `PendingQuiesceSeq`, `QuiesceIntentState`)
+- [x] `internal/node/client.go` — `doJSON` returns typed `*HTTPStatusError` on non-2xx (parses `code` field); `SyncReplication` uses same typed error
+- [x] `internal/node/phase28_hardening_test.go` — 31 hardening tests (added tests 21–25: quiesce intent normal flow, intent-only startup fence, intent+final cleanup, `HTTPStatusError.Is()`, promoted-primary detail fields); test 14 rewritten for true concurrent-first-commit race
+- [x] **1292 total tests — Phase 28 net-new: 98 (phase28_hardening_test.go: 31, phase28_safety_test.go: 28, journal_baseline_test.go: 22, quiesce_store_test.go: 17)**
+- [x] **NOT automatic failover** — operator must stop old primary before calling promote
+- [x] **No distributed fencing** — quiesce write-fence is local to the primary process
 
 ---
 

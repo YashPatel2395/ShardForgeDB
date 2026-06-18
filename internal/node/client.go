@@ -164,22 +164,16 @@ func (c *Client) SyncReplication(ctx context.Context) (*SyncResult, error) {
 		return nil, fmt.Errorf("node client: sync replication: read body: %w", err)
 	}
 
-	// HTTP 409 with code "sync_in_progress": a concurrent background or manual sync
-	// is already in flight. Return a wrapped ErrSyncInProgress so callers can use
-	// errors.Is. A 409 for a replication gap has a different code and does NOT match.
-	if resp.StatusCode == http.StatusConflict {
-		var coded struct {
-			Code string `json:"code"`
-		}
-		if json.Unmarshal(body, &coded) == nil && coded.Code == "sync_in_progress" {
-			return nil, fmt.Errorf("node client: sync replication: %w", ErrSyncInProgress)
-		}
-	}
-
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Decode with code field for typed error handling.
 		var errResp errorResponse
 		if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-			return nil, fmt.Errorf("node client: sync replication: server error %d: %s", resp.StatusCode, errResp.Error)
+			httpErr := &HTTPStatusError{
+				StatusCode: resp.StatusCode,
+				Code:       errResp.Code,
+				Message:    errResp.Error,
+			}
+			return nil, fmt.Errorf("node client: sync replication: %w", httpErr)
 		}
 		return nil, fmt.Errorf("node client: sync replication: unexpected status %d: %s", resp.StatusCode, string(body))
 	}
@@ -235,6 +229,24 @@ func (c *Client) ExplainScan(ctx context.Context, start, end []byte) (*ExplainSc
 	return &resp, nil
 }
 
+// QuiesceReplication calls POST /replication/quiesce on a primary node.
+func (c *Client) QuiesceReplication(ctx context.Context) (*QuiesceResponse, error) {
+	var resp QuiesceResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/replication/quiesce", nil, &resp); err != nil {
+		return nil, fmt.Errorf("node client: quiesce: %w", err)
+	}
+	return &resp, nil
+}
+
+// PromoteFollower calls POST /replication/promote on a follower node.
+func (c *Client) PromoteFollower(ctx context.Context, req *PromoteRequest) (*PromoteResponse, error) {
+	var resp PromoteResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/replication/promote", req, &resp); err != nil {
+		return nil, fmt.Errorf("node client: promote: %w", err)
+	}
+	return &resp, nil
+}
+
 // Do executes an HTTP request with optional JSON body and decodes the response into a
 // map[string]any. Useful for proxy-forwarding when the exact response shape is unknown.
 // Returns an error for non-2xx status codes.
@@ -284,12 +296,19 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any, out 
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		// Try to decode a server-side error message.
+		// Try to decode a server-side error message with stable code field.
 		var errResp errorResponse
 		if jsonErr := json.Unmarshal(respBytes, &errResp); jsonErr == nil && errResp.Error != "" {
-			return fmt.Errorf("server error %d: %s", resp.StatusCode, errResp.Error)
+			return &HTTPStatusError{
+				StatusCode: resp.StatusCode,
+				Code:       errResp.Code,
+				Message:    errResp.Error,
+			}
 		}
-		return fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(respBytes))
+		return &HTTPStatusError{
+			StatusCode: resp.StatusCode,
+			Message:    string(respBytes),
+		}
 	}
 
 	if out != nil {

@@ -23,6 +23,29 @@ var ErrAlreadyStarted = errors.New("node: server already started")
 // Concurrent syncs are rejected to prevent double-application of the same batch.
 var ErrSyncInProgress = errors.New("node: sync already in progress")
 
+// Phase 28: manual promotion and controlled failover error sentinels.
+var (
+	ErrNodeQuiesced              = errors.New("node is quiesced: writes are rejected")
+	ErrAlreadyQuiesced           = errors.New("node is already quiesced")
+	ErrNotPrimary                = errors.New("operation requires primary role")
+	ErrNotFollower               = errors.New("operation requires follower role")
+	ErrPromotionNotReady         = errors.New("follower is not ready for promotion")
+	ErrPromotionSequenceMismatch = errors.New("follower sequence does not match quiesce record")
+	ErrPromotionSourceMismatch   = errors.New("quiesce record source does not match configured primary")
+	ErrPromotionRecordInvalid    = errors.New("quiesce record is invalid or corrupt")
+	ErrPromotionInProgress       = errors.New("promotion is already in progress")
+	ErrAlreadyPromoted           = errors.New("node is already promoted")
+
+	// ErrQuiesceInProgress is returned when a second quiesce request arrives while the
+	// first is still executing (serialized by quiesceMu).
+	ErrQuiesceInProgress = errors.New("quiesce is already in progress")
+
+	// ErrQuiesceFailedFenced is returned on GET /replication/status to indicate that the
+	// write gate has been closed but the quiesce record persistence failed.
+	// The node will retry on the next POST /replication/quiesce with the same QuiesceID.
+	ErrQuiesceFailedFenced = errors.New("quiesce gate closed but record persistence failed; retry to commit")
+)
+
 // validate checks that required Options fields are set and the DataDir can be created.
 func (o Options) validate() error {
 	if o.NodeID == "" {

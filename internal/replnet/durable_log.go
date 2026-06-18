@@ -58,6 +58,7 @@ type DurableLog struct {
 	f          *os.File
 	index      []indexEntry // in-memory index built from replay on open
 	nextSeq    uint64       // next seq to assign; starts at 1
+	baseSeq    uint64       // Phase 28: promoted-primary baseline; 0 = no baseline (default)
 	closed     bool
 	poisoned   bool                            // true if a rollback failure has made this log unusable
 	path       string                          // full path to journal file, for Stats()
@@ -89,10 +90,34 @@ func OpenDurableLog(dataDir string) (*DurableLog, error) {
 	dl.truncateFn = f.Truncate // default: real truncate; override in tests for rollback path
 	dl.seekFn = f.Seek         // default: real seek; override in tests for rollback path
 
+	// Phase 28: load journal baseline if present. The baseline tells us that
+	// sequences 1..baseSeq belong to the old primary and this log should start
+	// numbering from baseSeq+1.
+	baseline, blErr := LoadJournalBaseline(dataDir)
+	if blErr != nil {
+		f.Close()
+		return nil, fmt.Errorf("replnet: durable log: load baseline: %w", blErr)
+	}
+	if baseline != nil && baseline.BaseSeq > 0 {
+		dl.baseSeq = baseline.BaseSeq
+	}
+
 	if err := dl.replay(); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("replnet: durable log: replay %s: %w", path, err)
 	}
+
+	// If the journal is empty and we have a baseline, adjust nextSeq.
+	if len(dl.index) == 0 && dl.baseSeq > 0 {
+		if dl.baseSeq == math.MaxUint64 {
+			// baseSeq+1 would overflow to 0. Set nextSeq to MaxUint64 so Append
+			// hits the overflow guard and returns an error.
+			dl.nextSeq = math.MaxUint64
+		} else {
+			dl.nextSeq = dl.baseSeq + 1
+		}
+	}
+
 	// Seek to end for appending.
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		f.Close()
@@ -197,10 +222,11 @@ func (dl *DurableLog) replay() error {
 				ErrCorruptedJournal, offset)
 		}
 		if len(dl.index) == 0 {
-			// First record in the journal must have seq == 1.
-			if seq != 1 {
-				return fmt.Errorf("%w: first journal record has seq %d, expected 1 at offset %d",
-					ErrCorruptedJournal, seq, offset)
+			// First record must have seq == baseSeq+1 (or seq == 1 when no baseline).
+			expectedFirst := dl.baseSeq + 1
+			if seq != expectedFirst {
+				return fmt.Errorf("%w: first journal record has seq %d, expected %d at offset %d",
+					ErrCorruptedJournal, seq, expectedFirst, offset)
 			}
 		} else {
 			// Subsequent records: seq must equal prevSeq + 1.
@@ -499,6 +525,26 @@ func (dl *DurableLog) FirstAvailableSeq() uint64 {
 	return dl.index[0].seq
 }
 
+// BaseSeq returns the baseline sequence number. 0 means no baseline (default).
+func (dl *DurableLog) BaseSeq() uint64 {
+	dl.mu.RLock()
+	defer dl.mu.RUnlock()
+	return dl.baseSeq
+}
+
+// LatestSeq returns the most recent sequence number in the log.
+// If the journal is empty but a baseline exists, returns the baseline seq.
+// Returns 0 if the journal is empty and no baseline exists.
+func (dl *DurableLog) LatestSeq() uint64 {
+	dl.mu.RLock()
+	defer dl.mu.RUnlock()
+	n := len(dl.index)
+	if n > 0 {
+		return dl.index[n-1].seq
+	}
+	return dl.baseSeq
+}
+
 // Stats returns a point-in-time snapshot of the journal's state.
 // Returns ErrClosed if the log is closed.
 // Durable is true only when the DurableLog implementation is active (always true here).
@@ -516,6 +562,9 @@ func (dl *DurableLog) Stats() (DurableLogStats, error) {
 	if n > 0 {
 		firstSeq = dl.index[0].seq
 		lastSeq = dl.index[n-1].seq
+	} else if dl.baseSeq > 0 {
+		// Empty journal with baseline: report baseline as last seq.
+		lastSeq = dl.baseSeq
 	}
 
 	fi, err := dl.f.Stat()

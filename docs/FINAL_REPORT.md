@@ -1,13 +1,13 @@
 # ShardForgeDB — Final Engineering Report
 
-**Version:** v0.4.0-portfolio
-**Status:** 27-phase build complete, all tests passing, all benchmarks reproducible.
+**Version:** v0.5.0-portfolio
+**Status:** Phases 1–27 locked; Phase 28 implemented and awaiting final validation and merge. 1292 tests passing.
 
 ---
 
 ## Executive summary
 
-ShardForgeDB is a ground-up Go database engine built as a 27-phase educational and portfolio project. It implements a WAL-backed LSM-tree key-value store, exact vector search, a real networked HTTP node runtime, a stateless routing proxy, explicit pull-based read replicas with durable journal and cursor, automatic background pull replication with configurable interval/backoff/jitter and lag tracking, an operations simulation layer, and a full explainability system that produces real execution traces for every key database operation. All phases are tested, benchmarked, and documented. Every design decision and limitation is explicitly stated.
+ShardForgeDB is a ground-up Go database engine built as a 28-phase educational and portfolio project. It implements a WAL-backed LSM-tree key-value store, exact vector search, a real networked HTTP node runtime, a stateless routing proxy, explicit pull-based read replicas with durable journal and cursor, automatic background pull replication with configurable interval/backoff/jitter and lag tracking, an operations simulation layer, a full explainability system that produces real execution traces for every key database operation, and an operator-controlled manual promotion workflow for planned failover. All phases are tested, benchmarked, and documented. Every design decision and limitation is explicitly stated.
 
 The project is not a production database. It is an explainable, deeply documented implementation that demonstrates real engineering depth across storage, networking, routing, replication, observability, and operations tooling.
 
@@ -44,8 +44,9 @@ The project is not a production database. It is an explainable, deeply documente
 | 25 | `configs/replication/`, `scripts/repl_demo_*.sh`, `internal/node` (SyncResult, Client.SyncReplication), `internal/node/replication_phase25_test.go`, `internal/cluster/replication_demo_test.go` | Networked pull-based replication demo: leader+follower HTTP nodes, explicit pull via POST /replication/sync, PUT+DELETE replication, idempotent pull, role enforcement, 20 new tests | 20 | — |
 | 26 | `internal/replnet/durable_log.go`, `internal/replnet/state_store.go`, `internal/node/replication_phase26_test.go`, `scripts/repl_restart_demo_*.sh`, `docs/REPLICATION_DURABILITY_DESIGN.md` | Durable replication state: binary journal for primary (`replication.journal` — per-Append fsync, rollback-on-failure, ErrPoisonedLog on rollback failure, replay boundary checks); identity-bound versioned JSON cursor for follower (`replication_state.json` — version+follower_node_id+primary_url+last_applied_seq+updated_at+checksum, CRC32 over all fields, directory fsync best-effort); gap detection (HTTP 409); sequence monotonicity enforcement; concurrent sync guard (`ErrSyncInProgress`); crash window documented; restart recovery demo (18 checks). Test breakdown: 31 DurableLog + 12 StateStore + 18 Phase26_node = 61 Phase 26 tests | 61 | — |
 | 27 | `internal/node/background_sync.go`, `internal/node/background_sync_test.go`, `internal/node/replication_phase27_test.go`, `internal/node/server_lifecycle_test.go`, `internal/node/types.go` (Duration, BackgroundSyncConfig, WorkerState, BackgroundSyncStatus, ReplicationStatusResponse), `internal/node/config.go` (ErrAlreadyStarted, NaN/Inf jitter guard), `internal/node/server.go` (single-use lifecycle, race-safe start under mutex), `internal/node/handlers.go` (HTTP 409 ErrSyncInProgress + code field), `internal/node/client.go` (ReplicationStatus typed method; SyncReplication typed ErrSyncInProgress), `internal/replnet/replicator.go` (PullResult.PrimaryLatestSeqKnown, *uint64 logResponse), `cmd/shardforge-node/main.go` (bg-sync flags), `scripts/repl_auto_demo_*.sh` (24 checks), `configs/replication/demo-background-sync.json`, `docs/BACKGROUND_REPLICATION_DESIGN.md` | Automatic background pull replication with lag tracking: configurable goroutine polls primary every 500ms; exponential backoff (initial→max) with bounded jitter (fraction); ErrSyncInProgress→skip (resets backoff to 0, no failure counter); *ReplicationGapError→WorkerStateBlocked (clears Running/CurrentBackoffMs/NextRetryAt); lag_entries/lag_known propagated from PrimaryLatestSeqKnown (*uint64 pointer in logResponse); UTC timestamps (nowFn); server single-use lifecycle (ErrAlreadyStarted sentinel, started+closed bool under mu); worker CAS linearized inside lifecycleMu (CAS inside lifecycleMu.Lock() so stop() winning the mutex leaves CAS slot unconsumed; preLaunchHook test seam verifies stop() blocks until start() completes wg.Add+launch); shutdown cancellation not counted as failure (w.ctx.Err() guard); HTTP 409 with code="sync_in_progress" for manual sync conflict; Client.SyncReplication returns wrapped ErrSyncInProgress on 409 (502 does not match); typed ReplicationStatusResponse client; 24-check smoke demo; NOT Raft; NOT automatic failover. Test breakdown: 48 unit (background_sync_test.go: +StopWaitsForConcurrentStart +StopBeforeStart_StartStillSucceeds −ConcurrentStartStop) + 26 integration (replication_phase27_test.go) + 14 lifecycle+client (server_lifecycle_test.go: 9 original + 5 blocking-Start path) + 1 replnet (replicator_test.go#PrimaryLatestSeq_Reported) = 89 Phase 27 tests | 89 | — |
+| 28 | `internal/node/handlers.go` (handleQuiesce/handlePromote rewrite, writeJSONError, handleExplainPut/Delete fencing), `internal/node/server.go` (quiesceMu, promoteMu, promotionBarrier, quiesce_failed_fenced, quiesceIDFn seam, runtimeSnapshot/runtimeState(), replicationMutationMu, restartBackgroundWorkerAfterPromotionFailure idempotent, removeQuiesceIntentFn seam, ApplyReplicationEntries follower-only), `internal/node/types.go` (ReplicationStatusResponse Phase 28 fields, HTTPStatusError), `internal/node/config.go` (ErrQuiesceInProgress, ErrQuiesceFailedFenced, ErrPromotionInProgress, ErrNotFollower), `internal/replnet/quiesce_store.go` (NewQuiesceID→(string,error), NewQuiesceRecord→(*QuiesceRecord,error)), `internal/replnet/journal_baseline.go` (CreateJournalBaseline idempotent, JournalBaselineExists, ErrJournalBaselineConflict, ErrJournalBaselineMaxUint64, journalCompatibilityCheck), `internal/replnet/quiesce_intent.go` (SaveQuiesceIntent, LoadQuiesceIntent, RemoveQuiesceIntent), `internal/node/phase28_hardening_test.go` (31 tests), `internal/node/phase28_safety_test.go` (28 tests), `internal/node/phase28_unit_test.go`, `internal/node/phase28_test_helpers_test.go`, `internal/replnet/journal_baseline_test.go` (22 tests), `internal/replnet/quiesce_store_test.go` (17 tests), `docs/MANUAL_PROMOTION_DESIGN.md` | Phase 28 hardening (all 4 passes): quiesceMu serializes all concurrent quiesce; quiesce_failed_fenced with pendingQuiesceRecord retry; entropy failure aborts before gate closes; quiesceIDFn injectable seam; s.Addr() (not :0); handleExplainPut/Delete fenced; runtimeSnapshot atomic snapshot; promoteMu serializes promotion; promotionBarrier+double-check drain; CreateJournalBaseline idempotent; cross-validation: new_role, fields, MaxUint64, baseline, BaseSeq; pre-commit revert/post-commit preserve; writeJSONError stable code; typed ReplicationStatusResponse; quiesce-intent durable record; replicationMutationMu RWMutex (triple barrier); HTTPStatusError; cursor re-validated UNDER WLock; ApplyReplicationEntries split+follower-only; startup fails on state-store error; journalCompatibilityCheck stat-first; idempotent bgWorker restart; ErrPromotionInProgress from all 3 barriers (HTTP 409); quiesceIntentActive truthful (cleanup_pending vs active); BackgroundSyncStatus+SyncFromPrimary replicator under mutex. Test breakdown (all Phase 28 net-new, none of these files existed on main): phase28_hardening_test.go=31, phase28_safety_test.go=28, journal_baseline_test.go=22, quiesce_store_test.go=17 → 98 Phase 28 net-new tests | 98 (Phase 28) | — |
 
-**Total tests:** 1112
+**Total tests:** 1292
 **Total benchmarks:** 120+
 **Packages with tests:** 23 of 27
 
@@ -62,6 +63,8 @@ The networked layer adds real HTTP/JSON nodes, a client-side consistent-hash rou
 Read replicas add explicit pull-based sync: the primary keeps a durable binary journal (`replication.journal`); followers persist their cursor to `replication_state.json` and pull entries on demand. Both survive process restarts. Gap detection returns HTTP 409 when the follower falls too far behind.
 
 Phase 27 adds automatic background pull replication: when `--bg-sync` is set, a goroutine polls the primary every 500ms (configurable). Exponential backoff on failure, bounded jitter, `ErrSyncInProgress`→skip, `*ReplicationGapError`→terminal blocked state. Lag tracking (`lag_entries`, `lag_known`) is always accurate after any successful sync. The manual sync path is still available alongside the background worker. NOT Raft, NOT automatic failover.
+
+Phase 28 adds operator-controlled manual promotion and controlled failover: a primary can be quiesced (write-fenced) via `POST /replication/quiesce`; a follower can be promoted via `POST /replication/promote` with the quiesce record. The Phase 28 hardening pass fixes all concurrency and crash-consistency issues found after initial implementation.
 
 The ops layer adds health visibility, failure simulation (routing impact without live calls), and manual rebalance planning (key movement without data movement).
 
@@ -128,7 +131,7 @@ The trace system works only because each `Explain*` method mirrors the exact exe
 
 ## Release status
 
-All 27 phases complete. `go test -race -count=1 ./...` → 1112 tests pass across 23 packages. Smoke demos: cluster (25/25), repl (16/16), repl-restart (16/16), repl-auto (24/24).
+Phases 1–27 locked; Phase 28 implemented and awaiting final validation and merge. `go test -race -count=1 ./...` → 1292 tests pass across 23 packages. Smoke demos: cluster (25/25), repl (16/16), repl-restart (16/16), repl-auto (24/24), repl-failover (32/32).
 
 **Phase 26 fix pass hardening** (not a new phase — correctness fixes to Phase 26 before PR acceptance):
 - Journal fsync before index update; rollback on failure (injectable `syncFn` for deterministic tests)
@@ -138,6 +141,42 @@ All 27 phases complete. `go test -race -count=1 ./...` → 1112 tests pass acros
 - Sequence monotonicity enforced in `replay()` (`seq == prevSeq+1`)
 - `ErrSyncInProgress` guard prevents concurrent `SyncFromPrimary` calls
 - Crash window documented explicitly: engine write before journal append; mutation visible in engine but absent from journal if crash occurs between the two
+
+**Phase 28 concurrency and crash-consistency hardening** (correctness fixes before PR acceptance):
+- `quiesceMu sync.Mutex` serializes the entire quiesce operation (check → gate → persist → state); concurrent quiesce requests queue and the second caller sees the already-quiesced state idempotently
+- `quiesce_failed_fenced` state: when the write gate closes but `SaveQuiesceRecord` fails, `pendingQuiesceRecord` is preserved and retry reuses the same QuiesceID
+- `NewQuiesceID() (string, error)`: entropy failure aborts quiesce before gate closes (gate is never poisoned by a zero/predictable ID); `quiesceIDFn func() (string, error)` injectable seam for tests
+- `s.Addr()` used for `primary_base_url` capture; quiesce rejected if listener not yet bound (`:0`)
+- `handleExplainPut` and `handleExplainDelete` now check `writeGate.Enter()` (previously unfenced despite real engine writes)
+- `runtimeSnapshot` struct + `runtimeState()` method: all mutable fields read under `s.mu` in one snapshot; eliminates data races in all handlers that previously read `s.runtimeRole` bare
+- `promoteMu sync.Mutex` serializes the entire promotion operation; concurrent promote attempts queue
+- `promotionBarrier atomic.Bool` + double-check pattern: set before stopping bgWorker; `SyncFromPrimary` checks barrier before AND after claiming `syncInProgress` CAS slot, preventing slip-through
+- `CreateJournalBaseline(dir, baseSeq)` idempotent helper: same value → nil, different value → `ErrJournalBaselineConflict`, `MaxUint64` → `ErrJournalBaselineMaxUint64`; used as phase-1 commit in promotion (orphan-safe)
+- Cross-validation in `resolveRuntimeRole()`: verifies `new_role=="primary"`, non-empty fields, `InheritedLastSeq != MaxUint64`, baseline exists, `baseline.BaseSeq == rec.InheritedLastSeq`; any mismatch → node refuses to open
+- Pre-commit failure: revert `promotionBarrier` + `promotionState`; post-commit failure: preserve state for restart recovery
+- `writeJSONError` helper: stable machine-readable `code` field in all error responses (`node_quiesced`, `wrong_role`, `node_closing`, `promotion_sequence_mismatch`, `quiesce_persistence_failed`, `sync_in_progress`)
+- Fully typed `ReplicationStatusResponse` with Phase 28 fields: `runtime_role`, `local_role_source`, `write_state`, `quiesced`, `quiesce_state`, `quiesce_id`, `quiesced_at`, `quiesced_latest_seq`, `promotion_state`
+- 31 tests in `phase28_hardening_test.go` (all Phase 28 net-new); 22 tests in `journal_baseline_test.go` (all Phase 28 net-new); 17 tests in `quiesce_store_test.go` (all Phase 28 net-new); total 1264 passing (after passes 1+2)
+
+**Phase 28 hardening pass 3** (9 safety contracts added; commit `381b11b`):
+- `validatePromotionPreconditionsLocked`: re-reads `lastApplied` AND durable cursor UNDER exclusive `replicationMutationMu` WLock; any divergence rejects promotion with `ErrPromotionSequenceMismatch`
+- `ApplyReplicationEntries` split: public guarded wrapper (barrier check + RLock) + `applyReplicationEntriesLocked` private helper; `SyncFromPrimary` calls locked path directly (already holds RLock)
+- `resolveRuntimeRole()`: `NewReplicationStateStore` errors at promoted-primary startup now fail `Open()` — no silent ignore
+- `journalCompatibilityCheck`: `os.Stat` first (nil if file absent); propagates `OpenDurableLog` errors
+- `restartBackgroundWorkerAfterPromotionFailure`: atomic restart under `s.mu` with `closed`/`role`/`barrier` guards; pre-commit failure path uses this helper
+- All 3 `SyncFromPrimary` barrier returns wrap `ErrPromotionInProgress`; `handleReplicationSync` returns HTTP 409 with `promotion_in_progress`; `HTTPStatusError.Is()` maps code → `ErrPromotionInProgress`
+- Quiesce retry success path calls `RemoveQuiesceIntent`; `quiesceIntentActive` cleared only if removal succeeds
+- `bgEnabled` read moved under `s.mu` in `SyncFromPrimary` (data race fix)
+- 18 new tests in `phase28_safety_test.go`; total 1282 passing
+
+**Phase 28 hardening pass 4** (6 safety contracts added; awaiting final validation and merge):
+- `restartBackgroundWorkerAfterPromotionFailure` idempotent: reads `s.bgWorker.Status().State` under `s.mu`; only replaces nil/stopped/disabled workers; live worker → no-op (prevents duplicate active worker on repeated failure retry)
+- `BackgroundSyncStatus()` race-free: reads `s.bgWorker` under `s.mu.Lock/Unlock`; calls `worker.Status()` outside the mutex
+- `SyncFromPrimary` replicator capture: captures `closed`, `role`, `replicator`, `bgEnabled` under `s.mu` in first critical section; uses captured `replicator` pointer for `PullEntries`; fast path barrier check remains before lock
+- `ApplyReplicationEntries` follower-only: after barrier+RLock, reads role under `s.mu`; returns `ErrNotFollower` for primary/standalone/promoted-primary (promoted-primary hits barrier first → `ErrPromotionInProgress`)
+- `removeQuiesceIntentFn` injectable seam: truthful `quiesceIntentActive` — set to false only when removal succeeds; `handleReplicationStatus` reports `cleanup_pending` (quiesced + intent active) vs `active` (in-flight + intent active)
+- Deterministic Close-vs-restart race test: 50 iterations with `sync.WaitGroup` barrier; after Close, no worker in running/starting/backing-off state
+- 10 new tests added in `phase28_safety_test.go` (pass 4); 28 total in that file; total 1292 passing. Phase 28 net-new grand total: 31 + 28 + 22 + 17 = 98 tests across 4 files (all entirely Phase 28 new — none existed on main)
 
 **Phase 27 production-contract hardening** (correctness and lifecycle fixes before PR acceptance):
 - `ErrAlreadyStarted` sentinel: server single-use lifecycle (`started bool` under mutex); double-Start or Start-after-Close returns typed error

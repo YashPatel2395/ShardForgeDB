@@ -27,7 +27,14 @@ Built to demonstrate:
 - **Client-side routing gateway** — deterministic consistent-hash routing to independent nodes via `shardforge-gateway`
 - **Stateless HTTP gateway proxy** — `shardforge-proxy` wraps the gateway ring in a long-running HTTP/JSON server (10 endpoints, no failover, no retry)
 - **Static cluster metadata** — `internal/cluster` provides a typed, validated JSON config format; gateway and proxy CLIs accept `--config <path>` instead of `--nodes`
-- **Strict test/benchmark/docs discipline** — race-safe tests, reproducible benchmarks, honest scope docs
+- **Runtime operation traces from real execution paths** — `ExplainGet/Put/Delete/Scan` and vector `ExplainUpsert/Search/Delete` produce step-by-step traces (WAL_APPEND, MEMTABLE_HIT, BLOOM_CHECK, SSTABLE_HIT, …) with real wall-clock durations; no fabricated steps
+- **Networked `/explain/*` trace API and CLI** — HTTP explain endpoints on every node; `shardforge explain-node` calls any live node and prints the real execution trace
+- **Reproducible three-node HTTP cluster demo** — scripts start 3 independent nodes + proxy, prove data isolation and deterministic key routing, 25 checks
+- **Explicit pull-based HTTP replication** — leader keeps durable binary journal; follower pulls via `POST /replication/sync`; PUT+DELETE replication and idempotent pull proven
+- **Durable primary journal and identity-bound follower cursor** — `replication.journal` (per-append fsync, CRC, crash rollback); `replication_state.json` (CRC-verified, versioned, identity-bound); both survive process restarts
+- **Automatic background pull replication with lag tracking** — configurable background goroutine polls primary every 500 ms; exponential backoff with bounded jitter; `lag_entries`/`lag_known` always current after any successful sync
+- **Operator-controlled planned failover** — `POST /replication/quiesce` write-fences primary (durable intent record); `POST /replication/promote` promotes follower via crash-consistent two-phase commit; NOT automatic failover; NOT Raft
+- **Strict test/benchmark/docs discipline** — 1292 race-safe tests, 120+ reproducible benchmarks, per-claim honest scope audit
 
 ---
 
@@ -38,13 +45,13 @@ Sharding, replication, and the dashboard are **local in-process simulations** �
 | Feature | What is implemented | What is NOT implemented |
 |---------|--------------------|-----------------------|
 | Sharding | FNV-1a hash ring over local Engine instances, single process | Networked cluster, shard migration, distributed routing |
-| Replication | Leader/follower log, pause/lag simulation, single process | Raft, consensus, automatic leader election, quorum, fault tolerance |
+| Replication | **Local simulation:** leader/follower op-log, pause/lag/catch-up controls, single process. **Networked:** explicit pull-based read replication between real HTTP nodes; durable binary journal (per-append fsync, CRC, crash rollback); identity-bound follower cursor (CRC-verified versioned JSON); automatic background pull (500 ms interval, exponential backoff, lag tracking); operator-controlled quiesce + manual promotion (durable intent record, two-phase commit, cross-validated startup) | Raft, consensus, quorum replication, automatic leader election, automatic failover, distributed fencing, synchronous replication, strong-consistency guarantee, automatic client rerouting, automatic old-primary reintegration, zero-data-loss guarantee |
 | Dashboard | Local HTTP server (`127.0.0.1:8080`), chaos scenarios via replica API | Real distributed monitoring, networked node discovery |
 | Vector search | Exact brute-force k-NN, cosine/L2/dot | ANN, HNSW, IVF, approximate search |
 | Compaction | Manual full compaction (`Compact()`) | Background compaction, automatic thresholds, leveled/size-tiered |
-| Node runtime | Real independent `shardforge-node` processes, HTTP/JSON API, Docker Compose demo | Distributed sharding across nodes, networked replication, Raft, consensus |
+| Node runtime | Real independent `shardforge-node` processes, HTTP/JSON API, Docker Compose demo, replication journal and follower cursor, explain trace endpoints | Distributed sharding across nodes, Raft, consensus, automatic coordination |
 | Gateway | Client-side consistent-hash routing (`shardforge-gateway`), deterministic key→node mapping | Server-side routing, cluster metadata service, automatic failover, resharding |
-| Proxy | Stateless HTTP proxy (`shardforge-proxy`), routes requests to nodes via gateway ring, 10 endpoints | Fault-tolerant proxy, retry on failure, replication, distributed state |
+| Proxy | Stateless HTTP proxy (`shardforge-proxy`), routes requests to nodes via gateway ring, 10 endpoints; stateless and replication-unaware; 502 on node failure — no retry, no failover | Fault-tolerant proxy, retry on failure, replication awareness, distributed state |
 | Cluster config | Static JSON config (`configs/*.json`), typed/validated, loaded at startup by gateway/proxy via `--config` | Dynamic membership, node discovery, gossip, Raft, leader election, production cluster manager |
 
 ---
@@ -629,7 +636,7 @@ make bench-cluster           # cluster package Go benchmarks
 
 ```bash
 make all           # fmt + vet + build
-make build         # compile all 6 binaries into bin/
+make build         # compile all 7 binaries into bin/
 make test          # go test -race -count=1 ./...
 make fmt           # format source files
 make vet           # static analysis

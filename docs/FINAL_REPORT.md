@@ -1,7 +1,7 @@
 # ShardForgeDB — Final Engineering Report
 
 **Version:** v0.5.0-portfolio
-**Status:** Phases 1–27 locked; Phase 28 implemented and awaiting final validation and merge. 1292 tests passing.
+**Status:** All 28 approved phases complete and locked. Phase 28 squash-merged to main at `b6965e839baf1ddaeeb6e64a69c781775d5e1396` (accepted PR head `4eb28c52795ae0cc6d98f4a29fb5909166b0e547`, 2026-06-18). 1292 race-safe tests passing. Phase 29 has not started.
 
 ---
 
@@ -131,7 +131,7 @@ The trace system works only because each `Explain*` method mirrors the exact exe
 
 ## Release status
 
-Phases 1–27 locked; Phase 28 implemented and awaiting final validation and merge. `go test -race -count=1 ./...` → 1292 tests pass across 23 packages. Smoke demos: cluster (25/25), repl (16/16), repl-restart (16/16), repl-auto (24/24), repl-failover (32/32).
+All 28 approved phases complete and locked. Phase 28 squash-merged to main at `b6965e839baf1ddaeeb6e64a69c781775d5e1396` (2026-06-18). `go test -race -count=1 ./...` → 1292 tests pass across 23 packages. Smoke demos: cluster (25/25), repl (16/16), repl-restart (16/16), repl-auto (24/24), repl-failover (32/32). make release-check: PASS. make final-smoke: 36/36. Phase 29 has not started.
 
 **Phase 26 fix pass hardening** (not a new phase — correctness fixes to Phase 26 before PR acceptance):
 - Journal fsync before index update; rollback on failure (injectable `syncFn` for deterministic tests)
@@ -169,7 +169,7 @@ Phases 1–27 locked; Phase 28 implemented and awaiting final validation and mer
 - `bgEnabled` read moved under `s.mu` in `SyncFromPrimary` (data race fix)
 - 18 new tests in `phase28_safety_test.go`; total 1282 passing
 
-**Phase 28 hardening pass 4** (6 safety contracts added; awaiting final validation and merge):
+**Phase 28 hardening pass 4** (6 safety contracts added; merged and validation-locked 2026-06-18):
 - `restartBackgroundWorkerAfterPromotionFailure` idempotent: reads `s.bgWorker.Status().State` under `s.mu`; only replaces nil/stopped/disabled workers; live worker → no-op (prevents duplicate active worker on repeated failure retry)
 - `BackgroundSyncStatus()` race-free: reads `s.bgWorker` under `s.mu.Lock/Unlock`; calls `worker.Status()` outside the mutex
 - `SyncFromPrimary` replicator capture: captures `closed`, `role`, `replicator`, `bgEnabled` under `s.mu` in first critical section; uses captured `replicator` pointer for `PullEntries`; fast path barrier check remains before lock

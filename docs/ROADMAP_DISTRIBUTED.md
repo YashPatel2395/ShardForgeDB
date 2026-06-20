@@ -1,6 +1,6 @@
 # ShardForgeDB — Distributed Roadmap
 
-**Phase 27 — Automatic Background Pull Replication and Lag Tracking edition**
+**Phase 28 — Manual Promotion and Controlled Failover edition (final completed phase)**
 
 This document defines the phases required to evolve ShardForgeDB from its current explainable single-node + HTTP-node foundation into a real distributed database. Each phase is narrow, honest, and fully testable before the next begins.
 
@@ -8,7 +8,9 @@ The final target: **ShardForgeDB — a real explainable distributed database eng
 
 ---
 
-## Current state (Phases 1–28 complete)
+## Current state (Phases 1–28 complete and locked — no additional phase currently authorized)
+
+All 28 approved phases are merged to main at `b6965e839baf1ddaeeb6e64a69c781775d5e1396` (2026-06-18). Phase 29 has not started.
 
 | Component | Status |
 |---|---|
@@ -25,6 +27,7 @@ The final target: **ShardForgeDB — a real explainable distributed database eng
 | Static cluster metadata | Implemented (`internal/cluster`) |
 | Explicit pull-based read replicas with durable state | Implemented (`internal/replnet` — DurableLog, ReplicationStateStore, gap detection) |
 | Automatic background pull replication with lag tracking | Implemented (`internal/node` — backgroundSyncWorker, configurable interval/backoff/jitter, lag_entries/lag_known) |
+| Operator-controlled manual promotion and controlled failover | Implemented (`internal/node` — quiesce/promote endpoints, promotionBarrier, replicationMutationMu, crash-consistent 2-phase commit, quiesce-intent record, 98 net-new tests, 32-check demo) |
 | Ops simulation (health, failure sim, rebalance plan) | Implemented (`internal/ops`) |
 
 **Not yet implemented (required for real distributed claims):**

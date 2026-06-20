@@ -2,13 +2,13 @@
 
 An **explainable** Go database engine for key-value and vector search workloads, built layer-by-layer toward a real distributed system. Every phase is strictly documented, tested, and benchmarked. Every claim is audited.
 
-> **Phase 28 — Manual Promotion and Controlled Failover (Hardening Pass 4).** Phases 1–27 locked; Phase 28 implemented and awaiting final validation and merge.
+> **Phase 28 — Manual Promotion and Controlled Failover (Hardening Pass 4).** Phases 1–28 complete and locked. Squash-merged to main at `b6965e839baf1ddaeeb6e64a69c781775d5e1396` (2026-06-18). No additional phase is currently authorized.
 > Phase 28 adds operator-controlled planned failover: `POST /replication/quiesce` write-fences a primary; `POST /replication/promote` promotes a follower. Hardening pass 4 adds: idempotent bgWorker restart (never replaces live worker), deterministic Close-vs-restart race test, `BackgroundSyncStatus` read under mutex, `SyncFromPrimary` replicator capture under mutex, `ApplyReplicationEntries` follower-only enforcement (ErrNotFollower for primary/standalone/promoted-primary), injectable `removeQuiesceIntentFn` seam with truthful `quiesceIntentActive` tracking (`cleanup_pending` vs `active` intent state). 1292 total tests.
 > Phase 27 adds automatic background pull replication: configurable goroutine polls primary every 500ms, exponential backoff, bounded jitter, lag tracking (`lag_entries`, `lag_known`), terminal gap detection. No Raft, no automatic failover.
 > Phase 26 makes replication state durable: primary binary journal (`replication.journal`) and follower cursor (`replication_state.json`) survive process restarts. Replication gap detection added (HTTP 409).
 > Phase 25 adds a reproducible leader+follower HTTP replication demo: explicit pull via `POST /replication/sync`, PUT+DELETE replication proven, idempotent pull proven, follower write-rejection proven.
 >
-> **1292 race-safe tests. 120+ reproducible benchmarks. Phases 1–27 locked; Phase 28 implemented and awaiting final validation and merge.**
+> **1292 race-safe tests. 120+ reproducible benchmarks. All 28 approved phases complete and locked. Phase 29 has not started.**
 
 ---
 
@@ -549,7 +549,7 @@ make node-demo-down
 - [x] **Background sync is follower-only** — primary is unaffected; follower rejects writes
 - [x] **Phase 26 crash window acknowledged** — engine commit → journal append window remains
 
-**Phase 28 — Manual Promotion and Controlled Failover (Hardening Pass 4)** — implemented; awaiting final validation and merge
+**Phase 28 — Manual Promotion and Controlled Failover (Hardening Pass 4)** — merged and validation-locked (squash commit `b6965e8`, 2026-06-18)
 
 - [x] `internal/replnet/quiesce_intent.go` — NEW: `QuiesceIntentRecord` (crash-safe fence written before write-gate close); `SaveQuiesceIntent`/`LoadQuiesceIntent`/`RemoveQuiesceIntent`; startup rules: intent-only → `quiesce_failed_fenced`; intent+final matching → `quiesced` + intent cleanup; mismatch → startup error
 - [x] `internal/replnet/quiesce_store.go` — `NewQuiesceID() (string, error)`: crypto/rand, returns error on entropy failure; `NewQuiesceRecord` returns `(*QuiesceRecord, error)`; `quiesceIDFn` injectable seam on Server

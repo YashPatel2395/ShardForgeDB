@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# scripts/final_smoke.sh — Phase 26 final smoke validation
-# Runs the full acceptance gate for portfolio launch readiness.
+# scripts/final_smoke.sh — ShardForgeDB final portfolio smoke validation
+# Runs the full acceptance gate for portfolio launch readiness (Phases 1–28).
 # No Docker required. No network calls. Pure local validation.
 set -eu
 
@@ -34,7 +34,7 @@ ok "go vet ./... passes"
 echo ""
 echo "-- Tests (race detector)"
 go test -race -count=1 ./...
-ok "go test -race -count=1 ./... passes (994 tests)"
+ok "go test -race -count=1 ./... passes (1292 tests)"
 
 # ── Build ─────────────────────────────────────────────────────────────
 echo ""
@@ -177,7 +177,7 @@ echo "  Failed: $FAIL"
 echo ""
 
 if [ "$FAIL" -eq 0 ]; then
-  echo "All checks passed. ShardForgeDB Phase 26 is ready for portfolio launch."
+  echo "All checks passed. ShardForgeDB Phases 1–28 are validated and ready for portfolio release."
   exit 0
 else
   echo "Some checks failed. Review output above."

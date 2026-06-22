@@ -40,7 +40,7 @@ Built to demonstrate:
 
 ## Honesty / Scope
 
-Sharding, replication, and the dashboard are **local in-process simulations** — not distributed systems:
+ShardForgeDB includes both **local simulations** and **real networked components**. The table below distinguishes what is implemented from what remains intentionally out of scope:
 
 | Feature | What is implemented | What is NOT implemented |
 |---------|--------------------|-----------------------|

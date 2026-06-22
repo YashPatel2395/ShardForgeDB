@@ -1,6 +1,6 @@
 # ShardForgeDB — Claims Audit
 
-**Phase 28 — Manual Promotion and Controlled Failover (Hardening Pass 4)** — merged and validation-locked (squash commit `b6965e839baf1ddaeeb6e64a69c781775d5e1396`, 2026-06-18). All 28 approved phases complete. Phase 29 has not started.
+**Phase 29 — Distributed Architecture Constitution** — architecture and specification phase, in progress (2026-06-22). Phase 28 was merged and validation-locked (squash commit `b6965e839baf1ddaeeb6e64a69c781775d5e1396`, 2026-06-18). All 28 approved implementation phases complete and locked.
 
 This file is the authoritative record of what ShardForgeDB can and cannot claim. All documentation, README copy, demo scripts, and recruiter materials must comply with this list. If a claim does not appear in Section A, it must not be made.
 
@@ -83,19 +83,27 @@ The following may become safe only after the specific future phases listed. None
 
 | Future claim | Required before claiming | Phase |
 |---|---|---|
-| "Real distributed sharding" | Key ranges actually stored on separate node processes via networking | Phase 18 |
-| "RPC-based node communication" | Binary RPC protocol between nodes replaces HTTP | Phase 16+ |
-| "Networked multi-node database" | Nodes coordinate via a real distributed protocol (not just shared config) | Phase 18 |
-| "Networked replication" | Replication is triggered automatically, not only on explicit pull | Phase 20 |
-| "Majority / quorum writes" | Write acknowledged only after N/2+1 nodes confirm | Phase 22 |
-| "Automatic failover" | Follower is automatically promoted when primary fails | Phase 23 |
-| "Raft" | Full leader election, term handling, replicated log, commit index, voting, tests | Phase 23 |
-| "Real cluster dashboard" | Dashboard polls live distributed nodes | Phase 26 |
-| "Distributed vector search" | Query is routed and executed across multiple nodes | Phase 25 |
-| "ANN vector search" | Approximate nearest-neighbour index (HNSW, IVF, or equivalent) | Phase 25 |
-| "Background compaction" | Automatic threshold-triggered compaction without explicit call | Phase 24 |
-| "Block cache" | In-memory LRU cache for hot SSTable blocks | Phase 24 |
-| "Operation traces" | Real execution paths produce per-operation trace steps | Phase 15 |
+| "Deterministic fault-injection simulator with seed-based replay" | Simulator infrastructure operational and verified | Phase 30 |
+| "Raft persistent state (term, votedFor, log durability)" | WAL-backed Raft state with crash recovery verified | Phase 31 |
+| "Raft leader election" | At-most-one leader per term, verified by 500 seeded simulator runs | Phase 32 |
+| "Majority / quorum writes" | Write acknowledged only after N/2+1 nodes confirm | Phase 33 |
+| "Linearizable reads" | Read-index protocol implemented and verified | Phase 34 |
+| "Client idempotency" | Duplicate request detection verified | Phase 34 |
+| "Snapshots and log compaction" | InstallSnapshot, snapshot creation, and WAL truncation verified | Phase 35 |
+| "Safe membership changes" | Joint consensus implemented and verified | Phase 36 |
+| "Replicated shard state machine" | Engine-backed state machine connected to Raft log | Phase 37 |
+| "Metadata Raft group" | Shard assignment and epoch table managed by dedicated Raft group | Phase 38 |
+| "Leader-aware routing and automatic failover" | Router retries transparently on leader change | Phase 39 |
+| "Live shard migration" | Five-stage migration with epoch fencing verified | Phase 40 |
+| "Background compaction" | Automatic threshold-triggered compaction without explicit call | Phase 41 |
+| "Block cache" | In-memory LRU cache for hot SSTable blocks | Phase 41 |
+| "HNSW approximate nearest-neighbor index" | Persistent HNSW with recall >= 95% verified | Phase 42 |
+| "Distributed vector search" | Fan-out to all shards, global top-k merge, recall >= 95% | Phase 43 |
+| "Prometheus metrics endpoint" | Valid Prometheus exposition format, all required metrics present | Phase 44 |
+| "OpenTelemetry distributed tracing" | OTLP export verified for write and read paths | Phase 44 |
+| "Multi-host dashboard" | Dashboard polls live distributed nodes; shows shard/lag/health | Phase 44 |
+| "mTLS inter-node security" | mTLS handshake verified; unauthorized connections rejected | Phase 45 |
+| "v1.0-distributed release" | 500 linearizability checker runs pass; 10 chaos runs pass | Phase 46 |
 
 ---
 
@@ -141,3 +149,31 @@ includes real distributed sharding and Raft-based consensus as future phases.
 No. Vector search is exact brute-force k-NN (cosine, L2, or dot product). HNSW and approximate
 nearest-neighbour search are planned for a future phase but are not implemented.
 ```
+
+---
+
+## Phase 29: Architecture Only
+
+Phase 29 is an architecture, specification, and governance phase. No new distributed implementation capability is unlocked in Phase 29.
+
+**Phase 29 safe claim:**
+ShardForgeDB has an approved, documented distributed v1.0 architecture, failure model, consistency contract, formal-model skeleton, and gated implementation roadmap.
+
+**Not yet implemented (requires Phases 30–46):**
+- Raft protocol
+- Majority-committed writes
+- Linearizable reads
+- Automatic leader election
+- Automatic failover
+- Dynamic membership changes
+- Distributed sharding
+- Live shard migration
+- Resharding
+- Automatic background compaction
+- Block cache
+- HNSW approximate nearest-neighbor index
+- ANN search
+- Distributed vector search with global top-k merge
+- Prometheus metrics endpoint
+- OpenTelemetry distributed tracing
+- Multi-host cluster dashboard

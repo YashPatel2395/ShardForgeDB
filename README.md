@@ -674,6 +674,23 @@ make help              # list all targets
 
 ---
 
+## Distributed v1.0 Program
+
+v0.5.0-portfolio is the completed released baseline for ShardForgeDB — all 28 phases merged, validated, and tagged.
+
+Phase 29 begins a formally gated distributed-systems program. This phase contains architecture and specification only.
+
+**Not yet implemented:**
+- Raft consensus
+- Automatic failover
+- Distributed sharding
+- Persistent HNSW approximate nearest-neighbor index
+- Distributed vector search
+
+No new distributed implementation claim is unlocked by Phase 29. All distributed capabilities remain in the roadmap (docs/ROADMAP_DISTRIBUTED.md) and are gated by the Phase Governance rules (docs/PHASE_GOVERNANCE.md).
+
+---
+
 ## Requirements
 
 - Go 1.21 or later (uses `log/slog`)
